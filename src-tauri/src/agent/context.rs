@@ -1,0 +1,65 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// 消息角色
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::System => write!(f, "system"),
+            Role::User => write!(f, "user"),
+            Role::Assistant => write!(f, "assistant"),
+        }
+    }
+}
+
+/// 对话消息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub id: String,
+    pub role: Role,
+    pub content: String,
+    pub timestamp: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub token_count: i64,
+    #[serde(default)]
+    pub thinking_ms: i64,
+    /// 思考内容（模型的推理过程，仅 assistant 消息可能包含）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+}
+
+impl Message {
+    pub fn new(role: Role, content: impl Into<String>, session_id: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            role,
+            content: content.into(),
+            timestamp: Utc::now().to_rfc3339(),
+            session_id: session_id.into(),
+            token_count: 0,
+            thinking_ms: 0,
+            thinking: None,
+        }
+    }
+}
+
+/// 会话信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub title: String,
+    pub persona_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}

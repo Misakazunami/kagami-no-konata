@@ -1,0 +1,40 @@
+[package]
+name = "konata_mirror"
+version = "0.1.0"
+description = "Konata_Mirror - AI Chat Assistant"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "konata_mirror_lib"
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico"] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde_yaml = "0.9"
+anyhow = "1"
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1"
+regex = "1"
+globset = "0.4.20"
+walkdir = "2.5.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
