@@ -215,6 +215,8 @@ impl OpenAiClient {
                                 let event = String::from_utf8_lossy(&event_bytes).to_string();
                                 state.handle_event(&event);
                             }
+                            // 暂存的标签前缀按当前状态吐出（绝不吞掉最后一个分片）
+                            state.flush_tag_carry();
                             state.finished = true;
                         }
                     }
@@ -233,6 +235,9 @@ struct SseState {
     buffer: Vec<u8>,
     /// `<think>` 标签状态：0=正常, 1=思考中
     think_state: u8,
+    /// 可能被分片切断的标签前缀（`<thi` / `</thi`…）：留给下一个事件再判定，
+    /// 否则正文里会漏出标签文本
+    tag_carry: String,
     /// 已解析、待下发的 chunk
     pending: VecDeque<StreamChunk>,
     /// 对端已结束
@@ -244,7 +249,12 @@ struct SseState {
 impl SseState {
     /// 解析一个完整 SSE 事件，把结果并入自身状态
     fn handle_event(&mut self, event: &str) {
-        match parse_sse_event(event, &mut self.think_state, &mut self.pending) {
+        match parse_sse_event(
+            event,
+            &mut self.think_state,
+            &mut self.tag_carry,
+            &mut self.pending,
+        ) {
             Ok(true) => self.finished = true,
             Ok(false) => {}
             // 首个错误胜出：后续事件通常只是同一故障的重复
@@ -253,6 +263,19 @@ impl SseState {
                     self.error = Some(message.to_string());
                 }
             }
+        }
+    }
+
+    /// 流结束（EOF）时把暂存的标签前缀按当前状态吐出，绝不丢内容
+    fn flush_tag_carry(&mut self) {
+        if self.tag_carry.is_empty() {
+            return;
+        }
+        let tail = std::mem::take(&mut self.tag_carry);
+        if self.think_state == 0 {
+            self.pending.push_back(StreamChunk::Content(tail));
+        } else {
+            self.pending.push_back(StreamChunk::Thinking(tail));
         }
     }
 }
@@ -289,6 +312,7 @@ fn find_event_separator(buf: &[u8]) -> Option<usize> {
 fn parse_sse_event(
     event: &str,
     think_state: &mut u8,
+    tag_carry: &mut String,
     pending: &mut VecDeque<StreamChunk>,
 ) -> Result<bool> {
     let mut done = false;
@@ -328,7 +352,7 @@ fn parse_sse_event(
                     // 处理正文内容（可能包含 <think> 标签）
                     if let Some(content) = &choice.delta.content {
                         if !content.is_empty() {
-                            parse_content_chunks(content, think_state, pending);
+                            parse_content_chunks(content, think_state, tag_carry, pending);
                         }
                     }
                     // 工具调用增量：只入队交给上层累积，绝不混入正文
@@ -396,9 +420,18 @@ fn truncate_for_log(text: &str) -> String {
 
 /// 解析内容中的 `<think>...</think>` 标签，将结果追加到 pending 列表
 ///
-/// `think_state` 是跨 chunk 持久的状态：0=正常模式, 1=在思考标签内
-fn parse_content_chunks(content: &str, think_state: &mut u8, pending: &mut VecDeque<StreamChunk>) {
-    let mut remaining = content;
+/// `think_state` 是跨 chunk 持久的状态：0=正常模式, 1=在思考标签内。
+/// `tag_carry` 暂存"可能是标签前缀"的尾巴：网关按子词切流时 `<thi` + `nk>`
+/// 会跨 chunk，不暂存的话标签文本会漏进正文、后续 `</think>` 也无法纠正。
+fn parse_content_chunks(
+    content: &str,
+    think_state: &mut u8,
+    tag_carry: &mut String,
+    pending: &mut VecDeque<StreamChunk>,
+) {
+    let mut text = std::mem::take(tag_carry);
+    text.push_str(content);
+    let mut remaining = text.as_str();
 
     while !remaining.is_empty() {
         if *think_state == 0 {
@@ -411,8 +444,12 @@ fn parse_content_chunks(content: &str, think_state: &mut u8, pending: &mut VecDe
                 *think_state = 1;
                 remaining = &remaining[start + 7..]; // 跳过 "<think>"
             } else {
-                // 没有思考标签，全部是正文
-                pending.push_back(StreamChunk::Content(remaining.to_string()));
+                // 没有完整标签：把"可能是 `<think>` 前缀"的尾巴留给下一个 chunk
+                let (emit, tail) = split_possible_tag_prefix(remaining, "<think>");
+                if !emit.is_empty() {
+                    pending.push_back(StreamChunk::Content(emit.to_string()));
+                }
+                *tag_carry = tail.to_string();
                 return;
             }
         } else {
@@ -425,12 +462,33 @@ fn parse_content_chunks(content: &str, think_state: &mut u8, pending: &mut VecDe
                 *think_state = 0;
                 remaining = &remaining[end + 8..]; // 跳过 "</think>"
             } else {
-                // 没有结束标签，全部是思考内容
-                pending.push_back(StreamChunk::Thinking(remaining.to_string()));
+                let (emit, tail) = split_possible_tag_prefix(remaining, "</think>");
+                if !emit.is_empty() {
+                    pending.push_back(StreamChunk::Thinking(emit.to_string()));
+                }
+                *tag_carry = tail.to_string();
                 return;
             }
         }
     }
+}
+
+/// 若字符串尾部是 `tag` 的真前缀（如 `<thi`），把它留给下一个分片
+///
+/// 返回 `(可立即输出的部分, 暂存的尾缀)`；找不到这样的尾缀时原样返回全文。
+fn split_possible_tag_prefix<'a>(text: &'a str, tag: &str) -> (&'a str, &'a str) {
+    // 只可能是真前缀：长度严格小于 tag；允许暂存整个 text（text 本身就是前缀时）
+    let max_carry = (tag.len() - 1).min(text.len());
+    for len in (1..=max_carry).rev() {
+        if !text.is_char_boundary(text.len() - len) {
+            continue;
+        }
+        let suffix = &text[text.len() - len..];
+        if tag.starts_with(suffix) {
+            return (&text[..text.len() - len], suffix);
+        }
+    }
+    (text, "")
 }
 
 #[cfg(test)]
@@ -441,12 +499,14 @@ mod tests {
     /// 把若干 SSE 事件喂给解析器，返回收集到的 chunk
     fn parse(events: &[&str]) -> (Vec<StreamChunk>, bool) {
         let mut think_state = 0u8;
+        let mut tag_carry = String::new();
         let mut pending: VecDeque<StreamChunk> = VecDeque::new();
         let mut done = false;
         for event in events {
             match parse_sse_event(
                 &format!("data: {}\n\n", event),
                 &mut think_state,
+                &mut tag_carry,
                 &mut pending,
             ) {
                 Ok(true) => {
@@ -463,10 +523,12 @@ mod tests {
     /// 单事件解析结果（断言"错误路径"用）
     fn parse_one(event: &str) -> Result<bool> {
         let mut think_state = 0u8;
+        let mut tag_carry = String::new();
         let mut pending: VecDeque<StreamChunk> = VecDeque::new();
         parse_sse_event(
             &format!("data: {}\n\n", event),
             &mut think_state,
+            &mut tag_carry,
             &mut pending,
         )
     }
@@ -477,10 +539,12 @@ mod tests {
     #[test]
     fn accepts_data_prefix_without_space() {
         let mut think_state = 0u8;
+        let mut tag_carry = String::new();
         let mut pending: VecDeque<StreamChunk> = VecDeque::new();
         let done = parse_sse_event(
             "data:{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
             &mut think_state,
+            &mut tag_carry,
             &mut pending,
         )
         .unwrap();
@@ -517,13 +581,71 @@ mod tests {
         assert_eq!(end, event.len());
         let text = String::from_utf8_lossy(&event[..end]);
         let mut think_state = 0u8;
+        let mut tag_carry = String::new();
         let mut pending: VecDeque<StreamChunk> = VecDeque::new();
-        parse_sse_event(&text, &mut think_state, &mut pending).unwrap();
+        parse_sse_event(&text, &mut think_state, &mut tag_carry, &mut pending).unwrap();
         assert!(matches!(pending.front(), Some(StreamChunk::Content(t)) if t == "hi"));
 
         // 混用分隔符时取最早结束的那个事件
         let mixed = b"data: a\n\ndata: b\r\n\r\n";
         assert_eq!(find_event_separator(mixed), Some(9));
+    }
+
+    /// `<think>` 标签被网关切在分片边界时必须暂存，不能把 `<thi` 当正文输出
+    #[test]
+    fn think_tag_split_across_chunks_is_carried() {
+        let (chunks, _) = parse(&[
+            r#"{"choices":[{"delta":{"content":"<thi"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"nk>推理</think>答案"}}]}"#,
+        ]);
+        assert!(matches!(&chunks[0], StreamChunk::Thinking(t) if t == "推理"), "{chunks:?}");
+        assert!(matches!(&chunks[1], StreamChunk::Content(t) if t == "答案"), "{chunks:?}");
+        // 正文里绝不出现标签碎片
+        for chunk in &chunks {
+            if let StreamChunk::Content(text) = chunk {
+                assert!(!text.contains("<thi"), "{text}");
+            }
+        }
+
+        // 结束标签被拆分同样要暂存
+        let (chunks, _) = parse(&[
+            r#"{"choices":[{"delta":{"content":"<think>推理</thi"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"nk>答案"}}]}"#,
+        ]);
+        assert!(matches!(&chunks[0], StreamChunk::Thinking(t) if t == "推理"), "{chunks:?}");
+        assert!(matches!(&chunks[1], StreamChunk::Content(t) if t == "答案"), "{chunks:?}");
+    }
+
+    /// 普通文本尾部恰好是 `<` 这类可能前缀时也不能丢字符
+    #[test]
+    fn trailing_lt_is_not_lost_when_no_tag_follows() {
+        let (chunks, _) = parse(&[
+            r#"{"choices":[{"delta":{"content":"1 < 2"}}]}"#,
+        ]);
+        // 本次事件里 `< 2` 不是标签前缀，直接输出
+        assert!(
+            chunks.iter().any(|c| matches!(c, StreamChunk::Content(t) if t == "1 < 2")),
+            "{chunks:?}"
+        );
+
+        // 只有孤立的 `<`：暂存（已输出的部分不受影响），由 EOF flush 兜底
+        let mut state = SseState::default();
+        state.handle_event("data: {\"choices\":[{\"delta\":{\"content\":\"abc<\"}}]}\n\n");
+        assert!(
+            matches!(state.pending.front(), Some(StreamChunk::Content(t)) if t == "abc"),
+            "{:?}",
+            state.pending
+        );
+        assert_eq!(state.tag_carry, "<", "可能是标签前缀的尾巴必须暂存");
+        state.flush_tag_carry();
+        assert!(
+            state
+                .pending
+                .iter()
+                .any(|c| matches!(c, StreamChunk::Content(t) if t == "<")),
+            "{:?}",
+            state.pending
+        );
     }
 
     /// `finish_reason` 必须带上去：`length` 意味着输出被 max_tokens 截断

@@ -299,7 +299,10 @@ pub async fn get_snapshot(
         &state.app_data_dir,
         state.chat_store.clone(),
     );
-    let info = store.info(&session_id, &stream_id);
+    // 备份文件的存在性检查是磁盘 IO：放到阻塞线程，不占住 async 执行器
+    let info = tokio::task::spawn_blocking(move || store.info(&session_id, &stream_id))
+        .await
+        .map_err(|e| format!("读取快照失败：{}", e))?;
     Ok(if info.is_empty() { None } else { Some(info) })
 }
 
