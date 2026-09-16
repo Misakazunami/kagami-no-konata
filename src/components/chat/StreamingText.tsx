@@ -54,7 +54,9 @@ export function StreamingText({ onFinished }: Props) {
     // 注意：所有 listen 都是异步的，必须等 Promise 全部落地后再登记注销函数，
     // 否则 React 严格模式下的"挂载→清理→再挂载"会留下重复监听。
     void (async () => {
-      const listeners = await Promise.all([
+      // allSettled：单个订阅失败不能带走其它监听
+      // （Promise.all 失败时已成功返回的 unlisten 会全部泄漏）
+      const results = await Promise.allSettled([
         listen<StreamEventData>(STREAM_EVENT.chunk, (event) => {
           if (!matches(event.payload)) return;
           bufRef.current.content += event.payload.data;
@@ -76,10 +78,18 @@ export function StreamingText({ onFinished }: Props) {
       ]);
 
       if (disposed) {
-        listeners.forEach((fn) => fn());
+        results.forEach((result) => {
+          if (result.status === "fulfilled") result.value();
+        });
         return;
       }
-      unlistens.push(...listeners);
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          unlistens.push(result.value);
+        } else {
+          console.error("Failed to subscribe stream events:", result.reason);
+        }
+      }
     })();
 
     return () => {

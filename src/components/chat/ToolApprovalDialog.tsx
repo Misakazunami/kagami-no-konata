@@ -4,6 +4,7 @@ import type { ToolDecision } from "../../types/events";
 import {
   TOOL_PERMISSION_LABEL,
   TOOL_PERMISSION_RISK,
+  normalizePermission,
 } from "../../types/tools";
 
 /**
@@ -104,7 +105,10 @@ export function ToolApprovalDialog() {
 
   if (!pendingApproval) return null;
 
-  const risk = TOOL_PERMISSION_RISK[pendingApproval.permission];
+  // 归一化后再查表：后端新增权限字面量/协议漂移时不能直接索引 undefined
+  // 并在渲染中抛错（没有 ErrorBoundary，整个界面会白屏）
+  const permission = normalizePermission(pendingApproval.permission);
+  const risk = TOOL_PERMISSION_RISK[permission];
   const seconds = remainingMs === null ? null : Math.ceil(remainingMs / 1000);
   const urgent = seconds !== null && seconds <= 15;
   const ratio =
@@ -134,7 +138,7 @@ export function ToolApprovalDialog() {
           </span>
           <span className={`tool-approval-risk ${risk.level}`}>{risk.label}</span>
           <span className="tool-approval-permission">
-            {TOOL_PERMISSION_LABEL[pendingApproval.permission]}
+            {TOOL_PERMISSION_LABEL[permission]}
           </span>
         </div>
 

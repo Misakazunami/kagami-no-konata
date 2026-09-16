@@ -128,7 +128,8 @@ export function FloatingWidget() {
       isSameStream(payload, activeStreamIdRef.current);
 
     void (async () => {
-      const listeners = await Promise.all([
+      // allSettled：单个订阅失败不能带走其它监听
+      const results = await Promise.allSettled([
         listen<StreamEventData>(STREAM_EVENT.chunk, (event) => {
           if (!matches(event.payload)) return;
           setBubbleContent((prev) => prev + event.payload.data);
@@ -159,10 +160,18 @@ export function FloatingWidget() {
       ]);
 
       if (disposed) {
-        listeners.forEach((fn) => fn());
+        results.forEach((result) => {
+          if (result.status === "fulfilled") result.value();
+        });
         return;
       }
-      unlisteners.push(...listeners);
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          unlisteners.push(result.value);
+        } else {
+          console.error("[float] 订阅流式事件失败:", result.reason);
+        }
+      }
     })();
 
     return () => {
@@ -226,7 +235,13 @@ export function FloatingWidget() {
     <div className="desktop-pet">
       {/* 气泡（内嵌，有内容时显示） */}
       {(showBubble && displayContent) || pokeBubble ? (
-        <div className="pet-inline-bubble">
+        <div
+          className="pet-inline-bubble"
+          // 手动关闭：把"自动隐藏"设为 0 时气泡不会自己消失，
+          // 没有这个入口它会永久盖住桌宠
+          onClick={() => setShowBubble(false)}
+          title="点击关闭气泡"
+        >
           <div className="bubble-text">
             {pokeBubble ?? displayContent}
             {isStreaming && !pokeBubble && <span className="cursor-blink">▊</span>}

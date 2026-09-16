@@ -14,10 +14,27 @@ import {
   type PersonaSummary,
 } from "../../types/persona";
 
+/**
+ * 本地日期键（`YYYY-MM-DD`）
+ *
+ * `toISOString()` 是 UTC：UTC+8 的凌晨 0-8 点会被算到前一天，
+ * "今天/昨天"分组与排序都会错。
+ */
+function localDateKey(value: Date | string): string {
+  const date = typeof value === "string" ? new Date(value) : value;
+  if (Number.isNaN(date.getTime())) {
+    // 解析失败按原字符串的日期部分兜底
+    return typeof value === "string" ? value.split("T")[0] : "";
+  }
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
 /** 格式化日期标题 */
 function formatDateHeader(dateStr: string): string {
-  const today = new Date().toISOString().split("T")[0];
-  const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0];
+  const today = localDateKey(new Date());
+  const yesterday = localDateKey(new Date(Date.now() - 86400000));
   if (dateStr === today) return "今天";
   if (dateStr === yesterday) return "昨天";
   return dateStr;
@@ -27,7 +44,7 @@ function formatDateHeader(dateStr: string): string {
 function groupSessionsByDate(sessions: Session[]): [string, Session[]][] {
   const groups: Record<string, Session[]> = {};
   for (const s of sessions) {
-    const date = s.created_at.split("T")[0];
+    const date = localDateKey(s.created_at);
     if (!groups[date]) groups[date] = [];
     groups[date].push(s);
   }
@@ -50,7 +67,7 @@ export function ChatWindow() {
   // 人格列表
   const [personas, setPersonas] = useState<PersonaSummary[]>([]);
   // 默认人格 ID 与后端 persona::types::DEFAULT_PERSONA_ID 保持一致
-  const [selectedPersona, setSelectedPersona] = useState("konata-default");
+  const [selectedPersona, setSelectedPersona] = useState(DEFAULT_PERSONA_ID);
 
   // 工作区弹窗与状态
   const [showTaskModal, setShowTaskModal] = useState(false);
