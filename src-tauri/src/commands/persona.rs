@@ -123,8 +123,7 @@ pub async fn list_personas(state: State<'_, AppState>) -> Result<Vec<PersonaSumm
     let mut personas = Vec::new();
 
     // 1. 先收集用户自定义人格（app_data_dir/personas/），按 id 去重
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-    let dir = personas_dir(&data_dir);
+    let dir = personas_dir(&state.app_data_dir);
     let mut user_by_id: std::collections::HashMap<String, PersonaSummary> =
         std::collections::HashMap::new();
     if dir.exists() {
@@ -170,8 +169,7 @@ pub async fn get_persona_yaml(
     validate_persona_id(&persona_id)?;
 
     // 1. 先查用户文件（兼容 .yaml / .yml）
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-    let dir = personas_dir(&data_dir);
+    let dir = personas_dir(&state.app_data_dir);
     if let Some(user_file) = find_user_persona_file(&dir, &persona_id) {
         return fs::read_to_string(&user_file).map_err(|e| e.to_string());
     }
@@ -215,8 +213,7 @@ pub async fn get_persona_summary(
     };
 
     let is_builtin = {
-        let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-        !personas_dir(&data_dir)
+        !personas_dir(&state.app_data_dir)
             .join(format!("{}.yaml", resolved_id))
             .exists()
     };
@@ -253,14 +250,13 @@ pub async fn save_persona(
     }
 
     // 保存到用户目录（统一使用 .yaml 扩展名）
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-    let dir = personas_dir(&data_dir);
+    let dir = personas_dir(&state.app_data_dir);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     write_persona_file(&dir, &persona_id, &yaml_content)?;
 
     // 热重载：保存的人格立即对聊天生效（无需重启）
-    state.dispatcher.chat_agent().reload_personas(&data_dir);
+    state.dispatcher.chat_agent().reload_personas(&dir);
 
     Ok(())
 }
@@ -273,13 +269,12 @@ pub async fn delete_persona(
 ) -> Result<(), String> {
     validate_persona_id(&persona_id)?;
 
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-    let dir = personas_dir(&data_dir);
+    let dir = personas_dir(&state.app_data_dir);
 
     if let Some(file_path) = find_user_persona_file(&dir, &persona_id) {
         fs::remove_file(&file_path).map_err(|e| e.to_string())?;
         // 热重载：删除的人格立即从聊天中移除
-        state.dispatcher.chat_agent().reload_personas(&data_dir);
+        state.dispatcher.chat_agent().reload_personas(&state.app_data_dir);
         Ok(())
     } else if persona_id == DEFAULT_PERSONA_ID {
         Err("该人格为内置人格，无法删除".to_string())

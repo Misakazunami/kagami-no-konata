@@ -141,8 +141,7 @@ pub async fn import_memories(
 /// 导出所有人格到 JSON 字符串
 #[tauri::command]
 pub async fn export_personas(state: State<'_, AppState>) -> Result<String, String> {
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-    let dir = personas_dir(&data_dir);
+    let dir = personas_dir(&state.app_data_dir);
     let mut entries = Vec::new();
 
     // 内置人格（标记 is_builtin，导入端会跳过）
@@ -209,7 +208,7 @@ pub async fn import_personas(
         ));
     }
 
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
+    let data_dir = state.app_data_dir.clone();
     let dir = personas_dir(&data_dir);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 

@@ -306,8 +306,7 @@ fn build_tool_runtime(
 
     let (mut tools_cfg, app_data_dir) = {
         let config = state.config.lock().ok()?;
-        let data_dir = state.app_data_dir.lock().ok()?.clone();
-        (config.tools.clone(), data_dir)
+        (config.tools.clone(), state.app_data_dir.clone())
     };
 
     if !tools_cfg.enabled {

@@ -208,6 +208,8 @@ export function FloatingWidget() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // 与主窗口输入框同一规则：输入法组合期间的回车是选词，不是发送
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();

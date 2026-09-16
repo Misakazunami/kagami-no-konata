@@ -45,7 +45,12 @@ pub struct AppState {
     pub memory_store: Arc<Mutex<MemoryStore>>,
     /// 共享人格引擎（聊天 Agent 与记忆/人设工具共用）
     pub personas: Arc<RwLock<PersonaEngine>>,
-    pub app_data_dir: Mutex<PathBuf>,
+    /// 应用数据目录
+    ///
+    /// **启动后不可变，因此故意不加锁**：它与 `config` 曾经构成一对 ABBA 死锁
+    /// （保存配置持 data_dir 等 config，而发消息/列工作区持 config 等 data_dir），
+    /// 去掉这把锁后死锁从结构上消失，`config` 成为唯一需要排序的全局锁。
+    pub app_data_dir: PathBuf,
     /// 进行中生成的取消标记（key = stream_id）
     ///
     /// 历史实现从未写入过这个字段，导致 `stop_generation` 与 `cancel` 完全是死代码。
@@ -169,7 +174,7 @@ pub fn run() {
                 chat_store: chat_store.clone(),
                 memory_store: Arc::new(Mutex::new(memory_store)),
                 personas,
-                app_data_dir: Mutex::new(app_data_dir),
+                app_data_dir,
                 cancel_flags: Mutex::new(HashMap::new()),
                 pending_approvals: new_approval_map(),
             });

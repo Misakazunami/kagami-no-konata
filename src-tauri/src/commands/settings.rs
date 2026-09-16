@@ -26,18 +26,21 @@ fn mutate_config<T, F>(state: &AppState, apply: F) -> Result<T, String>
 where
     F: FnOnce(&mut AppConfig) -> Result<T, String>,
 {
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
+    // 只拿 config 一把锁。数据目录已改为不可变字段（无需锁），历史实现
+    // 先锁 data_dir 再锁 config，与其它命令的相反顺序构成 ABBA 死锁。
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
 
     let mut draft = config.clone();
     let output = apply(&mut draft)?;
     draft.validate()?;
-    crate::config::save_config(&data_dir, &draft).map_err(|e| format!("配置保存失败: {}", e))?;
+    // 持锁落盘是有意为之：它保证"读-改-写"整体原子，并发修改不会互相覆盖。
+    // 因为没有第二把锁，这里的 I/O 只可能阻塞、不可能死锁。
+    crate::config::save_config(&state.app_data_dir, &draft)
+        .map_err(|e| format!("配置保存失败: {}", e))?;
 
     let provider = draft.llm.active_provider().clone();
     *config = draft;
     drop(config);
-    drop(data_dir);
 
     state.dispatcher.chat_agent().update_provider(&provider);
     Ok(output)

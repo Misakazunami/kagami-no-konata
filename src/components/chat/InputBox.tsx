@@ -22,6 +22,10 @@ export function InputBox() {
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // 输入法组合期间的回车是"确认候选词"，不是发送：
+    // 不拦住它，中文/日文用户按回车选词时会把半成品直接发出去。
+    // keyCode 229 是 Safari/部分 WebView 在组合态下拿不到 isComposing 时的兜底。
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();

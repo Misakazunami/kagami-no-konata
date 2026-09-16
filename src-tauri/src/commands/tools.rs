@@ -294,12 +294,11 @@ pub async fn get_snapshot(
     stream_id: String,
 ) -> Result<Option<crate::agent::harness::SnapshotInfo>, String> {
     ensure_main_window(&window)?;
-    let data_dir = state
-        .app_data_dir
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone();
-    let store = crate::agent::harness::SnapshotStore::new(&data_dir, state.chat_store.clone());
+    // 数据目录不可变：直接借用，无需（也不该）再去拿任何锁
+    let store = crate::agent::harness::SnapshotStore::new(
+        &state.app_data_dir,
+        state.chat_store.clone(),
+    );
     let info = store.info(&session_id, &stream_id);
     Ok(if info.is_empty() { None } else { Some(info) })
 }
@@ -315,15 +314,11 @@ pub async fn restore_snapshot(
     stream_id: String,
 ) -> Result<crate::agent::harness::snapshot::RestoreReport, String> {
     ensure_main_window(&window)?;
-    let (tools_cfg, data_dir) = {
+    let tools_cfg = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        let data_dir = state
-            .app_data_dir
-            .lock()
-            .map_err(|e| e.to_string())?
-            .clone();
-        (config.tools.clone(), data_dir)
+        config.tools.clone()
     };
+    let data_dir = state.app_data_dir.clone();
     // 目标路径重新过一遍工作区监狱（备份索引是我们自己写的，但边界只有一处）
     let workspaces = crate::agent::harness::WorkspaceSet::from_config(&tools_cfg, &data_dir);
     let store = crate::agent::harness::SnapshotStore::new(&data_dir, state.chat_store.clone());
@@ -345,8 +340,8 @@ pub struct WorkspaceView {
 
 fn workspace_views(state: &AppState) -> Result<Vec<WorkspaceView>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-    let set = crate::agent::harness::WorkspaceSet::from_config(&config.tools, &data_dir);
+    let set =
+        crate::agent::harness::WorkspaceSet::from_config(&config.tools, &state.app_data_dir);
     Ok(set
         .list()
         .into_iter()
@@ -468,8 +463,7 @@ pub async fn add_workspace(
 
     let (mut config, data_dir) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-        (config.clone(), data_dir.clone())
+        (config.clone(), state.app_data_dir.clone())
     };
 
     if config.tools.workspaces.len() >= MAX_WORKSPACE_ROOTS {
@@ -581,8 +575,9 @@ pub async fn remove_workspace(
 
 fn persist_config(state: &AppState, config: &crate::config::types::AppConfig) -> Result<(), String> {
     config.validate()?;
-    let data_dir = state.app_data_dir.lock().map_err(|e| e.to_string())?;
-    crate::config::save_config(&data_dir, config).map_err(|e| e.to_string())?;
+    // 落盘在**锁外**完成：磁盘 I/O 可能长达毫秒级，持锁 I/O 会放大并发窗口；
+    // 且这里绝不能先拿 data_dir（已去锁）再拿 config，锁序统一为"不进锁做 I/O"。
+    crate::config::save_config(&state.app_data_dir, config).map_err(|e| e.to_string())?;
     let mut current = state.config.lock().map_err(|e| e.to_string())?;
     *current = config.clone();
     Ok(())
