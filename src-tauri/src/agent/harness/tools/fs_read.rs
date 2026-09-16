@@ -14,6 +14,11 @@ use super::args;
 const MAX_SEARCH_RESULTS: usize = 200;
 /// 单个文件参与 grep 的体积上限（超过视为不可搜索的大文件）
 const MAX_GREP_FILE_BYTES: u64 = 1024 * 1024;
+/// 可整体读入内存的文本文件上限（read_file / edit_file 共用）
+///
+/// 超过这个大小就明确拒绝：GB 级日志/镜像一次 `fs::read` 会申请同样大小的
+/// 内存（还有解码副本），足以把应用 OOM 掉。
+pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// 二进制探测窗口
 const BINARY_SNIFF_BYTES: usize = 8192;
 
@@ -64,6 +69,14 @@ impl Tool for ReadFile {
             );
         }
 
+        let metadata = std::fs::metadata(&resolved.abs_path)?;
+        if metadata.len() > MAX_TEXT_FILE_BYTES {
+            anyhow::bail!(
+                "文件过大（{} MB，上限 {} MB）：请用 grep_search 定位内容，或用 offset/limit 之外的工具分片查看",
+                metadata.len() / 1024 / 1024,
+                MAX_TEXT_FILE_BYTES / 1024 / 1024
+            );
+        }
         let bytes = std::fs::read(&resolved.abs_path)?;
         if is_binary(&bytes) {
             anyhow::bail!(
@@ -140,14 +153,16 @@ impl Tool for ListDir {
         let mut skipped = 0usize;
 
         for entry in std::fs::read_dir(&resolved.abs_path)? {
-            let entry = entry?;
+            // 单个条目在枚举与 stat 之间被并发删除/权限异常 → 跳过该条目，
+            // 而不是让整次 list_dir 失败
+            let Ok(entry) = entry else { continue };
             let path = entry.path();
             if cx.services.workspaces.is_path_denied(&path) {
                 skipped += 1;
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let metadata = entry.metadata()?;
+            let Ok(metadata) = entry.metadata() else { continue };
             if metadata.is_dir() {
                 dirs.push(format!("{}/", name));
             } else {
@@ -228,7 +243,9 @@ impl Tool for GlobSearch {
         for entry in walkdir::WalkDir::new(&search_root.abs_path)
             .max_depth(24)
             .into_iter()
-            .filter_entry(|e| !is_hidden_dir(e.path()))
+            // 谓词同样作用于根条目：根名命中隐藏列表时整棵树会被剪掉，
+            // 因此根（depth 0）必须放行
+            .filter_entry(|e| e.depth() == 0 || !is_hidden_dir(e.path()))
         {
             if cx.cancelled() {
                 cx.ensure_not_cancelled()?;
@@ -331,7 +348,8 @@ impl Tool for GrepSearch {
             walkdir::WalkDir::new(&target.abs_path)
                 .max_depth(24)
                 .into_iter()
-                .filter_entry(|e| !is_hidden_dir(e.path()))
+                // 根条目也要放行（见 glob_search 的同款说明）
+                .filter_entry(|e| e.depth() == 0 || !is_hidden_dir(e.path()))
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().is_file())
                 .map(|e| e.into_path())

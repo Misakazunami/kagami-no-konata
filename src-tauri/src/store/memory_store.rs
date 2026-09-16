@@ -313,6 +313,15 @@ impl MemoryStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// 记忆条数（只查 COUNT：`get_app_status` 只需要数字，不该把全部
+    /// 1536 维向量反序列化一遍）
+    pub fn count_memories(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+        Ok(count.max(0) as usize)
+    }
+
     /// 供界面展示的记忆列表：不读取/不返回向量
     ///
     /// 界面只用 content / type / importance，而单个向量是 1536 维浮点数组，

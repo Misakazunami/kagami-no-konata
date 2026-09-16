@@ -900,7 +900,7 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 1);
         assert_eq!(outcome.steps, 1);
         assert_eq!(outcome.content, "继续实现：已经写出第一个文件。");
-        assert!(outcome.content.trim().len() > 0, "绝不能再产出空白回合");
+        assert!(!outcome.content.trim().is_empty(), "绝不能再产出空白回合");
 
         // 提醒确实推给了模型（而不是重发一模一样的请求）
         let seen = backend.seen_messages.lock().unwrap();

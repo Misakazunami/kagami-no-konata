@@ -128,43 +128,47 @@ impl SnapshotStore {
             };
         }
 
-        let store = match self.store.lock() {
-            Ok(store) => store,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        // 同一个文件在本次生成里只需要备份**最早**的那一份：
-        // 回滚的目标是"生成开始前的状态"，而后续备份记录的是中间版本。
-        // 不去重的话，回滚按时间顺序重放会把文件停在中间版本；
-        // 重复备份也纯属浪费磁盘（每个 stream 有 64 MB 上限）。
-        let rows = match store.list_snapshots(stream_id) {
-            Ok(rows) => rows,
-            Err(e) => {
-                return Capture::Skipped {
-                    reason: format!("读取已有备份失败：{}", e),
-                }
-            }
-        };
         let dir = self.stream_dir(stream_id);
-        let rel_str = rel.to_string_lossy();
-        let already_backed_up = rows.iter().any(|row| {
-            row.root_id == root_id
-                && row.rel_path == rel_str
-                // 备份文件已被外部清理时不算数，否则会留下"看似可回滚、实际 missing"的记录
-                && dir.join(&row.backup_name).is_file()
-        });
-        if already_backed_up {
-            return Capture::Captured { bytes: 0 };
-        }
-
-        let used: u64 = rows.iter().map(|row| row.bytes.max(0) as u64).sum();
-        if used + metadata.len() > MAX_TOTAL_BYTES {
-            return Capture::Skipped {
-                reason: format!(
-                    "本轮备份总量已达上限（{} MB）",
-                    MAX_TOTAL_BYTES / 1024 / 1024
-                ),
+        let rel_str = rel.to_string_lossy().to_string();
+        {
+            // 只在"查重 + 额度检查"期间持锁：随后的复制最多 4 MB，
+            // 让全局 ChatStore 锁陪跑磁盘 IO 会拖住所有消息落库/记忆读写
+            let store = match self.store.lock() {
+                Ok(store) => store,
+                Err(poisoned) => poisoned.into_inner(),
             };
+
+            // 同一个文件在本次生成里只需要备份**最早**的那一份：
+            // 回滚的目标是"生成开始前的状态"，而后续备份记录的是中间版本。
+            // 不去重的话，回滚按时间顺序重放会把文件停在中间版本；
+            // 重复备份也纯属浪费磁盘（每个 stream 有 64 MB 上限）。
+            let rows = match store.list_snapshots(stream_id) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return Capture::Skipped {
+                        reason: format!("读取已有备份失败：{}", e),
+                    }
+                }
+            };
+            let already_backed_up = rows.iter().any(|row| {
+                row.root_id == root_id
+                    && row.rel_path == rel_str
+                    // 备份文件已被外部清理时不算数，否则会留下"看似可回滚、实际 missing"的记录
+                    && dir.join(&row.backup_name).is_file()
+            });
+            if already_backed_up {
+                return Capture::Captured { bytes: 0 };
+            }
+
+            let used: u64 = rows.iter().map(|row| row.bytes.max(0) as u64).sum();
+            if used + metadata.len() > MAX_TOTAL_BYTES {
+                return Capture::Skipped {
+                    reason: format!(
+                        "本轮备份总量已达上限（{} MB）",
+                        MAX_TOTAL_BYTES / 1024 / 1024
+                    ),
+                };
+            }
         }
 
         if let Err(e) = fs::create_dir_all(&dir) {
@@ -174,9 +178,24 @@ impl SnapshotStore {
         }
         let backup_name = format!("{}-{}", Uuid::new_v4(), sanitize_name(abs));
         let backup_path = dir.join(&backup_name);
-        if let Err(e) = fs::copy(abs, &backup_path) {
+        let copied = match fs::copy(abs, &backup_path) {
+            Ok(copied) => copied,
+            Err(e) => {
+                return Capture::Skipped {
+                    reason: format!("复制备份失败：{}", e),
+                }
+            }
+        };
+        // 检查与复制之间文件可能已被其它进程写大：以**实际复制的字节数**
+        // 为准（既如实记录占盘量，也守住单文件上限）
+        if copied > MAX_FILE_BYTES {
+            let _ = fs::remove_file(&backup_path);
             return Capture::Skipped {
-                reason: format!("复制备份失败：{}", e),
+                reason: format!(
+                    "文件在备份期间变大（{} KB > {} KB 上限），已放弃本次备份",
+                    copied / 1024,
+                    MAX_FILE_BYTES / 1024
+                ),
             };
         }
 
@@ -185,10 +204,14 @@ impl SnapshotStore {
             session_id: session_id.to_string(),
             stream_id: stream_id.to_string(),
             root_id: root_id.to_string(),
-            rel_path: rel.to_string_lossy().to_string(),
+            rel_path: rel_str,
             backup_name,
-            bytes: metadata.len() as i64,
+            bytes: copied as i64,
             created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let store = match self.store.lock() {
+            Ok(store) => store,
+            Err(poisoned) => poisoned.into_inner(),
         };
         if let Err(e) = store.record_snapshot(&row) {
             // 索引写不进去 → 删掉刚复制的备份，避免留下无法回滚的孤儿文件
@@ -198,9 +221,7 @@ impl SnapshotStore {
             };
         }
 
-        Capture::Captured {
-            bytes: metadata.len(),
-        }
+        Capture::Captured { bytes: copied }
     }
 
     /// 某个 stream 的快照概况
@@ -229,9 +250,16 @@ impl SnapshotStore {
 
     /// 回滚某个 stream 的全部文件改动
     ///
-    /// 目标路径重新过一遍 [`WorkspaceSet::resolve`]：备份是后端自己写的，
-    /// 但仍然让它回到同一个信任边界里（这也顺带挡住了 deny_glob 命中的文件）。
-    pub fn restore(&self, stream_id: &str, workspaces: &WorkspaceSet) -> RestoreReport {
+    /// 目标路径重新过一遍 [`WorkspaceSet::resolve_writable`]：备份是后端自己写的，
+    /// 但仍然让它回到同一个信任边界里（这也顺带挡住了 deny_glob 命中的文件与
+    /// 只读工作区）。`expected_session` 必须与备份记录的会话一致——否则任何窗口
+    /// 拿一个旧 `stream_id` 就能回滚别的会话造成的改动。
+    pub fn restore(
+        &self,
+        stream_id: &str,
+        expected_session: &str,
+        workspaces: &WorkspaceSet,
+    ) -> RestoreReport {
         let rows = match self.store.lock() {
             Ok(store) => store.list_snapshots(stream_id),
             Err(poisoned) => poisoned.into_inner().list_snapshots(stream_id),
@@ -258,14 +286,20 @@ impl SnapshotStore {
             if !restored_paths.insert(key) {
                 continue;
             }
+            if row.session_id != expected_session {
+                report
+                    .errors
+                    .push(format!("{}：备份不属于当前会话，已跳过", row.rel_path));
+                continue;
+            }
             let backup_path = self.stream_dir(stream_id).join(&row.backup_name);
             if !backup_path.is_file() {
                 report.missing += 1;
                 continue;
             }
-            // 用 `root_id:rel_path` 重新走寻址与监狱检查
+            // 用 `root_id:rel_path` 重新走寻址与监狱检查（含只读工作区拒绝）
             let address = format!("{}:{}", row.root_id, row.rel_path);
-            let resolved = match workspaces.resolve(&address) {
+            let resolved = match workspaces.resolve_writable(&address) {
                 Ok(resolved) => resolved,
                 Err(e) => {
                     report.errors.push(format!("{}：{}", address, e));
@@ -431,7 +465,7 @@ mod tests {
         assert_eq!(info.files, 1);
         assert!(info.bytes > 0);
 
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.workspaces);
+        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "原始内容");
@@ -462,7 +496,7 @@ mod tests {
         let info = fx.snapshots.info(&fx.session_id, &fx.stream_id);
         assert_eq!(info.files, 1, "同一路径不能被计成两个文件");
 
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.workspaces);
+        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "v0");
     }
@@ -499,7 +533,7 @@ mod tests {
             }
         }
 
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.workspaces);
+        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "原始版本");
     }
@@ -516,7 +550,7 @@ mod tests {
         std::fs::remove_file(&abs).unwrap();
         assert!(!abs.exists());
 
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.workspaces);
+        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "要找回我");
     }
@@ -566,7 +600,7 @@ mod tests {
         for entry in std::fs::read_dir(&backup_dir).unwrap() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.workspaces);
+        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 0);
         assert_eq!(report.missing, 1, "{report:?}");
     }

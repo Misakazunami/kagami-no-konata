@@ -307,10 +307,14 @@ pub async fn get_snapshot(
 ///
 /// 这里**不检查 `tools.enabled`**：用户完全可能在关掉工具之后才想撤销上一次的改动，
 /// 回滚只读备份、不执行任何模型指令。
+///
+/// `session_id` 必须与备份记录一致：否则拿到一个旧 `stream_id` 就能回滚
+/// 别的会话造成的改动（见 `SnapshotStore::restore`）。
 #[tauri::command]
 pub async fn restore_snapshot(
     window: WebviewWindow,
     state: State<'_, AppState>,
+    session_id: String,
     stream_id: String,
 ) -> Result<crate::agent::harness::snapshot::RestoreReport, String> {
     ensure_main_window(&window)?;
@@ -322,7 +326,11 @@ pub async fn restore_snapshot(
     // 目标路径重新过一遍工作区监狱（备份索引是我们自己写的，但边界只有一处）
     let workspaces = crate::agent::harness::WorkspaceSet::from_config(&tools_cfg, &data_dir);
     let store = crate::agent::harness::SnapshotStore::new(&data_dir, state.chat_store.clone());
-    Ok(store.restore(&stream_id, &workspaces))
+    // 回滚含大量文件复制（单 stream 上限 64 MB）：放到阻塞线程上，
+    // 不占住 async 执行器
+    tokio::task::spawn_blocking(move || store.restore(&stream_id, &session_id, &workspaces))
+        .await
+        .map_err(|e| format!("回滚任务失败：{}", e))
 }
 
 // ─── 工作区管理 ─────────────────────────────────────────
@@ -385,13 +393,23 @@ fn validate_new_root(path: &str, existing: &[WorkspaceRoot], app_data_dir: &std:
         return Err("不允许把磁盘根目录设为工作区".to_string());
     }
 
-    // 系统目录与"直接包含应用配置/数据库的目录"一律拒绝
-    let lowered = canonical.to_string_lossy().to_ascii_lowercase();
-    let blocked = [
-        "\\windows", "/windows", "\\system32", "/system32", "/etc", "/usr", "/bin", "/sbin",
-        "/system", "/library",
-    ];
-    if blocked.iter().any(|frag| lowered.contains(frag)) {
+    // 系统目录：只看**顶层组件**（`/etc`、`C:\Windows`、`/proc`…）。
+    // 子串匹配会把 `/home/u/etc-projects` 这类合法目录误杀，又漏掉 `/proc`；
+    // 按任意层级匹配组件则会把用户项目里名为 `bin`/`etc` 的普通目录误杀。
+    let first_component = canonical
+        .components()
+        .find(|component| matches!(component, std::path::Component::Normal(_)))
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let blocked: &[&str] = if cfg!(windows) {
+        &["windows", "system32", "syswow64"]
+    } else {
+        &[
+            "etc", "usr", "bin", "sbin", "boot", "dev", "proc", "sys", "root", "system",
+            "library",
+        ]
+    };
+    if blocked.contains(&first_component.as_str()) {
         return Err("该目录属于系统目录，不允许作为工作区".to_string());
     }
     if canonical.join("config.json").exists() && canonical.join("data.db").exists() {
@@ -399,8 +417,13 @@ fn validate_new_root(path: &str, existing: &[WorkspaceRoot], app_data_dir: &std:
     }
 
     let app_data_canonical = std::fs::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
-    if canonical == app_data_canonical {
-        return Err("不允许把应用数据目录本身设为工作区".to_string());
+    // 应用数据目录及其**所有子目录**都拒绝：snapshots/（回滚备份）与 personas/
+    // （人格 system prompt）都在里面，放进来等于让文件工具能改写回滚备份与人格
+    if canonical.starts_with(&app_data_canonical) {
+        return Err(
+            "不允许把应用数据目录（或其子目录）设为工作区：其中含配置、数据库、快照与人格"
+                .to_string(),
+        );
     }
 
     for root in existing {
@@ -665,15 +688,31 @@ mod tests {
     fn validate_new_root_rejects_nested_roots() {
         let base = std::env::temp_dir().join(format!("konata-ws-{}", uuid::Uuid::new_v4()));
         let nested = base.join("inner");
+        let appdata = base.join("appdata");
         std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&appdata).unwrap();
 
         let existing = vec![root("base", "外层", &base.display().to_string())];
-        let err = validate_new_root(&nested.display().to_string(), &existing, &std::env::temp_dir()).unwrap_err();
+        let err = validate_new_root(&nested.display().to_string(), &existing, &appdata).unwrap_err();
         assert!(err.contains("嵌套"), "{err}");
 
         // 同一个目录重复添加
-        let err = validate_new_root(&base.display().to_string(), &existing, &std::env::temp_dir()).unwrap_err();
+        let err = validate_new_root(&base.display().to_string(), &existing, &appdata).unwrap_err();
         assert!(err.contains("已经在工作区列表中"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 应用数据目录的子目录（snapshots / personas）绝不能被设为工作区
+    #[test]
+    fn validate_new_root_rejects_app_data_subdirectories() {
+        let base = std::env::temp_dir().join(format!("konata-ws-sub-{}", uuid::Uuid::new_v4()));
+        let appdata = base.join("appdata");
+        let snapshots = appdata.join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+
+        let err = validate_new_root(&snapshots.display().to_string(), &[], &appdata).unwrap_err();
+        assert!(err.contains("应用数据目录"), "{err}");
 
         let _ = std::fs::remove_dir_all(&base);
     }

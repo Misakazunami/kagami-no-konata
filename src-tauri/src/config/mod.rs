@@ -69,6 +69,29 @@ pub fn load_config(app_data_dir: &Path) -> Result<AppConfig> {
         }
     }
 
+    // 内置拒绝清单必须完整：手工编辑/旧构建/另一条开发线的配置可能清空它，
+    // 那样 config.json（API Key）、*.db、.env、.ssh/** 会重新对文件工具可读。
+    // 就地补齐并落盘；`ToolConfig::validate` 也会拒绝缺失内置条目的配置。
+    let missing: Vec<String> = config
+        .tools
+        .missing_builtin_deny_globs()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "[config] 敏感文件拒绝清单缺少 {} 个内置条目，已补齐",
+            missing.len()
+        );
+        config.tools.deny_globs.extend(missing);
+        let mut seen = std::collections::HashSet::new();
+        config
+            .tools
+            .deny_globs
+            .retain(|pattern| seen.insert(pattern.clone()));
+        repaired = true;
+    }
+
     if repaired {
         let _ = save_config(app_data_dir, &config);
     }
@@ -199,6 +222,38 @@ mod tests {
         assert_eq!(loaded.llm.active_provider_id, loaded.llm.providers[0].id);
         // 修复后必须能通过校验（否则用户会卡在"设置存不下去"）
         assert!(loaded.validate().is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 内置敏感文件拒绝清单被清空时必须就地补齐并落盘
+    ///
+    /// 触发场景：手工编辑 config.json、旧构建写出的配置、另一条开发线的配置。
+    /// 不修复的话 `read_file("config.json")` 会把 API Key 读进上下文。
+    #[test]
+    fn load_config_restores_builtin_deny_globs() {
+        let dir = temp_dir("deny-restore");
+        let mut config = AppConfig::default();
+        config.tools.deny_globs.clear();
+        fs::write(
+            config_path(&dir),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_config(&dir).expect("must repair deny list");
+        assert!(
+            loaded.tools.missing_builtin_deny_globs().is_empty(),
+            "内置拒绝条目必须被补回"
+        );
+        assert!(loaded.validate().is_ok());
+
+        // 修复结果已落盘，且重复加载不会重复追加
+        let reloaded: AppConfig =
+            serde_json::from_str(&fs::read_to_string(config_path(&dir)).unwrap()).unwrap();
+        assert!(reloaded.tools.missing_builtin_deny_globs().is_empty());
+        let again = load_config(&dir).expect("second load");
+        assert_eq!(again.tools.deny_globs.len(), reloaded.tools.deny_globs.len());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -197,6 +197,8 @@ impl ChatStore {
     ///
     /// `model` 只对 assistant 消息有意义（会话级模型选择的展示标签），
     /// 用户/系统消息传 `None`。
+    // 参数个数由"消息元数据"的字段决定，拆结构体只会把调用点变啰嗦
+    #[allow(clippy::too_many_arguments)]
     pub fn add_message(
         &self,
         session_id: &str,

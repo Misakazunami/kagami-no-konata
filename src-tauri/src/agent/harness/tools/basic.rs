@@ -152,8 +152,9 @@ impl Tool for GetAppStatus {
 
         if let Some(memory) = &cx.services.memory {
             let memory = memory.lock().unwrap_or_else(|e| e.into_inner());
-            match memory.list_memories(None) {
-                Ok(entries) => lines.push(format!("长期记忆条数：{}", entries.len())),
+            // 只取条数：不要 list_memories——它会把全部向量反序列化一遍再丢掉
+            match memory.count_memories() {
+                Ok(count) => lines.push(format!("长期记忆条数：{}", count)),
                 Err(e) => lines.push(format!("记忆读取失败：{}", e)),
             }
         }

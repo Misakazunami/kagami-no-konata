@@ -143,6 +143,14 @@ impl Tool for EditFile {
             anyhow::bail!("文件不存在：{}", target.display());
         }
 
+        let metadata = std::fs::metadata(&target)?;
+        if metadata.len() > super::fs_read::MAX_TEXT_FILE_BYTES {
+            anyhow::bail!(
+                "文件过大（{} MB，上限 {} MB），无法整体编辑：请改用脚本或分片处理",
+                metadata.len() / 1024 / 1024,
+                super::fs_read::MAX_TEXT_FILE_BYTES / 1024 / 1024
+            );
+        }
         let bytes = std::fs::read(&target)?;
         if super::fs_read::is_binary(&bytes) {
             anyhow::bail!("{} 是二进制文件，无法编辑", target.display());
@@ -209,16 +217,28 @@ impl Tool for EditFile {
 }
 
 /// 原子写入：临时文件 → fsync → rename（与 config.json 的写入方式一致）
+///
+/// 覆盖已存在的文件时**保留原权限位**：临时文件由 `File::create` 新建
+/// （默认 0644 & umask），rename 会整体替换 inode，若不显式回写，0600 的
+/// 私密文件会变宽松、可执行脚本会丢可执行位。
 fn atomic_write(target: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let dir = target
         .parent()
         .ok_or_else(|| anyhow::anyhow!("无法确定目标目录"))?;
     let tmp = dir.join(format!(".konata-tmp-{}", uuid::Uuid::new_v4()));
+    let original_permissions = std::fs::metadata(target).ok().map(|m| m.permissions());
 
     {
         let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+        if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            // 磁盘写满/IO 错误：清掉半截临时文件，不留在用户工作区
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+    }
+    if let Some(permissions) = original_permissions {
+        let _ = std::fs::set_permissions(&tmp, permissions);
     }
 
     // Windows 上 std::fs::rename 使用 MOVEFILE_REPLACE_EXISTING，可覆盖既有文件
@@ -363,7 +383,7 @@ mod tests {
         assert!(info.bytes > 0);
 
         // 回滚后回到原内容
-        let report = snapshots.restore("st1", &fx.services.workspaces);
+        let report = snapshots.restore("st1", &session_id, &fx.services.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(
             std::fs::read_to_string(fx.dir.join("note.md")).unwrap(),
@@ -385,7 +405,7 @@ mod tests {
         .unwrap();
         assert_eq!(snapshots.info(&session_id, "st1").files, 1);
 
-        snapshots.restore("st1", &fx.services.workspaces);
+        snapshots.restore("st1", &session_id, &fx.services.workspaces);
         assert_eq!(
             std::fs::read_to_string(fx.dir.join("note.md")).unwrap(),
             "第一行\n第二行\n第二行\n"
@@ -408,6 +428,45 @@ mod tests {
         assert!(err.to_string().contains("UTF-8"), "{err}");
         // 关键：文件必须一个字节都没动，而不是被 U+FFFD 替换后写回
         assert_eq!(std::fs::read(fx.dir.join("gbk.txt")).unwrap(), gbk);
+    }
+
+    #[test]
+    fn edit_file_refuses_oversized_files() {
+        let fx = Fixture::new("huge-edit", true);
+        let path = fx.dir.join("huge.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::agent::harness::tools::fs_read::MAX_TEXT_FILE_BYTES + 1)
+            .unwrap();
+        drop(file);
+
+        let cx = fx.ctx();
+        let err = block_on(EditFile.call(
+            json!({"path": "huge.txt", "old_string": "a", "new_string": "b"}),
+            &cx,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("过大"), "{err}");
+    }
+
+    /// 覆盖写入必须保留原权限位（0600 不能变 0644、可执行位不能丢）
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = Fixture::new("perms", true);
+        let path = fx.dir.join("note.md");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cx = fx.ctx();
+        block_on(WriteFile.call(
+            json!({"path": "note.md", "content": "新内容", "overwrite": true}),
+            &cx,
+        ))
+        .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "覆盖写入必须保留原权限位");
     }
 
     #[test]

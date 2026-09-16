@@ -974,6 +974,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!info) return;
     try {
       const report = await invoke<RestoreReportView>("restore_snapshot", {
+        sessionId: info.session_id,
         streamId: info.stream_id,
       });
       const parts = [`已还原 ${report.restored} 个文件`];

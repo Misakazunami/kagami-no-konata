@@ -119,16 +119,40 @@ fn ensure_within_limits(stats: &PathStats, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// 移动/复制一个路径（跨卷时退化为"复制 + 删除源"）
+/// 移动/复制一个路径（只在**跨卷**时退化为"复制 + 删除源"）
+///
+/// 历史实现把任何 `rename` 失败（权限、占用等）都当成跨卷，会导致
+/// "明明只是没权限，却去复制一份再删源"的危险行为；这里只对
+/// `ErrorKind::CrossesDevices`（Unix EXDEV / Windows ERROR_NOT_SAME_DEVICE）
+/// 退化，其余错误如实上报。
 fn move_any(from: &Path, to: &Path) -> Result<()> {
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            copy_any(from, to)?;
+        Err(e) if is_cross_device(&e) => {
+            let target_existed = to.exists();
+            if let Err(copy_err) = copy_any(from, to) {
+                // 复制失败：清掉可能已经写了一半的新目标，源保持不动
+                if !target_existed {
+                    let _ = remove_any(to);
+                }
+                return Err(copy_err);
+            }
             remove_any(from)?;
             Ok(())
         }
+        Err(e) => Err(anyhow::anyhow!(
+            "移动失败（{} → {}）：{}",
+            from.display(),
+            to.display(),
+            e
+        )),
     }
+}
+
+fn is_cross_device(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::CrossesDevices
+        // 老平台/特殊文件系统兜底：Unix 的 EXDEV
+        || e.raw_os_error() == Some(18)
 }
 
 fn copy_any(from: &Path, to: &Path) -> Result<()> {
@@ -145,8 +169,32 @@ fn copy_any(from: &Path, to: &Path) -> Result<()> {
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(from, to).map(|_| ()).map_err(|e| anyhow::anyhow!(e))
+        copy_file_atomically(from, to)
     }
+}
+
+/// 文件复制：先写同目录临时文件，再 rename 覆盖目标
+///
+/// `fs::copy` 会先截断目标再写，中途失败（磁盘满/IO 错误）会把原有内容
+/// 变成半截文件；临时文件 + rename 保证"要么旧内容、要么完整新内容"。
+fn copy_file_atomically(from: &Path, to: &Path) -> Result<()> {
+    let parent = to
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("无法确定目标目录：{}", to.display()))?;
+    let tmp = parent.join(format!(".konata-copy-{}", uuid::Uuid::new_v4()));
+    if let Err(e) = fs::copy(from, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!("复制失败（{}）：{}", from.display(), e));
+    }
+    if let Err(e) = fs::rename(&tmp, to) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!(
+            "复制完成但无法替换目标（{}）：{}",
+            to.display(),
+            e
+        ));
+    }
+    Ok(())
 }
 
 fn remove_any(target: &Path) -> Result<()> {
@@ -584,7 +632,8 @@ impl Tool for CopyPath {
         }
 
         // 目标会被覆盖时先备份它（复制本身不动源文件，无需备份源）
-        let target_capture = if to.abs_path.exists() {
+        let target_existed = to.abs_path.exists();
+        let target_capture = if target_existed {
             capture_existing(cx, &to.root_id, &to.rel, &to.abs_path)
         } else {
             None
@@ -595,7 +644,14 @@ impl Tool for CopyPath {
         }
 
         cx.ensure_not_cancelled()?;
-        copy_any(&from.abs_path, &to.abs_path)?;
+        if let Err(e) = copy_any(&from.abs_path, &to.abs_path) {
+            // 目录复制不是原子的：失败时把"本次新建的半个目标"清掉，
+            // 避免工作区里留下一个看似完整的副本（已存在的目标由原子文件复制保护）
+            if !target_existed {
+                let _ = remove_any(&to.abs_path);
+            }
+            return Err(e);
+        }
 
         let body = format!(
             "已复制：{} → {}（{} 个条目，{}）{}",
@@ -753,7 +809,7 @@ mod tests {
         // 删除前已备份 → 可以回滚
         let info = fx.snapshots.info(&fx.session_id, "st1");
         assert_eq!(info.files, 1);
-        let report = fx.snapshots.restore("st1", &fx.services.workspaces);
+        let report = fx.snapshots.restore("st1", &fx.session_id, &fx.services.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(
             std::fs::read_to_string(fx.dir.join("note.txt")).unwrap(),
@@ -800,7 +856,7 @@ mod tests {
         assert!(out.content.contains("已移动"), "{}", out.content);
 
         // 回滚把源放回原位
-        fx.snapshots.restore("st1", &fx.services.workspaces);
+        fx.snapshots.restore("st1", &fx.session_id, &fx.services.workspaces);
         assert_eq!(
             std::fs::read_to_string(fx.dir.join("old.txt")).unwrap(),
             "内容"

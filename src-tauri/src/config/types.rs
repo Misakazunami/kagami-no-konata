@@ -1002,6 +1002,20 @@ impl ToolConfig {
             return Err("拒绝访问模式不能为空字符串".to_string());
         }
 
+        // 内置拒绝条目**不可移除**：清空它意味着 config.json（API Key）、
+        // *.db、.env、.ssh/** 重新可读。允许在末尾追加自定义模式。
+        if let Some(missing) = self.missing_builtin_deny_globs().first() {
+            return Err(format!(
+                "拒绝访问模式缺少内置条目「{}」（内置条目不可移除，只能追加自定义模式）",
+                missing
+            ));
+        }
+        for pattern in &self.deny_globs {
+            if globset::GlobBuilder::new(pattern).build().is_err() {
+                return Err(format!("拒绝访问模式不是合法的 glob：{}", pattern));
+            }
+        }
+
         Ok(())
     }
 
@@ -1115,6 +1129,32 @@ mod tests {
         // 空 providers：历史上会让下次启动直接崩溃
         cfg.llm.providers.clear();
         assert!(cfg.validate().is_err());
+    }
+
+    /// 内置敏感文件拒绝条目不可移除；非法 glob 必须在保存前被拒绝
+    #[test]
+    fn validate_guards_deny_globs() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.validate().is_ok());
+
+        // 删掉任意一个内置条目（例如 config.json）→ 拒绝
+        cfg.tools.deny_globs.retain(|g| !g.contains("config.json"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("内置条目"), "{err}");
+
+        // 全清空 → 拒绝
+        cfg.tools.deny_globs.clear();
+        assert!(cfg.validate().is_err());
+
+        // 非法 glob → 拒绝（而不是静默跳过、让用户以为生效了）
+        let mut cfg = AppConfig::default();
+        cfg.tools.deny_globs.push("[[[".to_string());
+        assert!(cfg.validate().is_err());
+
+        // 追加合法自定义模式 → 允许
+        let mut cfg = AppConfig::default();
+        cfg.tools.deny_globs.push("**/secrets/**".to_string());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

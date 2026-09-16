@@ -98,8 +98,10 @@ fn move_to_trash_in(target: &Path, files_dir: &Path, info_dir: &Path) -> Result<
         Err(rename_err) => {
             // 跨卷（EXDEV）等情形：改为"复制成功后再删原文件"
             if let Err(copy_err) = copy_into_place(target, &trashed_path) {
-                // 复制失败 → 清理刚写的 info，原文件保持不动（fail-closed）
+                // 复制失败 → 清理刚写的 info 与**已复制的一半**（半截文件/半棵树
+                // 会永久占用磁盘且没有配对 info），原文件保持不动（fail-closed）
                 let _ = fs::remove_file(&info_path);
+                let _ = remove_any(&trashed_path);
                 anyhow::bail!(
                     "无法移入回收站（{}），且复制失败（{}）：为避免丢失，未删除 {}",
                     rename_err,
@@ -141,10 +143,15 @@ fn remove_any(target: &Path) -> Result<()> {
 /// 复制到回收站目标位置（文件用复制，目录递归复制）
 fn copy_into_place(target: &Path, destination: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(target)?;
-    if metadata.is_dir() {
+    if metadata.file_type().is_symlink() {
+        // 符号链接按链接本身复制：跟随目标会把工作区外的内容实体化进回收站
+        copy_symlink(target, destination)
+    } else if metadata.is_dir() {
         copy_tree(target, destination)
     } else {
-        fs::copy(target, destination).map(|_| ()).map_err(|e| anyhow::anyhow!(e))
+        fs::copy(target, destination)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!(e))
     }
 }
 
@@ -155,13 +162,31 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         let child_from = entry.path();
         let child_to = to.join(entry.file_name());
         let metadata = fs::symlink_metadata(&child_from)?;
-        if metadata.is_dir() {
+        if metadata.file_type().is_symlink() {
+            copy_symlink(&child_from, &child_to)?;
+        } else if metadata.is_dir() {
             copy_tree(&child_from, &child_to)?;
         } else {
             fs::copy(&child_from, &child_to)?;
         }
     }
     Ok(())
+}
+
+/// 复制符号链接本身（Unix）；其他平台无法可靠重建，明确拒绝而不是跟随目标
+#[cfg(unix)]
+fn copy_symlink(from: &Path, to: &Path) -> Result<()> {
+    let target = fs::read_link(from)?;
+    std::os::unix::fs::symlink(&target, to)
+        .map_err(|e| anyhow::anyhow!("创建符号链接失败：{}", e))
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(from: &Path, _to: &Path) -> Result<()> {
+    anyhow::bail!(
+        "暂不支持跨卷移动包含符号链接的目录：{}",
+        from.display()
+    )
 }
 
 /// 找一个还没被占用的条目名（`name`、`name.1`、`name.2`…）
@@ -212,19 +237,29 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn absolute(target: &Path) -> Result<String> {
-    let abs = if target.is_absolute() {
-        target.to_path_buf()
+fn absolute(target: &Path) -> Result<PathBuf> {
+    if target.is_absolute() {
+        Ok(target.to_path_buf())
     } else {
-        std::env::current_dir()?.join(target)
-    };
-    Ok(abs.to_string_lossy().to_string())
+        Ok(std::env::current_dir()?.join(target))
+    }
 }
 
 /// RFC2396 风格的百分号编码（XDG Trash Info 的 `Path` 键要求 URL 编码）
-fn encode_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len() + 8);
-    for byte in path.bytes() {
+///
+/// 非 UTF-8 文件名必须按**原始字节**编码：`to_string_lossy` 会把非法字节
+/// 替换成 U+FFFD，文件管理器按这条记录"还原"时会恢复到错误路径或直接失败。
+fn encode_path(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes: Vec<u8> = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes: Vec<u8> = path.to_string_lossy().as_bytes().to_vec();
+
+    let mut out = String::with_capacity(bytes.len() + 8);
+    for byte in bytes {
         let keep = byte.is_ascii_alphanumeric()
             || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~');
         if keep {
@@ -348,10 +383,43 @@ mod tests {
 
     #[test]
     fn path_is_percent_encoded() {
-        assert_eq!(encode_path("/home/me/a b.txt"), "/home/me/a%20b.txt");
-        assert_eq!(encode_path("/tmp/中文.txt"), "/tmp/%E4%B8%AD%E6%96%87.txt");
+        assert_eq!(
+            encode_path(Path::new("/home/me/a b.txt")),
+            "/home/me/a%20b.txt"
+        );
+        assert_eq!(encode_path(Path::new("/tmp/中文.txt")), "/tmp/%E4%B8%AD%E6%96%87.txt");
         // 安全字符保持原样，便于人读
-        assert_eq!(encode_path("/a-b_c.d~e/f"), "/a-b_c.d~e/f");
+        assert_eq!(encode_path(Path::new("/a-b_c.d~e/f")), "/a-b_c.d~e/f");
+    }
+
+    /// 非 UTF-8 文件名按原始字节编码（lossy 会变成 U+FFFD，还原时路径就错了）
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_is_encoded_as_raw_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = [b'/', b'a', 0xFF, b'b'];
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&raw));
+        assert_eq!(encode_path(&path), "/a%FFb");
+    }
+
+    /// 跨卷复制必须保留符号链接本身，而不是跟随目标把外部内容搬进来
+    #[cfg(unix)]
+    #[test]
+    fn cross_volume_copy_preserves_symlinks() {
+        let fx = Fixture::new("symlink");
+        let src = fx.root.join("tree");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("real.txt"), "内容").unwrap();
+        std::os::unix::fs::symlink("real.txt", src.join("link.txt")).unwrap();
+
+        let dst = fx.root.join("copied");
+        copy_tree(&src, &dst).unwrap();
+        let meta = std::fs::symlink_metadata(dst.join("link.txt")).unwrap();
+        assert!(meta.file_type().is_symlink(), "必须按链接复制");
+        assert_eq!(
+            std::fs::read_link(dst.join("link.txt")).unwrap(),
+            PathBuf::from("real.txt")
+        );
     }
 
     #[test]
