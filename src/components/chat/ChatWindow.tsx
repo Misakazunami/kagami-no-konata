@@ -187,10 +187,17 @@ export function ChatWindow() {
   // 悬浮窗状态：通过后端事件实时同步
   const [floatVisible, setFloatVisible] = useState(false);
   useEffect(() => {
-    // 初始化：查询当前悬浮窗状态
-    invoke<boolean>("is_float_visible").then(setFloatVisible).catch(() => {});
+    // 查询结果可能晚于事件到达：事件已经改过状态时丢弃这次快照，
+    // 否则会把更新的状态覆盖回旧值
+    let eventSeen = false;
+    invoke<boolean>("is_float_visible")
+      .then((visible) => {
+        if (!eventSeen) setFloatVisible(visible);
+      })
+      .catch(() => {});
     // 监听后端发射的可见性变化事件
     const unlisten = listen<boolean>("float-visibility-changed", (event) => {
+      eventSeen = true;
       setFloatVisible(event.payload);
     });
     return () => { unlisten.then((fn) => fn()); };
@@ -230,6 +237,25 @@ export function ChatWindow() {
     const current = document.documentElement.getAttribute("data-theme");
     setIsDark(current !== "light");
   }, []);
+
+  // 创建任务弹窗：Esc 关闭 + 打开时聚焦（键盘用户不被困在背景里）
+  const taskModalRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!showTaskModal) return;
+    const previous = document.activeElement as HTMLElement | null;
+    taskModalRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setShowTaskModal(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previous?.focus?.();
+    };
+  }, [showTaskModal]);
 
   return (
     <div className="chat-window">
@@ -283,8 +309,18 @@ export function ChatWindow() {
                   <div
                     key={s.id}
                     className={`session-item ${s.id === currentSessionId ? "active" : ""}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-current={s.id === currentSessionId ? "true" : undefined}
                     onClick={() => {
                       if (editingId !== s.id) switchSession(s.id);
+                    }}
+                    onKeyDown={(e) => {
+                      if (editingId === s.id) return;
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        switchSession(s.id);
+                      }
                     }}
                     onDoubleClick={(e) => startRename(s, e)}
                   >
@@ -314,6 +350,8 @@ export function ChatWindow() {
                     )}
                     <button
                       className="session-delete"
+                      aria-label={`删除会话「${s.title}」`}
+                      title="删除会话"
                       onClick={(e) => {
                         e.stopPropagation();
                         if (confirm(`确认删除会话「${s.title}」？`)) {
@@ -399,6 +437,8 @@ export function ChatWindow() {
         <div className="modal-overlay" onClick={() => setShowTaskModal(false)}>
           <div
             className="modal-card task-modal-card"
+            ref={taskModalRef}
+            tabIndex={-1}
             role="dialog"
             aria-modal="true"
             aria-label="创建任务会话"

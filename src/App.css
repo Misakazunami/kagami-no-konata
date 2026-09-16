@@ -404,6 +404,16 @@ html, body, #root {
   line-height: 1.6;
 }
 
+/* 键盘用户：会话条目与删除按钮必须有可见焦点 */
+.session-item:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.session-delete:focus-visible {
+  opacity: 1;
+}
+
 /* 流式期间按纯文本渲染：保留换行与空白，避免正文在落库前被 HTML 折叠 */
 .message-content.streaming-plain {
   white-space: pre-wrap;

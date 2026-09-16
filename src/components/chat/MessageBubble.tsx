@@ -120,6 +120,7 @@ function MessageBubbleImpl({ message, showStats, liveToolCalls }: Props) {
             <button
               className="thinking-toggle"
               onClick={() => setThinkingExpanded(!thinkingExpanded)}
+              aria-expanded={thinkingExpanded}
             >
               <span className="thinking-icon">🧠</span>
               <span>思考过程</span>

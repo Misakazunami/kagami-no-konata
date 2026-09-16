@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
+import { register } from "@tauri-apps/plugin-global-shortcut";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emptyGenerationState, getLastLocalStreamId, useChatStore } from "./stores/chatStore";
 import { ChatWindow } from "./components/chat/ChatWindow";
@@ -23,6 +23,14 @@ function applyTheme(theme: string, fontSize: number) {
   }
   root.style.fontSize = `${fontSize}px`;
 }
+
+/**
+ * 全局快捷键是否已注册
+ *
+ * 模块级守卫：主窗口单实例且与进程同生命周期，注册一次即可；
+ * 若随组件卸载注销，会与下一次挂载的注册竞态（见 effect 内注释）。
+ */
+let mainShortcutRegistered = false;
 
 function App() {
   const currentPage = useChatStore((s) => s.currentPage);
@@ -61,10 +69,12 @@ function App() {
       llm: { providers: Array<{ id: string; api_key: string; model: string }>; active_provider_id: string };
     }>("get_config")
       .then((config) => {
+        // 主题与字号**永远**要应用：超时兜底只是让界面先可交互，
+        // 若之后配置才返回而这里直接 return，用户配置的主题会被永久吞掉
+        applyTheme(config.ui.theme, config.ui.font_size);
         if (settled) return;
         settled = true;
         clearTimeout(timeoutId);
-        applyTheme(config.ui.theme, config.ui.font_size);
         // 只有**活跃**提供商才算配置完成：历史实现检查"任意一个提供商有 key"，
         // 多提供商场景下会跳过引导，随后因为活跃提供商缺 key/模型而直接失败。
         const active = config.llm.providers.find(
@@ -108,10 +118,23 @@ function App() {
     const fns: Array<() => void> = [];
     let disposed = false;
 
-    // 注册 Ctrl+Shift+K 切换主窗口（卸载时必须注销，否则 HMR/重挂载会残留回调）
-    register("CmdOrCtrl+Shift+K", () => {
-      invoke("toggle_main_window");
-    }).catch(console.error);
+    /*
+     * 全局快捷键 Ctrl+Shift+K 切换主窗口
+     *
+     * 注册与注销都是异步的，且主窗口在进程生命周期内只有一个实例：
+     * 每次挂载都 unregister 会与下一次 register 竞态（最终可能落在"已注销"
+     * 状态）。因此这里只注册一次（模块级守卫），不随组件卸载注销；
+     * 失败只记录日志，不影响其它功能。
+     */
+    if (!mainShortcutRegistered) {
+      mainShortcutRegistered = true;
+      register("CmdOrCtrl+Shift+K", () => {
+        invoke("toggle_main_window");
+      }).catch((e) => {
+        mainShortcutRegistered = false;
+        console.error("Failed to register global shortcut:", e);
+      });
+    }
 
     void (async () => {
       // allSettled：单个订阅失败不能带走其它监听
@@ -175,8 +198,7 @@ function App() {
     return () => {
       disposed = true;
       fns.forEach((fn) => fn());
-      // capabilities 已授予 global-shortcut:allow-unregister
-      unregister("CmdOrCtrl+Shift+K").catch(() => {});
+      // 快捷键故意不注销（见上方注释）：窗口与进程同生命周期
     };
   }, [isFloatWindow]);
 

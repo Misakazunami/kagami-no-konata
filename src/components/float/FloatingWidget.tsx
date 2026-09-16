@@ -33,6 +33,10 @@ export function FloatingWidget() {
   const isStreamingRef = useRef(false);
   const inputFocusedRef = useRef(false);
   const autoHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 失焦后的延时判断（150ms）：需要能取消，且不能读到陈旧的 bubbleContent */
+  const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bubbleContentRef = useRef("");
+  bubbleContentRef.current = bubbleContent;
   /** 本窗口发起的生成标识：只有它的事件才会渲染到气泡里 */
   const activeStreamIdRef = useRef<string | null>(null);
 
@@ -116,8 +120,14 @@ export function FloatingWidget() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 卸载时清理自动隐藏计时器
-  useEffect(() => clearAutoHide, []);
+  // 卸载时清理自动隐藏与失焦计时器
+  useEffect(
+    () => () => {
+      if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current);
+      if (blurTimerRef.current) clearTimeout(blurTimerRef.current);
+    },
+    []
+  );
 
   // 流式事件：只渲染本窗口发起的那一次生成
   useEffect(() => {
@@ -315,12 +325,16 @@ export function FloatingWidget() {
           }}
           onBlur={() => {
             inputFocusedRef.current = false;
-            setTimeout(() => {
+            if (blurTimerRef.current) clearTimeout(blurTimerRef.current);
+            blurTimerRef.current = setTimeout(() => {
+              blurTimerRef.current = null;
               if (!document.hasFocus()) {
-                // 失焦时如果有内容，启动自动隐藏而非立即隐藏
-                if (bubbleContent && !isStreamingRef.current) {
+                // 失焦时如果有内容，启动自动隐藏而非立即隐藏；
+                // 这里读 ref 而不是闭包里的 bubbleContent：150ms 内可能刚收到
+                // 第一个 chunk，用陈旧值会把正在流式的气泡直接藏掉
+                if (bubbleContentRef.current && !isStreamingRef.current) {
                   startAutoHide();
-                } else {
+                } else if (!isStreamingRef.current) {
                   setShowBubble(false);
                 }
               }

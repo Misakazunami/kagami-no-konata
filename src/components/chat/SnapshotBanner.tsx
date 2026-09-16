@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import type { SnapshotInfoView } from "../../types/events";
 
@@ -47,12 +48,25 @@ export function SnapshotBannerView({
 }: {
   snapshot: SnapshotInfoView | null;
   notice: string | null;
-  onRestore: () => void;
+  onRestore: () => void | Promise<void>;
   onDismiss: () => void;
 }) {
+  // 回滚是不可重入的：快速双击会发出两次 restore_snapshot，
+  // 产生重复还原与互相覆盖的提示文案
+  const [restoring, setRestoring] = useState(false);
   if (!snapshot) return null;
 
   const size = formatBackupSize(snapshot.bytes);
+
+  const handleRestore = async () => {
+    if (restoring) return;
+    setRestoring(true);
+    try {
+      await onRestore();
+    } finally {
+      setRestoring(false);
+    }
+  };
 
   return (
     <div className="snapshot-banner" role="status">
@@ -66,10 +80,11 @@ export function SnapshotBannerView({
       </span>
       <button
         className="snapshot-restore-btn"
-        onClick={onRestore}
+        onClick={handleRestore}
+        disabled={restoring}
         title="把这一轮生成改动的文件还原回改动前的内容"
       >
-        回滚
+        {restoring ? "回滚中…" : "回滚"}
       </button>
       <button
         className="snapshot-dismiss-btn"

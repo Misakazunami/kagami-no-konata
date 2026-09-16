@@ -103,6 +103,43 @@ export function ToolApprovalDialog() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [pendingApproval]);
 
+  /*
+   * 焦点管理
+   *
+   * - 打开时聚焦"拒绝"（最安全的默认动作），而不是让焦点留在背景页面上；
+   * - Tab 在弹窗内循环，不把键盘用户带到遮罩后面的控件；
+   * - 关闭时把焦点还给打开前的元素（通常是输入框）。
+   */
+  const cardRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!pendingApproval) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const card = cardRef.current;
+    card?.querySelector<HTMLElement>(".tool-approval-btn.deny")?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab" || !card) return;
+      const nodes = Array.from(
+        card.querySelectorAll<HTMLElement>("button:not([disabled])")
+      );
+      if (nodes.length === 0) return;
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    card?.addEventListener("keydown", onKeyDown);
+    return () => {
+      card?.removeEventListener("keydown", onKeyDown);
+      previous?.focus?.();
+    };
+  }, [pendingApproval]);
+
   if (!pendingApproval) return null;
 
   // 归一化后再查表：后端新增权限字面量/协议漂移时不能直接索引 undefined
@@ -124,7 +161,7 @@ export function ToolApprovalDialog() {
       aria-label="工具调用审批"
       onClick={() => decide("deny")}
     >
-      <div className="tool-approval-card" onClick={(e) => e.stopPropagation()}>
+      <div className="tool-approval-card" ref={cardRef} onClick={(e) => e.stopPropagation()}>
         <div className="tool-approval-title">
           <span className="tool-approval-icon" aria-hidden="true">
             🔐

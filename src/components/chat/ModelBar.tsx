@@ -110,8 +110,9 @@ export function ModelBar() {
 
   const handleToggleAuto = () => {
     if (mode === "auto") {
-      // 关闭自动 → 回到跟随全局
-      applyPref(null);
+      // 关闭自动 → 回到跟随全局；深度思考是本会话的意愿，必须保留
+      // （历史实现直接 applyPref(null)，把用户刚开的思考开关一起清掉）
+      applyPref({ mode: "inherit", thinking: pref?.thinking ?? null });
     } else {
       applyPref({ mode: "auto", thinking: pref?.thinking ?? null });
     }
@@ -166,6 +167,13 @@ export function ModelBar() {
           <option value={INHERIT_VALUE}>
             跟随全局：{activeProviderModels(catalog)?.current_model || "未配置"}
           </option>
+          {/* 会话选定的模型被停用/移出目录后，仍要把当前值显示在下拉框里，
+              否则 select 匹配不到 option 会显示空白（用户不知道现在用的是什么） */}
+          {mode === "manual" && !effectiveOption && pref?.model && (
+            <option value={manualValue}>
+              {pref.model}（已停用或不在目录中）
+            </option>
+          )}
           {catalog.providers.map((provider) => (
             <optgroup
               key={provider.provider_id}
