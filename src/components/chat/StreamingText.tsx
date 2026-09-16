@@ -114,9 +114,10 @@ export function StreamingText({ onFinished }: Props) {
         {hasThinking && (
           <ThinkingSection thinking={display.thinking} />
         )}
-        {/* 正文内容 */}
+        {/* 正文内容：流式期间按纯文本保留换行（markdown 在落库后统一渲染），
+            否则换行会被 HTML 折叠、代码块符号裸露 */}
         {hasContent ? (
-          <div className="message-content">
+          <div className="message-content streaming-plain">
             {display.content}
             <span className="cursor-blink">▊</span>
           </div>
@@ -139,7 +140,11 @@ function ThinkingSection({ thinking }: { thinking: string }) {
 
   return (
     <div className="thinking-section">
-      <button className="thinking-toggle" onClick={() => setExpanded(!expanded)}>
+      <button
+        className="thinking-toggle"
+        onClick={() => setExpanded(!expanded)}
+        aria-expanded={expanded}
+      >
         <span className="thinking-icon">🧠</span>
         <span>思考过程</span>
         <span className={`thinking-arrow ${expanded ? "expanded" : ""}`}>▶</span>

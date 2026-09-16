@@ -666,11 +666,13 @@ pub const DEFAULT_DENY_GLOBS: &[&str] = &[
 
 /// 默认允许执行的外部程序
 ///
-/// 这只是"白名单"的一半语义：真正的黑名单（shell、计划任务、注册表、
-/// 网络下载器、`npx`/`bunx` 这类"下载即执行"的包运行器等）硬编码在
-/// `agent::harness::command_guard` 中且**优先级更高**，用户配置只能收窄、不能放宽。
+/// 内置默认项**始终有效**：`CommandGuard::from_allowlist` 会无条件合并本列表，
+/// 用户只能在默认项之外追加，不能通过删配置移除它们（想彻底禁用请关闭工具
+/// 或改用只读模式）。真正的黑名单（shell、计划任务、注册表、网络下载器、
+/// `npx`/`bunx` 这类"下载即执行"的包运行器）硬编码在
+/// `agent::harness::command_guard` 中且**优先级更高**，用户配置无法放行；
 /// 代执行类参数（`find -exec`、`git -c alias.x=!cmd`、`npm exec`/`pnpm dlx`）
-/// 也在守卫的参数审查里一律拒绝。
+/// 也在参数审查里一律拒绝。
 pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     "git", "cargo", "rustc", "rustup", "node", "npm", "pnpm", "yarn", "deno", "bun",
     "python", "python3", "pip", "pip3", "uv", "go", "java", "javac", "mvn", "gradle", "dotnet",

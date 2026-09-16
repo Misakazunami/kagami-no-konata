@@ -56,11 +56,14 @@ export function ToolCallCard({ call }: Props) {
   const body = call.error ?? call.preview;
   const liveOutput = call.output ?? "";
 
-  // 执行中跟随滚动到底部；结束后不再打扰（此时用户可能正在往上翻）
+  // 执行中跟随滚动到底部；用户主动上翻查看历史输出时不打扰，
+  // 结束后不再滚动（此时用户可能正在往上翻）
   useEffect(() => {
     if (!running) return;
     const el = liveRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (nearBottom) el.scrollTop = el.scrollHeight;
   }, [liveOutput, running]);
 
   return (

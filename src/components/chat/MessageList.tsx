@@ -20,6 +20,7 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
   const isStreaming = useChatStore((s) => s.isStreaming);
   const liveToolCalls = useChatStore((s) => s.liveToolCalls);
   const toolsByMessage = useChatStore((s) => s.toolsByMessage);
+  const currentSessionId = useChatStore((s) => s.currentSessionId);
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [showStats, setShowStats] = useState(false);
@@ -80,6 +81,19 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
     if (!el) return true;
     return el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_THRESHOLD;
   };
+
+  // 切换会话 / 首次挂载：无条件滚到最新消息
+  //
+  // 不能复用 `isNearBottom()`：切换瞬间 scrollTop 还是旧值（新会话刚挂载时是 0），
+  // 从短会话切到 200 条消息的长会话必然判定"不在底部"，用户只能看到最旧一条。
+  const prevSessionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevSessionRef.current === currentSessionId) return;
+    prevSessionRef.current = currentSessionId;
+    requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ block: "end" });
+    });
+  }, [currentSessionId, messages]);
 
   // 新消息到达时：仅当用户位于底部附近才自动滚动（上翻阅读历史时不打扰）
   useEffect(() => {

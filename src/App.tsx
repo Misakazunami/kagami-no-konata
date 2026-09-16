@@ -114,7 +114,9 @@ function App() {
     }).catch(console.error);
 
     void (async () => {
-      const listeners = await Promise.all([
+      // allSettled：单个订阅失败不能带走其它监听
+      // （Promise.all 失败时，已成功返回的 unlisten 函数会全部泄漏）
+      const results = await Promise.allSettled([
         // 监听托盘菜单导航事件
         listen<string>("navigate-to", (event) => {
           if (event.payload === "settings") {
@@ -156,10 +158,18 @@ function App() {
       ]);
 
       if (disposed) {
-        listeners.forEach((fn) => fn());
+        results.forEach((result) => {
+          if (result.status === "fulfilled") result.value();
+        });
         return;
       }
-      fns.push(...listeners);
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          fns.push(result.value);
+        } else {
+          console.error("Failed to subscribe window event:", result.reason);
+        }
+      }
     })();
 
     return () => {

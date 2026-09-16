@@ -404,6 +404,12 @@ html, body, #root {
   line-height: 1.6;
 }
 
+/* 流式期间按纯文本渲染：保留换行与空白，避免正文在落库前被 HTML 折叠 */
+.message-content.streaming-plain {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ===== Markdown 渲染 ===== */
 .message-content p {
   margin: 0 0 8px;
