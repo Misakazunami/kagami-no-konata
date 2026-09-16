@@ -60,6 +60,25 @@ pub struct Session {
     pub id: String,
     pub title: String,
     pub persona_id: String,
+    #[serde(default = "default_session_type")]
+    pub session_type: String,
+    #[serde(default = "default_task_mode")]
+    pub task_mode: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// 会话级模型选择（手动 / 自动 + 深度思考开关）
+    ///
+    /// `None` = 跟随全局活跃提供商（与未引入该功能时一致）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_pref: Option<crate::llm::router::SessionModelPref>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_session_type() -> String {
+    "chat".to_string()
+}
+
+fn default_task_mode() -> String {
+    "plan".to_string()
 }

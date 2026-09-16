@@ -247,7 +247,7 @@ mod tests {
     fn seed_legacy(dir: &Path) {
         let conn = db::init_db(dir).unwrap();
         let store = ChatStore::new(conn);
-        let session = store.create_session("konata-default", "旧会话").unwrap();
+        let session = store.create_session("konata-default", "旧会话", None, None, None).unwrap();
         store
             .add_message(&session.id, crate::agent::context::Role::User, "你好", 1, 0, None)
             .unwrap();
@@ -375,7 +375,7 @@ mod tests {
         // 写入后不 checkpoint，制造"数据还在 WAL 里"的状态
         let conn = db::init_db(&legacy).unwrap();
         let store = ChatStore::new(conn);
-        let session = store.create_session("konata-default", "WAL 里的会话").unwrap();
+        let session = store.create_session("konata-default", "WAL 里的会话", None, None, None).unwrap();
         store
             .add_message(&session.id, crate::agent::context::Role::User, "hi", 1, 0, None)
             .unwrap();

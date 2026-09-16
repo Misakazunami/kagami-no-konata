@@ -16,7 +16,7 @@ use crate::config::types::LlmProvider;
 use crate::llm::proxy::LlmProxy;
 use crate::llm::types::LlmMessage;
 use crate::memory::extractor::MemoryExtractor;
-use crate::store::chat_store::ToolInvocationRow;
+use crate::store::chat_store::{ChatStore, ToolInvocationRow};
 use crate::AppState;
 
 /// 交给 LLM 的历史消息条数上限（对应文档中的"保留最近 10 条"）
@@ -62,6 +62,19 @@ fn build_retrieval_query(user_input: &str, conversation: &[Message]) -> String {
     let mut parts: Vec<&str> = recent.into_iter().rev().collect();
     parts.push(user_input);
     parts.join(" ")
+}
+
+/// 把"写库失败"翻译成用户能看懂的话
+///
+/// 会话刚被删除时，SQLite 只会回一句 `FOREIGN KEY constraint failed`——
+/// 直接抛给界面就变成「发送失败：FOREIGN KEY constraint failed」（真实报障）。
+/// 这里先确认会话到底还在不在，再决定说什么。
+fn persist_failure(store: &ChatStore, session_id: &str, error: anyhow::Error) -> String {
+    if store.get_session(session_id).is_err() {
+        format!("会话已被删除（{}），请新建一个会话再发送", session_id)
+    } else {
+        format!("保存消息失败：{}", error)
+    }
 }
 
 /// 统一的流式事件载荷
@@ -141,6 +154,45 @@ fn read_summary(store: &crate::store::chat_store::ChatStore, session_id: &str) -
                 e
             );
             (None, 0)
+        }
+    }
+}
+
+/// 读取会话级任务计划
+///
+/// 与 `read_summary` 同样的降级原则：计划只是上下文的一部分，
+/// 读失败（例如旧库缺 `session_plans` 表）绝不能让「发送」失败。
+fn read_plan(
+    store: &crate::store::chat_store::ChatStore,
+    session_id: &str,
+) -> Option<crate::agent::plan::SessionPlan> {
+    match store.get_plan(session_id) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!(
+                "[plan] 任务计划读取失败，本轮按「没有计划」处理（不影响发送）: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// 读取会话工作记忆
+///
+/// 与计划同样的降级原则：读失败（旧库缺表等）只记录，绝不让「发送」失败。
+fn read_notes(
+    store: &crate::store::chat_store::ChatStore,
+    session_id: &str,
+) -> Vec<crate::agent::notes::SessionNote> {
+    match store.list_notes(session_id) {
+        Ok(notes) => notes,
+        Err(e) => {
+            eprintln!(
+                "[notes] 工作记忆读取失败，本轮按「没有笔记」处理（不影响发送）: {}",
+                e
+            );
+            Vec::new()
         }
     }
 }
@@ -225,17 +277,34 @@ async fn load_context(
 /// 既不暴露工具，也不会触发审批弹窗。判定依据是 Tauri 注入的窗口 label
 /// 而不是 `persist` —— 悬浮窗的输入框发的是会落库的消息（`persist` 为默认 true），
 /// 只有戳一戳才是 `persist: false`，用 `persist` 判定会漏掉桌宠聊天这条路径。
+/// 配置 → 运行时限额的映射
+///
+/// 单独抽出来是为了能被测试覆盖：这些数值直接决定"一条命令能跑多久、输出留多少"，
+/// 而 `build_tool_runtime` 需要 `AppHandle`，在单测里构造不出来。
+fn tool_limits(cfg: &crate::config::types::ToolConfig) -> ToolLimits {
+    ToolLimits {
+        max_output_bytes: cfg.max_output_bytes,
+        // 可配（默认 60 秒）：首次编译这类长命令需要更大的预算，
+        // 超时时工具会主动收手并把已收到的输出带回来
+        call_timeout: Duration::from_secs(cfg.call_timeout_secs),
+        approval_timeout: Duration::from_secs(cfg.approval_timeout_secs),
+    }
+}
+
 fn build_tool_runtime(
     app: &AppHandle,
     window: &WebviewWindow,
     state: &AppState,
     llm_provider: &LlmProvider,
+    session_type: &str,
+    task_mode: &str,
+    target_workspace_id: Option<&str>,
 ) -> Option<ToolRuntime> {
     if window.label() == "float" {
         return None;
     }
 
-    let (tools_cfg, app_data_dir) = {
+    let (mut tools_cfg, app_data_dir) = {
         let config = state.config.lock().ok()?;
         let data_dir = state.app_data_dir.lock().ok()?.clone();
         (config.tools.clone(), data_dir)
@@ -245,11 +314,41 @@ fn build_tool_runtime(
         return None;
     }
 
+    // 如果任务会话绑定了特定的工作区，则优先将该工作区置顶/设为该轮的默认工作区
+    if let Some(ws_id) = target_workspace_id {
+        if let Some(pos) = tools_cfg.workspaces.iter().position(|w| w.id == ws_id) {
+            let mut target = tools_cfg.workspaces.remove(pos);
+            // 标记为主工作区，使模型可以直接以相对路径访问该目录
+            target.id = crate::config::types::DEFAULT_WORKSPACE_ID.to_string();
+            tools_cfg.workspaces.insert(0, target);
+        }
+    }
+
+    // 根据会话类型与模式动态决定工具权限与步数限制：
+    // - 普通会话 (chat)：锁定为轻量只读，步数较小（如 3 轮），防止闲聊陷入多轮复杂思考
+    // - 任务会话 (task) - Plan 模式：严格锁定只读 (ToolMode::ReadOnly)，杜绝写文件与命令，步数 8
+    // - 任务会话 (task) - Work 模式：使用配置的权限 (Standard 或 Full)，步数增加（如 20 轮）
+    let (effective_mode, effective_max_steps) = if session_type == "task" {
+        if task_mode == "plan" {
+            (crate::config::types::ToolMode::ReadOnly, 8.min(tools_cfg.max_steps))
+        } else {
+            (tools_cfg.mode, tools_cfg.max_steps.max(20))
+        }
+    } else {
+        // 普通聊天会话
+        (crate::config::types::ToolMode::ReadOnly, 3.min(tools_cfg.max_steps))
+    };
+
     let workspaces = WorkspaceSet::from_config(&tools_cfg, &app_data_dir);
+    // 写类工具改动前的快照：让"模型动过的文件"可以一键回滚
+    let snapshots = Arc::new(crate::agent::harness::SnapshotStore::new(
+        &app_data_dir,
+        state.chat_store.clone(),
+    ));
     let services = ToolServices {
         app_data_dir,
         workspaces,
-        mode: tools_cfg.mode,
+        mode: effective_mode,
         llm_provider: Some(llm_provider.clone()),
         memory: Some(state.memory_store.clone()),
         personas: Some(state.personas.clone()),
@@ -257,6 +356,12 @@ fn build_tool_runtime(
         web_domains: tools_cfg.web_domain_allowlist.clone(),
         command_allowlist: tools_cfg.command_allowlist.clone(),
         opener: Some(Arc::new(TauriOpener::new(app.clone()))),
+        snapshots: Some(snapshots),
+        // 子代理运行时由 ChatAgent 在每次生成时挂上（它才持有 LLM 后端）
+        subagent: None,
+        working_memory: tools_cfg.working_memory,
+        // 未启用/未配好时为 None：工具会给出"请去设置里填端点"的明确指引
+        search: tools_cfg.search.resolved(),
     };
 
     Some(ToolRuntime {
@@ -268,12 +373,8 @@ fn build_tool_runtime(
         )),
         enabled: true,
         auto_approve: tools_cfg.auto_approve.clone(),
-        limits: ToolLimits {
-            max_output_bytes: tools_cfg.max_output_bytes,
-            call_timeout: Duration::from_secs(60),
-            approval_timeout: Duration::from_secs(tools_cfg.approval_timeout_secs),
-        },
-        max_steps: tools_cfg.max_steps,
+        limits: tool_limits(&tools_cfg),
+        max_steps: effective_max_steps,
     })
 }
 
@@ -312,18 +413,18 @@ pub async fn send_message(
     let user_tokens = estimate_tokens(&content);
     if persist {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-        store
-            .add_message(&session_id, Role::User, &content, user_tokens, 0, None)
-            .map_err(|e| e.to_string())?;
+        if let Err(e) = store.add_message(&session_id, Role::User, &content, user_tokens, 0, None) {
+            return Err(persist_failure(&store, &session_id, e));
+        }
     }
 
-    // 获取会话的人格 ID
-    let persona_id = {
+    // 获取会话的人格 ID、会话类型、任务模式、指定的工作区 ID 与会话级模型偏好
+    let (persona_id, session_type, task_mode, workspace_id, model_pref) = {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
         store
             .get_session(&session_id)
-            .map(|s| s.persona_id)
-            .unwrap_or_else(|_| "konata-default".to_string())
+            .map(|s| (s.persona_id, s.session_type, s.task_mode, s.workspace_id, s.model_pref))
+            .unwrap_or_else(|_| ("konata-default".to_string(), "chat".to_string(), "plan".to_string(), None, None))
     };
 
     // 获取配置（使用活跃提供商）
@@ -337,6 +438,15 @@ pub async fn send_message(
             config.memory.auto_extract,
             config.memory.max_context_memories,
         )
+    };
+
+    // 本轮模型方案：会话级选择 + 主/子模型路由（详见 `llm::router`）
+    //
+    // 解析在这里（而不是 Agent 内部）完成：本轮生成拿到的是**快照**，
+    // 因此用户在生成过程中切换模型不会影响这一轮，两个窗口并发生成也互不影响。
+    let models = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        crate::llm::router::resolve(&config, model_pref.as_ref(), &session_type, &task_mode)
     };
 
     // 构建上下文（必要时增量压缩早期历史）
@@ -367,7 +477,40 @@ pub async fn send_message(
 
     // 构建 AgentContext（含记忆 + 用户信息 + 工具运行时）
     // 工具运行时只对主窗口构建；悬浮窗得到 None，走与接入工具前完全一致的纯对话链路
-    let tools = build_tool_runtime(&app, &window, &state, &llm_provider);
+    let tools = build_tool_runtime(
+        &app,
+        &window,
+        &state,
+        &llm_provider,
+        &session_type,
+        &task_mode,
+        workspace_id.as_deref(),
+    );
+    // 任务计划只服务于"有工具的链路"：悬浮窗不注入，保持纯对话行为不变
+    let plan = if tools.is_some() {
+        state
+            .chat_store
+            .lock()
+            .ok()
+            .and_then(|store| read_plan(&store, &session_id))
+    } else {
+        None
+    };
+    // 工作记忆同样只服务于有工具的链路；关掉开关时连读都不读
+    let notes = if tools
+        .as_ref()
+        .map(|runtime| runtime.services.working_memory)
+        .unwrap_or(false)
+    {
+        state
+            .chat_store
+            .lock()
+            .ok()
+            .map(|store| read_notes(&store, &session_id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let ctx = AgentContext {
         user_input: content.clone(),
         system_hint,
@@ -378,6 +521,11 @@ pub async fn send_message(
         user_info: Some(user_info),
         retrieved_memories,
         tools,
+        models: Some(Arc::new(models.clone())),
+        plan,
+        notes,
+        session_type,
+        task_mode,
         session_id: session_id.clone(),
         stream_id: stream_id.clone(),
     };
@@ -458,7 +606,9 @@ pub async fn send_message(
     // 计算统计
     let thinking_ms = start_time.elapsed().as_millis() as i64;
     let assistant_tokens = estimate_tokens(&response.content);
-    let total_tokens = user_tokens + assistant_tokens;
+    // 工具额外开销（只读子代理自己发起过生成）也要算进去，否则用户会疑惑
+    // "我只问了一句话，用量怎么涨这么多"
+    let total_tokens = user_tokens + assistant_tokens + response.extra_tokens as i64;
 
     // 提取思考内容
     let thinking_content = {
@@ -479,6 +629,8 @@ pub async fn send_message(
             "stream_id": &stream_id,
             "token_count": total_tokens,
             "thinking_ms": thinking_ms,
+            // 本轮实际用的模型（自动选择下主/子模型不同，必须让用户看得见）
+            "model": models.label(),
         }),
     );
     let _ = app.emit(
@@ -495,16 +647,30 @@ pub async fn send_message(
     let invocations = response.tool_invocations.clone();
     let full_conversation = {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-        let assistant_message = store
-            .add_message(
-                &session_id,
-                Role::Assistant,
-                &response.content,
-                assistant_tokens,
-                thinking_ms,
-                thinking_content,
-            )
-            .map_err(|e| e.to_string())?;
+        let assistant_message = match store.add_message(
+            &session_id,
+            Role::Assistant,
+            &response.content,
+            assistant_tokens,
+            thinking_ms,
+            thinking_content,
+        ) {
+            Ok(message) => message,
+            Err(e) => {
+                // 会话在生成期间被删除（用户在长任务跑到一半时删掉了它）：
+                // 正文已经流式送达，而这条会话行已经不存在 —— 往一张不存在的
+                // 会话里写回复没有任何意义，更不该把裸的 SQLite 外键错误
+                // 抛成「发送失败」（真实报障：FOREIGN KEY constraint failed）。
+                if store.get_session(&session_id).is_err() {
+                    eprintln!(
+                        "[chat] 会话已被删除，本轮回复不落库 session={} stream={}",
+                        session_id, stream_id
+                    );
+                    return Ok(());
+                }
+                return Err(format!("保存回复失败：{}", e));
+            }
+        };
         // 记录使用统计
         let _ = store.record_usage(user_tokens, assistant_tokens, thinking_ms);
 
@@ -661,17 +827,91 @@ pub async fn create_session(
     state: State<'_, AppState>,
     title: Option<String>,
     persona_id: Option<String>,
+    session_type: Option<String>,
+    workspace_id: Option<String>,
+    model_pref: Option<crate::llm::router::SessionModelPref>,
 ) -> Result<String, String> {
-    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    let is_task = session_type.as_deref() == Some("task");
     let title = title
         .map(|t| t.trim().chars().take(64).collect::<String>())
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| "新会话".to_string());
+        .unwrap_or_else(|| {
+            if is_task {
+                "新任务".to_string()
+            } else {
+                "新会话".to_string()
+            }
+        });
     let persona_id = persona_id.unwrap_or_else(|| "konata-default".to_string());
+
+    // 新的任务会话可以按配置默认开启"自动选择"（只对任务会话有意义）
+    let model_pref = match model_pref {
+        Some(pref) => Some(pref),
+        None if is_task => {
+            let config = state.config.lock().map_err(|e| e.to_string())?;
+            config
+                .models
+                .auto_by_default
+                .then(crate::llm::router::SessionModelPref::auto)
+        }
+        None => None,
+    };
+
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
     let session = store
-        .create_session(&persona_id, &title)
+        .create_session_with_model(
+            &persona_id,
+            &title,
+            session_type.as_deref(),
+            Some("plan"),
+            workspace_id.as_deref(),
+            model_pref.as_ref(),
+        )
         .map_err(|e| e.to_string())?;
     Ok(session.id)
+}
+
+/// 设置会话级模型选择（手动选定模型 / 自动选择 / 深度思考开关）
+///
+/// `pref` 为 `None` 时清除选择，回到"跟随全局活跃提供商"。
+/// 只写数据库，不触碰任何全局状态：因此**不会影响正在跑的生成**
+/// （本轮生成用的是发送那一刻的快照，见 `llm::router`）。
+///
+/// 刻意**不**广播 `session-updated`：那个事件会让前端重读整个会话
+/// （含消息列表），而模型选择已经由前端本地同步；另一侧（悬浮窗）没有模型 UI，
+/// 它下一条消息直接读数据库里的新值即可。
+#[tauri::command]
+pub async fn set_session_model(
+    state: State<'_, AppState>,
+    session_id: String,
+    pref: Option<crate::llm::router::SessionModelPref>,
+) -> Result<(), String> {
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    // 会话必须存在：否则用户会以为"选上了"，其实写进了一条不存在的会话
+    store
+        .get_session(&session_id)
+        .map_err(|_| format!("会话不存在：{}", session_id))?;
+    store
+        .set_session_model_pref(&session_id, pref.as_ref())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 切换会话的任务模式 (plan | work)
+#[tauri::command]
+pub async fn set_task_mode(
+    state: State<'_, AppState>,
+    session_id: String,
+    task_mode: String,
+) -> Result<(), String> {
+    let mode = match task_mode.to_lowercase().as_str() {
+        "work" => "work",
+        _ => "plan",
+    };
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    store
+        .set_task_mode(&session_id, mode)
+        .map_err(|e| e.to_string())
 }
 
 /// 查找或创建今日会话（优先复用空会话）
@@ -694,7 +934,7 @@ pub async fn find_or_create_today_session(
 
     // 3. 都没有，创建新会话
     store
-        .create_session("konata-default", "新会话")
+        .create_session("konata-default", "新会话", Some("chat"), Some("plan"), None)
         .map_err(|e| e.to_string())
 }
 
@@ -738,12 +978,40 @@ pub async fn get_messages(
 }
 
 /// 删除会话
+///
+/// 必须先停掉这个会话正在跑的生成：删除只删数据库行，生成任务仍在跑，
+/// 它跑完会尝试把回复写回 `messages` —— 而那条会话行已经没了，SQLite 只会回
+/// `FOREIGN KEY constraint failed`，用户看到的是「发送失败：FOREIGN KEY
+/// constraint failed」（真实报障）。停止之后生成会在下一次检查点收手。
 #[tauri::command]
 pub async fn delete_session(
     app: AppHandle,
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<(), String> {
+    let cancelled: Vec<String> = {
+        let flags = state.cancel_flags.lock().map_err(|e| e.to_string())?;
+        flags
+            .iter()
+            .filter(|(_, active)| active.session_id == session_id)
+            .map(|(id, active)| {
+                active.cancel.store(true, Ordering::SeqCst);
+                id.clone()
+            })
+            .collect()
+    };
+    for stream in &cancelled {
+        // 正在等审批的生成不会因为 cancel 标志自行退出，审批通道要一起结束
+        crate::commands::tools::cancel_approvals(&state, stream);
+    }
+    if !cancelled.is_empty() {
+        eprintln!(
+            "[chat] 删除会话 {}，已停止 {} 个进行中的生成",
+            session_id,
+            cancelled.len()
+        );
+    }
+
     let store = state.chat_store.lock().map_err(|e| e.to_string())?;
     store
         .delete_session(&session_id)
@@ -760,6 +1028,21 @@ mod tests {
 
     fn msg(role: Role, content: &str) -> Message {
         Message::new(role, content, "s1")
+    }
+
+    /// 配置里的超时必须真的落到运行时限额上（曾经写死 60 秒，设置页改不动）
+    #[test]
+    fn tool_limits_follow_config() {
+        let mut cfg = crate::config::types::ToolConfig::default();
+        assert_eq!(tool_limits(&cfg).call_timeout, Duration::from_secs(60));
+
+        cfg.call_timeout_secs = 600;
+        cfg.max_output_bytes = 128 * 1024;
+        cfg.approval_timeout_secs = 300;
+        let limits = tool_limits(&cfg);
+        assert_eq!(limits.call_timeout, Duration::from_secs(600));
+        assert_eq!(limits.max_output_bytes, 128 * 1024);
+        assert_eq!(limits.approval_timeout, Duration::from_secs(300));
     }
 
     #[test]
@@ -812,7 +1095,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conn = crate::store::db::init_db(&dir).unwrap();
         let store = ChatStore::new(conn);
-        store.create_session("konata-default", "t").unwrap();
+        store.create_session("konata-default", "t", None, None, None).unwrap();
         let session_id = store.list_sessions().unwrap()[0].id.clone();
         store.set_session_summary(&session_id, "之前聊过猫", 3).unwrap();
 
@@ -828,9 +1111,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 会话中途被删掉时，写库失败必须翻译成一句人话，
+    /// 而不是把裸的 `FOREIGN KEY constraint failed` 抛成「发送失败」
     #[test]
-    fn stream_payload_carries_session_and_stream_id() {
-        let payload = stream_payload("sess-1", "stream-1", "你好");
+    fn deleted_session_write_failure_is_explained() {
+        let dir = std::env::temp_dir().join(format!("konata-fk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::store::db::init_db(&dir).unwrap();
+        let store = ChatStore::new(conn);
+        let session = store
+            .create_session("konata-default", "t", Some("task"), Some("plan"), None)
+            .unwrap();
+
+        // 生成跑到一半时用户把会话删了
+        store.delete_session(&session.id).unwrap();
+
+        // 此时再写消息：底层就是那句外键错误
+        let error = store
+            .add_message(&session.id, Role::Assistant, "回复", 1, 0, None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("FOREIGN KEY"),
+            "底层错误应是外键约束：{error}"
+        );
+
+        // 翻译后必须是可执行的提示，而不是 SQLite 原文
+        let message = persist_failure(&store, &session.id, error);
+        assert!(message.contains("会话已被删除"), "{message}");
+        assert!(!message.contains("FOREIGN KEY"), "{message}");
+
+        // 会话还在时不要乱改口：如实报告保存失败
+        let alive = store
+            .create_session("konata-default", "t2", None, None, None)
+            .unwrap();
+        let other = anyhow::anyhow!("disk I/O error");
+        let message = persist_failure(&store, &alive.id, other);
+        assert!(message.contains("保存消息失败"), "{message}");
+        assert!(message.contains("disk I/O error"), "{message}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_payload_carries_session_and_stream_id() {        let payload = stream_payload("sess-1", "stream-1", "你好");
         assert_eq!(payload["session_id"], "sess-1");
         assert_eq!(payload["stream_id"], "stream-1");
         assert_eq!(payload["data"], "你好");

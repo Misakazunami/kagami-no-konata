@@ -157,6 +157,15 @@ function MessageBubbleImpl({ message, showStats, liveToolCalls }: Props) {
         </div>
         <div className="message-meta">
           <span className="message-time">{time}</span>
+          {/*
+            生成本条回复的模型：自动选择下主轮次/子代理会用到不同模型，
+            这里是"这条到底是谁答的"的唯一如实来源（历史消息回读时不带该字段）
+          */}
+          {!isUser && message.model && (
+            <span className="message-model" title="生成本条回复的模型">
+              {message.model}
+            </span>
+          )}
           {enabled && hasStats && (
             <span className="message-stats">
               {message.token_count} tokens · {(message.thinking_ms / 1000).toFixed(1)}s

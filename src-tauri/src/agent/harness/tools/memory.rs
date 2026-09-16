@@ -315,6 +315,7 @@ mod tests {
         ToolCtx {
             session_id: "s1",
             stream_id: "st1",
+            call_id: "c1",
             step: 0,
             cancel: cancel.clone(),
             services,

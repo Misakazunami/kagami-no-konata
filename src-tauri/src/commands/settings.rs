@@ -1,3 +1,4 @@
+use serde::Serialize;
 use tauri::{Emitter, State};
 
 use crate::config::types::{AppConfig, LlmProvider};
@@ -263,6 +264,88 @@ pub async fn test_llm_connection(state: State<'_, AppState>) -> Result<String, S
 #[tauri::command]
 pub async fn fetch_models(state: State<'_, AppState>) -> Result<Vec<ModelInfo>, String> {
     fetch_provider_models(state, None).await
+}
+
+// ─── 模型目录（对话界面选择器 / 设置页模型路由共用） ───────
+
+/// 一个可选模型（含能力探测结果）
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelOption {
+    pub id: String,
+    /// 是否支持深度思考（界面据此决定要不要显示"深度思考"开关）
+    pub supports_thinking: bool,
+    /// 是否是当前选中的模型
+    pub is_current: bool,
+}
+
+/// 一个提供商下的可选模型
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderModels {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub is_active: bool,
+    pub is_usable: bool,
+    pub current_model: String,
+    /// 该提供商在设置里声明的"默认开启思考"（会话未单独设置时的实际取值）
+    pub thinking_default: bool,
+    pub models: Vec<ModelOption>,
+}
+
+/// 模型目录
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelCatalog {
+    pub providers: Vec<ProviderModels>,
+    /// 自动选择的主/子模型池配置
+    pub settings: crate::config::types::ModelSettings,
+}
+
+/// 列出可选择的模型
+///
+/// 只列**已启用**的模型（`enabled_models` + 当前模型），而不是把上游
+/// `/models` 返回的几百个模型全灌进界面 —— 想要更多模型请先去设置页启用。
+/// 能力探测在 Rust 侧完成，界面不重复实现一套启发式。
+#[tauri::command]
+pub async fn get_model_catalog(state: State<'_, AppState>) -> Result<ModelCatalog, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+
+    let providers = config
+        .llm
+        .providers
+        .iter()
+        .map(|p| {
+            // 当前模型始终在列表里：否则用户会看到"当前模型不在下拉框里"
+            let mut ids = p.enabled_models.clone();
+            if !p.model.trim().is_empty() && !ids.contains(&p.model) {
+                ids.insert(0, p.model.clone());
+            }
+
+            ProviderModels {
+                provider_id: p.id.clone(),
+                provider_name: if p.name.trim().is_empty() {
+                    p.id.clone()
+                } else {
+                    p.name.clone()
+                },
+                is_active: p.id == config.llm.active_provider_id,
+                is_usable: !p.api_base_url.trim().is_empty() && !p.api_key.trim().is_empty(),
+                current_model: p.model.clone(),
+                thinking_default: p.enable_thinking,
+                models: ids
+                    .into_iter()
+                    .map(|id| ModelOption {
+                        supports_thinking: crate::llm::capabilities::provider_supports_thinking(p, &id),
+                        is_current: id == p.model,
+                        id,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+
+    Ok(ModelCatalog {
+        providers,
+        settings: config.models.clone(),
+    })
 }
 
 #[cfg(test)]

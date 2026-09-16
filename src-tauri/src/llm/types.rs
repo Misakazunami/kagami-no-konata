@@ -244,6 +244,14 @@ pub enum StreamChunk {
     Thinking(String),
     /// 工具调用增量（绝不作为正文外发）
     ToolCallDelta(ToolCallDelta),
+    /// 提供商给出的结束原因（`stop` / `length` / `content_filter` / ...）
+    ///
+    /// **为什么必须一路带到 harness**：`length` 表示这次输出被 `max_tokens`
+    /// 截断了（推理模型把预算全花在思考上时尤其常见）。历史实现把
+    /// `finish_reason` 反序列化后直接丢弃，于是"模型被截断"和"模型正常说完"
+    /// 在 runner 眼里完全一样：既没有正文、也没有工具调用，回合就静悄悄地
+    /// 结束了，用户只看到前面几张工具卡片（真实报障）。
+    Finish(String),
 }
 
 /// GET /models 响应

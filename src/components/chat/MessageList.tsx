@@ -47,8 +47,13 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
     !tailHasToolRecords;
 
   // 本轮没有产生回复消息 → 记录只能作为独立区块展示
+  //
+  // 额外要求 messages 非空：孤儿工具记录必然伴随着一条用户消息（工具调用由用户输入触发），
+  // 所以"空会话 + 工具卡片"只可能是换会话时没清干净的残留。store 已经在换会话时复位
+  // `liveToolCalls`，这里再挡一道，任何将来新增的会话切换路径都不会把卡片漏进新会话。
   const orphanToolCalls =
     !isStreaming &&
+    messages.length > 0 &&
     liveToolCalls.length > 0 &&
     tailAssistantId === null &&
     !tailHasToolRecords;

@@ -45,8 +45,11 @@ export function StreamingText({ onFinished }: Props) {
       if (!raf) raf = requestAnimationFrame(flush);
     };
 
+    // 本次生成既要是当前 activeStreamId，也必须仍属于当前会话：
+    // 换会话后旧流的事件不能再画进新会话的气泡里
     const matches = (payload: StreamEventData) =>
-      isSameStream(payload, activeStreamId);
+      isSameStream(payload, activeStreamId) &&
+      payload.session_id === currentSessionId;
 
     // 注意：所有 listen 都是异步的，必须等 Promise 全部落地后再登记注销函数，
     // 否则 React 严格模式下的"挂载→清理→再挂载"会留下重复监听。

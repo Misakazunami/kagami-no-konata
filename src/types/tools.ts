@@ -9,7 +9,7 @@
  * `types/events.ts`，本文件只做引用，不重复声明。
  */
 
-import type { ToolPermission, ToolStatus } from "./events";
+import type { PlanStatus, ToolPermission, ToolStatus } from "./events";
 
 /** `list_tools()` 返回的单个工具信息 */
 export interface ToolInfo {
@@ -72,6 +72,29 @@ export interface ToolCallView {
   duration_ms: number;
   truncated: boolean;
   error?: string;
+  /**
+   * 执行中的实时输出（来自 `tool-output-chunk`）
+   *
+   * 只保留**末尾**一段：单条命令的输出可以到上百 MB，界面只需要"现在在打印什么"。
+   * 完整的失败原因仍在 `preview` / 展开后的结果区里。
+   */
+  output?: string;
+  /**
+   * 这个工具派出去的子代理已经产生了多少次工具调用
+   *
+   * 子代理的内部调用不单独成卡片（否则一轮里会冒出十几张看不懂的卡片），
+   * 只在这里累计一个数字，卡片上显示「子代理 ×N」。
+   */
+  subagentCalls?: number;
+  /** 子任务列表的粗粒度状态（不包含详细敏感日志） */
+  subagentTasks?: Array<{
+    taskId: string;
+    goalPreview: string;
+    status: "queued" | "running" | "done" | "error" | "cancelled" | "skipped";
+    durationMs?: number;
+    /** 自动选择时这条子任务实际用的子模型（未配置子模型时为空） */
+    model?: string;
+  }>;
 }
 
 /** 状态 → 中文文案（卡片上的状态胶囊） */
@@ -110,6 +133,21 @@ export const TOOL_MODE_LABEL: Record<string, string> = {
   read_only: "只读",
   standard: "标准",
   full: "完整",
+};
+
+/** 计划项状态 → 中文文案与图标（进度面板用） */
+export const PLAN_STATUS_LABEL: Record<PlanStatus, string> = {
+  pending: "待办",
+  doing: "进行中",
+  done: "已完成",
+  blocked: "受阻",
+};
+
+export const PLAN_STATUS_ICON: Record<PlanStatus, string> = {
+  pending: "○",
+  doing: "◐",
+  done: "●",
+  blocked: "✕",
 };
 
 /**

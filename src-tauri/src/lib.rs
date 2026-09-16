@@ -5,6 +5,7 @@ mod config;
 mod llm;
 mod memory;
 mod persona;
+mod mcp;
 mod store;
 
 use std::collections::HashMap;
@@ -113,7 +114,19 @@ pub fn run() {
             let app_config = config::load_config(&app_data_dir).expect("Failed to load config");
 
             let conn = store::db::init_db(&app_data_dir).expect("Failed to init database");
-            let chat_store = ChatStore::new(conn);
+            let chat_store = Arc::new(Mutex::new(ChatStore::new(conn)));
+
+            // 回收过期的工作区改动快照：快照里的文件是磁盘上的真实占用，
+            // 用户每改一次文件就留一份，必须有自动回收。
+            // 失败只记录：清理垃圾不该拦住应用启动。
+            {
+                let snapshots =
+                    agent::harness::SnapshotStore::new(&app_data_dir, chat_store.clone());
+                let pruned = snapshots.prune(agent::harness::snapshot::KEEP_DAYS);
+                if pruned > 0 {
+                    eprintln!("[snapshot] 已回收 {} 组过期文件快照", pruned);
+                }
+            }
 
             // 第二个连接不再执行迁移（migrations 只应运行一次），
             // 只应用 WAL / foreign_keys 等连接级 PRAGMA。
@@ -140,7 +153,12 @@ pub fn run() {
                 app_config.tools.enabled = false;
             }
 
-            let tool_registry = Arc::new(builtin_registry());
+            // MCP：只连接用户在配置里启用且标记为可信的服务器。
+            // 走阻塞实现（每次握手最多等 HANDSHAKE_TIMEOUT），因此不需要在这里
+            // 造一个临时 runtime——子进程的管道也就不会跟着 runtime 一起失效。
+            // 任何一台起不来都只影响它自己，不拖垮应用启动。
+            let mcp_tools = mcp::connect_configured(&app_config.tools.mcp);
+            let tool_registry = Arc::new(builtin_registry().with_extra(mcp_tools));
             let llm_proxy = LlmProxy::new(app_config.llm.active_provider());
             let chat_agent = ChatAgent::new(llm_proxy, personas.clone(), tool_registry);
             let dispatcher = Arc::new(AgentDispatcher::new(chat_agent));
@@ -148,7 +166,7 @@ pub fn run() {
             app.manage(AppState {
                 config: Mutex::new(app_config),
                 dispatcher,
-                chat_store: Arc::new(Mutex::new(chat_store)),
+                chat_store: chat_store.clone(),
                 memory_store: Arc::new(Mutex::new(memory_store)),
                 personas,
                 app_data_dir: Mutex::new(app_data_dir),
@@ -279,6 +297,8 @@ pub fn run() {
             commands::chat::send_message,
             commands::chat::stop_generation,
             commands::chat::create_session,
+            commands::chat::set_task_mode,
+            commands::chat::set_session_model,
             commands::chat::find_or_create_today_session,
             commands::chat::update_session_title,
             commands::chat::get_sessions,
@@ -288,6 +308,7 @@ pub fn run() {
             commands::settings::update_config,
             commands::settings::test_llm_connection,
             commands::settings::fetch_models,
+            commands::settings::get_model_catalog,
             commands::settings::set_active_model,
             commands::settings::add_provider,
             commands::settings::update_provider,
@@ -312,6 +333,14 @@ pub fn run() {
             commands::tools::list_tools,
             commands::tools::resolve_tool_approval,
             commands::tools::get_tool_invocations,
+            commands::tools::get_plan,
+            commands::tools::clear_plan,
+            commands::tools::list_mcp_servers,
+            commands::tools::test_mcp_server,
+            commands::tools::get_notes,
+            commands::tools::clear_notes,
+            commands::tools::get_snapshot,
+            commands::tools::restore_snapshot,
             commands::tools::get_tool_safety_summary,
             commands::tools::list_workspaces,
             commands::tools::add_workspace,

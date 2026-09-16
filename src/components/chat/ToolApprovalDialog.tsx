@@ -138,6 +138,17 @@ export function ToolApprovalDialog() {
           </span>
         </div>
 
+        {/* 工具自算的摘要（例如多步命令的步骤清单）优先展示：
+            参数 JSON 适合机器看，人需要的是"到底要跑哪几条" */}
+        {pendingApproval.summary && (
+          <div className="tool-approval-summary-wrap">
+            <span className="tool-approval-summary-title">将要执行</span>
+            <pre className="tool-approval-summary">
+              {pendingApproval.summary}
+            </pre>
+          </div>
+        )}
+
         <div className="tool-approval-args-wrap">
           <span className="tool-approval-args-title">参数</span>
           <pre className="tool-approval-args">

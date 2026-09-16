@@ -99,6 +99,8 @@ impl Approver for TauriApprover {
                 "tool": req.tool,
                 "tool_label": req.tool_label,
                 "args": req.args,
+                // 工具自算的人类可读摘要（多步命令的步骤清单等），可能为空
+                "summary": req.summary,
                 "permission": req.permission.as_str(),
                 "risk": req.permission.risk_label(),
                 "expires_at": expires_at.to_rfc3339(),

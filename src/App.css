@@ -78,13 +78,29 @@ html, body, #root {
   margin-bottom: 12px;
 }
 
+/* 新建入口：两个按钮等宽平分一行（人设选择已挪到下面一行，不再互相挤） */
 .new-session-controls {
   display: flex;
   gap: 8px;
+  margin-bottom: 8px;
+}
+
+/* 人设选择行：标签 + 下拉框，独占一行 */
+.persona-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.persona-row-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .persona-select {
   flex: 1;
+  min-width: 0;
   padding: 8px;
   background: var(--bg-tertiary);
   color: var(--text-primary);
@@ -100,19 +116,36 @@ html, body, #root {
 }
 
 .new-chat-btn {
-  padding: 8px 12px;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
   background: var(--accent);
-  color: #1a1b26;
+  color: var(--on-accent);
   border: none;
   border-radius: 8px;
   cursor: pointer;
   font-weight: 600;
-  transition: background 0.2s;
+  font-size: 12px;
+  transition: background 0.2s, color 0.2s;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .new-chat-btn:hover {
   background: var(--accent-hover);
+}
+
+/* 任务入口：描边样式，与"对话"按钮明确区分（两种主题下都可读） */
+.new-chat-btn.task {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.new-chat-btn.task:hover {
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 .session-list {
@@ -163,6 +196,18 @@ html, body, #root {
   color: var(--text-muted);
   border-radius: 4px;
   flex-shrink: 0;
+}
+
+/* 会话列表里的"任务"标识：用强调色的浅底 + 同色文字，两种主题都清晰 */
+.session-type-badge {
+  flex-shrink: 0;
+  margin-right: 4px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--tool-running-bg);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
 }
 
 .chat-header {
@@ -600,6 +645,240 @@ html, body, #root {
 }
 
 /* ===== 输入框 ===== */
+/* 输入区外壳：任务模式下上面多一条模式切换栏，二者共用同一条 border-top */
+.input-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-secondary);
+  /* 与计划面板同理：它是固定底栏，绝不能被消息列表压缩 */
+  flex-shrink: 0;
+}
+
+/* 外壳已经画了边框与内边距，内部输入行不再重复一遍 */
+.input-area .input-box {
+  padding: 0;
+  border-top: none;
+  background: transparent;
+}
+
+/* ===== 任务会话：Plan / Work 模式切换 ===== */
+.task-mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.task-mode-label {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.task-mode-group {
+  display: flex;
+  gap: 6px;
+}
+
+.task-mode-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+
+.task-mode-btn:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+/* 选中态：实心底 + 主题安全的文字色，两种主题下都保持足够对比度 */
+.task-mode-btn.active.plan {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.task-mode-btn.active.work {
+  background: var(--success);
+  border-color: var(--success);
+  color: #1a1b26;
+  font-weight: 600;
+}
+
+/* ===== 模型选择条（手动选择 / 自动选择 / 深度思考） ===== */
+.model-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.model-bar-label {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.model-auto-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+
+.model-auto-btn:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.model-auto-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.model-select {
+  flex: 1;
+  min-width: 140px;
+  max-width: 320px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.model-thinking-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.model-bar-auto-hint,
+.model-bar-resolved {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-refresh-btn {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.model-refresh-btn:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+/* 消息气泡上的"这条是哪个模型答的" */
+.message-model {
+  font-size: 10px;
+  color: var(--text-muted);
+  opacity: 0.75;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== 设置页：模型路由（子模型列表） ===== */
+.sub-model-list {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sub-model-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  font-size: 12px;
+}
+
+.sub-model-order {
+  width: 18px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.sub-model-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.sub-model-provider {
+  color: var(--text-muted);
+}
+
+.sub-model-list li button {
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.sub-model-list li button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.model-thinking-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
 .input-box {
   display: flex;
   align-items: flex-end;
@@ -608,7 +887,6 @@ html, body, #root {
   border-top: 1px solid var(--border);
   background: var(--bg-secondary);
 }
-
 .input-box textarea {
   flex: 1;
   padding: 12px 16px;
@@ -636,7 +914,7 @@ html, body, #root {
 .send-btn {
   padding: 12px 16px;
   background: var(--accent);
-  color: #1a1b26;
+  color: var(--on-accent);
   border: none;
   border-radius: 12px;
   cursor: pointer;
@@ -1807,7 +2085,7 @@ html, body, #root {
   flex: 1;
   padding: 10px;
   background: var(--accent);
-  color: #1a1b26;
+  color: var(--on-accent);
   border: none;
   border-radius: 8px;
   cursor: pointer;
@@ -1823,6 +2101,102 @@ html, body, #root {
 .modal-confirm-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* ===== 创建任务会话弹窗（工作区选择）===== */
+/*
+ * 全部走主题变量：早先这里用的是行内硬编码颜色（深色底 + 浅灰字），
+ * 切到亮色主题后就成了"白底浅灰字"，基本读不出来。
+ */
+.modal-card.task-modal-card {
+  width: 460px;
+}
+
+.modal-card.task-modal-card select {
+  padding: 10px 12px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.modal-card.task-modal-card select:focus {
+  border-color: var(--accent);
+}
+
+.task-modal-section {
+  margin-bottom: 12px;
+  padding: 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.task-modal-section-title {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.task-modal-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.task-modal-inline:last-child {
+  margin-bottom: 0;
+}
+
+.task-modal-inline input[type="text"] {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 复选框一行：必须显式覆盖 `.modal-card label` 的竖排方向 */
+.modal-card .task-modal-check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 0;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.modal-card .task-modal-check input {
+  flex: none;
+  width: auto;
+  padding: 0;
+  margin: 0;
+}
+
+.task-modal-hint {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.task-modal-error {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: var(--tool-error-bg);
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
 }
 
 .provider-editor {
@@ -2311,6 +2685,12 @@ body[data-window="float"] {
   --tool-warn-bg: rgba(224, 175, 104, 0.16);
   --tool-running-bg: rgba(187, 154, 247, 0.12);
   --tool-mono: ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+  /*
+   * 实心强调色按钮上的文字色。
+   * 暗色主题的 --accent 是浅紫（亮底），要配深字；亮色主题的 --accent 是深紫，
+   * 必须换成白字——写死 #1a1b26 会在亮色主题下变成"深紫底 + 近黑字"，几乎读不出来。
+   */
+  --on-accent: #1a1b26;
 }
 
 [data-theme="light"] {
@@ -2319,6 +2699,7 @@ body[data-window="float"] {
   --tool-error-bg: rgba(239, 68, 68, 0.1);
   --tool-warn-bg: rgba(180, 83, 9, 0.1);
   --tool-running-bg: rgba(124, 58, 237, 0.1);
+  --on-accent: #ffffff;
 }
 
 /* ── 卡片列表 ── */
@@ -2460,6 +2841,41 @@ body[data-window="float"] {
   color: var(--tool-warn);
 }
 
+/*
+ * 执行中的实时输出
+ *
+ * 命令可以打印上千行：固定高度 + 内部滚动，卡片在流式期间不会不断变高，
+ * 也不会把消息列表顶得来回跳。
+ */
+.tool-call-live {
+  max-height: 160px;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+}
+
+/* 子代理活动计数：只读子代理的内部调用不单独成卡片，这里给一个总数 */
+.tool-call-subagents {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--tool-running-bg);
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+/* 折叠状态下的"最新一行输出"：给出实时感，但不撑开卡片 */
+.tool-call-live-tail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--tool-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
 /* ── 状态胶囊 ── */
 .tool-status-chip {
   flex-shrink: 0;
@@ -2587,6 +3003,42 @@ body[data-window="float"] {
 }
 
 .tool-approval-args-title {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ── 审批摘要（工具自算的"将要执行什么"） ── */
+.tool-approval-summary-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+}
+
+.tool-approval-summary-title {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.tool-approval-summary {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 180px;
+  overflow: auto;
+  background: var(--tool-running-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--tool-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 有摘要时参数退居次要：绝大多数用户只需要看摘要 */
+.tool-approval-summary-wrap + .tool-approval-args-wrap .tool-approval-args {
+  max-height: 120px;
   font-size: 11px;
   color: var(--text-muted);
 }
@@ -2973,4 +3425,443 @@ body[data-window="float"] {
   font-size: 12px;
   line-height: 1.5;
   word-break: break-word;
+}
+
+/* ===== 任务计划面板（`update_plan`）===== */
+/*
+ * 贴着输入框显示：它是"当前这一轮任务"的进度，不是聊天内容。
+ * 折叠时只有一行（进度 + 正在做什么），展开才列出全部条目。
+ */
+.plan-panel {
+  flex-shrink: 0;
+  margin: 0 16px 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+
+.plan-panel.has-blocked {
+  border-color: var(--tool-warn);
+}
+
+.plan-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.plan-head:hover {
+  background: var(--bg-tertiary);
+}
+
+.plan-icon {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
+.plan-progress {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--tool-running-bg);
+  font-family: var(--tool-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.plan-headline {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.plan-blocked-chip {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--tool-warn-bg);
+  font-size: 10.5px;
+  color: var(--tool-warn);
+}
+
+.plan-arrow {
+  flex-shrink: 0;
+  font-size: 9px;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.plan-arrow.expanded {
+  transform: rotate(90deg);
+}
+
+.plan-body {
+  padding: 4px 10px 8px;
+  border-top: 1px solid var(--border);
+}
+
+.plan-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plan-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.plan-item.done .plan-item-title {
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+.plan-item.blocked .plan-item-title {
+  color: var(--tool-warn);
+}
+
+.plan-item-icon {
+  flex-shrink: 0;
+  width: 12px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.plan-item.done .plan-item-icon {
+  color: var(--tool-ok, #9ece6a);
+}
+
+.plan-item.doing .plan-item-icon {
+  color: var(--accent, #bb9af7);
+}
+
+.plan-item-title {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.plan-item-status {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.plan-note {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.plan-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.plan-clear-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.plan-clear-btn:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* ===== 文件改动回滚条 ===== */
+/*
+ * 只在写类工具留下备份时出现。与计划面板同处输入框上方，
+ * 但视觉上更像"操作提示"而不是"任务状态"，因此用强调色边框区分。
+ */
+.snapshot-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin: 0 16px 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent, #bb9af7);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.snapshot-icon {
+  flex-shrink: 0;
+}
+
+.snapshot-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.snapshot-restore-btn {
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border: 1px solid var(--accent, #bb9af7);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #bb9af7);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.snapshot-restore-btn:hover {
+  background: var(--tool-running-bg);
+}
+
+.snapshot-dismiss-btn {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.snapshot-dismiss-btn:hover {
+  color: var(--text-primary);
+}
+
+/* ===== 工作记忆面板 ===== */
+/*
+ * 跨轮记忆是唯一会持久影响后续对话的东西，因此必须让用户看得见、能清空。
+ * 视觉上与计划面板同处输入框上方，但用偏冷的边框区分（计划=进度，记忆=资料）。
+ */
+.notes-panel {
+  flex-shrink: 0;
+  margin: 0 16px 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+
+.notes-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.notes-head:hover {
+  background: var(--bg-tertiary);
+}
+
+.notes-icon {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
+.notes-count {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.notes-headline {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.notes-arrow {
+  flex-shrink: 0;
+  font-size: 9px;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.notes-arrow.expanded {
+  transform: rotate(90deg);
+}
+
+.notes-body {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  max-height: 260px;
+  overflow: auto;
+}
+
+.notes-hint {
+  margin: 0 0 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.notes-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.notes-item-title {
+  display: block;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+}
+
+.notes-item-content {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--tool-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.notes-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.notes-clear-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.notes-clear-btn:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* ===== MCP 服务器（设置页） ===== */
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.mcp-item {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+}
+
+.mcp-item.disabled {
+  opacity: 0.6;
+}
+
+.mcp-item-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mcp-item-id {
+  font-family: var(--tool-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.mcp-item-cmd {
+  margin-top: 4px;
+  font-family: var(--tool-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.mcp-item-hint {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mcp-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.mcp-test-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.mcp-test-btn:hover:not(:disabled) {
+  border-color: var(--accent, #bb9af7);
+  color: var(--accent, #bb9af7);
+}
+
+.mcp-status {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+.mcp-status.ok {
+  color: var(--tool-ok, #9ece6a);
+}
+
+.mcp-status.error {
+  color: var(--tool-warn);
 }

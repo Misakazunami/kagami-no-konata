@@ -1,8 +1,12 @@
 pub mod basic;
+pub mod fs_move;
 pub mod fs_read;
 pub mod fs_write;
 pub mod memory;
+pub mod notes;
+pub mod plan;
 pub mod shell;
+pub mod subagent;
 pub mod web;
 
 use std::sync::Arc;
@@ -31,13 +35,24 @@ pub fn builtin_registry() -> ToolRegistry {
         Arc::new(memory::ReadPersona),
         // 写应用数据（免审批）
         Arc::new(memory::SaveMemory),
+        // 任务计划（只写应用自己的库，免审批）
+        Arc::new(plan::UpdatePlan),
+        // 工作记忆（写应用自己的库，免审批）
+        Arc::new(notes::SaveNote),
+        Arc::new(notes::ForgetNote),
+        // 只读子代理（无副作用：子代理本身被强制只读）
+        Arc::new(subagent::SpawnSubagents),
         // 写工作区（需审批）
         Arc::new(fs_write::WriteFile),
         Arc::new(fs_write::EditFile),
+        Arc::new(fs_move::DeletePath),
+        Arc::new(fs_move::MovePath),
+        Arc::new(fs_move::CopyPath),
         // 执行命令（需审批，仅 Full 模式可见，敏感命令硬拦截）
         Arc::new(shell::RunCommand),
         // 网络（需审批 + 域名白名单）
         Arc::new(web::WebFetch),
+        Arc::new(web::WebSearch),
         // 调起系统默认程序（需审批）
         Arc::new(web::OpenWithSystem),
     ])
@@ -97,7 +112,7 @@ mod tests {
     fn builtin_registry_has_unique_names() {
         let registry = builtin_registry();
         // len 与 schema 数一致即说明没有重复名覆盖
-        assert_eq!(registry.len(), 16, "内置工具数量应当与设计一致");
+        assert_eq!(registry.len(), 24, "内置工具数量应当与设计一致");
         let names = registry.visible_names(ToolMode::Full);
         let mut unique = names.clone();
         unique.sort();

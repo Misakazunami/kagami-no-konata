@@ -7,6 +7,14 @@ import {
   type ToolInfo,
   type WorkspaceView,
 } from "../../types/tools";
+import {
+  modelRefValue,
+  parseModelRefValue,
+  type ModelSettings,
+} from "../../types/models";
+
+/** 子模型数量上限（与后端 `config::types::MAX_SUB_MODELS` 保持一致） */
+const MAX_SUB_MODELS = 8;
 
 /** 工具（tool harness）配置段：与后端 `AppConfig.tools` 一一对应 */
 interface ToolsConfig {
@@ -19,6 +27,14 @@ interface ToolsConfig {
   max_steps: number;
   max_output_bytes: number;
   approval_timeout_secs: number;
+  /** 单次工具调用超时（秒）：run_command 会据此在超时前收手并保留部分输出 */
+  call_timeout_secs: number;
+  /** 工作记忆：模型主动记下的跨轮结论 */
+  working_memory: boolean;
+  /** 联网检索（web_search） */
+  search: SearchConfig;
+  /** MCP 服务器（外部工具生态） */
+  mcp: McpConfig;
   command_allowlist: string[];
   web_domain_allowlist: string[];
 }
@@ -33,6 +49,16 @@ const DEFAULT_TOOLS_CONFIG: ToolsConfig = {
   max_steps: 8,
   max_output_bytes: 65536,
   approval_timeout_secs: 120,
+  call_timeout_secs: 60,
+  working_memory: true,
+  search: {
+    enabled: false,
+    provider: "searxng",
+    endpoint: "",
+    api_key: "",
+    max_results: 5,
+  },
+  mcp: { servers: [] },
   command_allowlist: [],
   web_domain_allowlist: [],
 };
@@ -41,6 +67,49 @@ const TOOL_MODE_HINT: Record<ToolsConfig["mode"], string> = {
   read_only: "只读：写入与执行类工具直接从工具表中移除",
   standard: "标准：读与App内写入自动放行，写文件/执行命令需要审批",
   full: "完整：在标准之上放开命令执行（仍禁止敏感命令）",
+};
+
+type SearchProvider = "searxng" | "tavily" | "brave";
+
+interface SearchConfig {
+  enabled: boolean;
+  provider: SearchProvider;
+  /** 自建实例地址（SearXNG 必填）；官方服务留空用默认地址 */
+  endpoint: string;
+  api_key: string;
+  max_results: number;
+}
+
+interface McpServerConfig {
+  id: string;
+  enabled: boolean;
+  trusted: boolean;
+  command: string;
+  args: string[];
+  permission: "read" | "write" | "execute";
+}
+
+interface McpConfig {
+  servers: McpServerConfig[];
+}
+
+interface McpServerStatus {
+  id: string;
+  connected: boolean;
+  tools: string[];
+  error?: string | null;
+}
+
+const SEARCH_PROVIDER_HINT: Record<SearchProvider, string> = {
+  searxng: "自建 SearXNG：填你自己的实例地址（数据不出你的机器，推荐）",
+  tavily: "Tavily：留空端点用官方地址，必须填 API Key",
+  brave: "Brave Search：留空端点用官方地址，必须填 API Key",
+};
+
+const MCP_PERMISSION_HINT: Record<McpServerConfig["permission"], string> = {
+  read: "只读：调用不弹审批（只给确实只读的服务器用）",
+  write: "写入：每次调用都要审批（默认，最安全）",
+  execute: "执行：审批 + 只在「完整」模式下可见",
 };
 
 interface LlmProvider {
@@ -54,6 +123,8 @@ interface LlmProvider {
   max_tokens: number;
   temperature: number;
   enable_thinking?: boolean;
+  /** 显式声明支持深度思考的模型（覆盖名称启发式探测） */
+  thinking_models?: string[];
 }
 
 interface AppConfig {
@@ -70,6 +141,8 @@ interface AppConfig {
   ui: { theme: string; font_size: number; show_message_stats?: boolean; close_action?: string; show_float_clock?: boolean; float_position?: string; poke_enabled?: boolean; poke_probability?: number; poke_llm_chance?: number; bubble_auto_hide_secs?: number };
   /** 工具配置：旧版本后端可能没有该字段，读取时兜底 */
   tools?: ToolsConfig;
+  /** 模型路由（自动选择）：旧版本后端可能没有该字段，读取时兜底 */
+  models?: ModelSettings;
 }
 
 interface UsageStats {
@@ -148,6 +221,9 @@ export function SettingsPage() {
 
   // 工具状态
   const [tools, setTools] = useState<ToolInfo[]>([]);
+  /** MCP 服务器测试连接结果（按 id 索引） */
+  const [mcpStatus, setMcpStatus] = useState<Record<string, McpServerStatus>>({});
+  const [mcpTesting, setMcpTesting] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceView[]>([]);
   const [workspaceError, setWorkspaceError] = useState("");
   const [newWorkspacePath, setNewWorkspacePath] = useState("");
@@ -162,7 +238,7 @@ export function SettingsPage() {
   const configSnapshotRef = useRef<string>("");
   const providerSnapshotRef = useRef<string>("");
   const sections = (c: AppConfig) =>
-    JSON.stringify({ user: c.user, memory: c.memory, ui: c.ui, tools: c.tools });
+    JSON.stringify({ user: c.user, memory: c.memory, ui: c.ui, tools: c.tools, models: c.models });
 
   useEffect(() => {
     invoke<AppConfig>("get_config").then((c) => {
@@ -372,6 +448,73 @@ export function SettingsPage() {
     setEditingProvider({ ...editingProvider, enabled_models: newEnabled });
   };
 
+  /** 声明 / 取消声明"该模型支持深度思考"（覆盖名称探测，随"保存"一起落盘） */
+  const toggleModelThinking = (modelId: string) => {
+    if (!editingProvider) return;
+    const current = editingProvider.thinking_models ?? [];
+    const next = current.includes(modelId)
+      ? current.filter((m) => m !== modelId)
+      : [...current, modelId];
+    setEditingProvider({ ...editingProvider, thinking_models: next });
+  };
+
+  // ─── 模型路由（自动选择） ───────────────────
+
+  /** 全局配置里的模型路由段（旧后端没有该字段时兜底） */
+  const modelSettings: ModelSettings = config?.models ?? {
+    auto_by_default: false,
+    main: null,
+    subs: [],
+  };
+
+  const updateModelSettings = (patch: Partial<ModelSettings>) => {
+    if (!config) return;
+    setConfig({ ...config, models: { ...modelSettings, ...patch } });
+  };
+
+  /** 目录里所有"已启用"的模型（主/子模型下拉用） */
+  const selectableModels: Array<{ value: string; label: string }> = (() => {
+    if (!config) return [];
+    return config.llm.providers.flatMap((p) => {
+      const ids = p.enabled_models.includes(p.model) || !p.model
+        ? p.enabled_models
+        : [p.model, ...p.enabled_models];
+      return ids.map((id) => ({
+        value: modelRefValue({ provider_id: p.id, model: id }),
+        label: `${id}（${p.name || p.id}）`,
+      }));
+    });
+  })();
+
+  const addSubModel = (value: string) => {
+    const ref = parseModelRefValue(value);
+    if (!ref) return;
+    if (modelSettings.subs.length >= MAX_SUB_MODELS) {
+      setTestResult(`❌ 子模型最多 ${MAX_SUB_MODELS} 个`);
+      return;
+    }
+    if (
+      modelSettings.subs.some(
+        (s) => s.provider_id === ref.provider_id && s.model === ref.model
+      )
+    ) {
+      return;
+    }
+    updateModelSettings({ subs: [...modelSettings.subs, ref] });
+  };
+
+  const removeSubModel = (index: number) => {
+    updateModelSettings({ subs: modelSettings.subs.filter((_, i) => i !== index) });
+  };
+
+  const moveSubModel = (index: number, delta: number) => {
+    const next = [...modelSettings.subs];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    updateModelSettings({ subs: next });
+  };
+
   // ─── 工具 / 工作区 ─────────────────────────
 
   const errorText = (e: unknown): string =>
@@ -410,6 +553,27 @@ export function SettingsPage() {
   };
 
   /** 修改工具的启用开关 / 权限模式（随"保存全局配置"一起落盘） */
+  /**
+   * 测试 MCP 服务器：真的把进程拉起来并列出它的工具
+   *
+   * 这是"配置写对了吗"的唯一可靠答案——进程能否启动、协议是否对得上、
+   * 到底暴露了哪些工具，光看配置文件是看不出来的。
+   */
+  const handleTestMcp = async (id: string) => {
+    setMcpTesting(id);
+    try {
+      const status = await invoke<McpServerStatus>("test_mcp_server", { id });
+      setMcpStatus((prev) => ({ ...prev, [id]: status }));
+    } catch (e) {
+      setMcpStatus((prev) => ({
+        ...prev,
+        [id]: { id, connected: false, tools: [], error: String(e) },
+      }));
+    } finally {
+      setMcpTesting(null);
+    }
+  };
+
   const patchTools = (patch: Partial<ToolsConfig>) => {
     if (!config) return;
     const current = config.tools ?? DEFAULT_TOOLS_CONFIG;
@@ -699,6 +863,21 @@ export function SettingsPage() {
                       </label>
                       <span className="model-owner">{m.owned_by ?? ""}</span>
                       {isActive && <span className="model-badge">当前</span>}
+                      {/*
+                        显式声明"支持深度思考"：名称启发式探测不准时（自建端点、新模型），
+                        勾选后对话界面才会出现「深度思考」开关、请求里才带 enable_thinking
+                      */}
+                      <label
+                        className="model-thinking-check"
+                        title="声明该模型支持深度思考（覆盖名称探测）"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={(activeProvider.thinking_models ?? []).includes(m.id)}
+                          onChange={() => toggleModelThinking(m.id)}
+                        />
+                        深度思考
+                      </label>
                       <button className="model-select-btn" onClick={() => handleSetActiveModel(m.id)} disabled={isActive}>
                         {isActive ? "✓" : "设为当前"}
                       </button>
@@ -709,6 +888,123 @@ export function SettingsPage() {
             )}
           </div>
         )}
+      </div>
+
+      {/* ─── 模型路由（自动选择） ─── */}
+      <div className="settings-section">
+        <h3>🧭 模型路由（自动选择）</h3>
+        <p className="settings-hint">
+          任务会话里可以选「自动」：<b>Plan 模式与子代理优先用子模型</b>，
+          <b>Work 模式优先用主模型</b>。配置只作用于选择了自动的会话 ——
+          对话界面的底部工具条可以随时切回手动或跟随全局。
+        </p>
+
+        {selectableModels.length === 0 && (
+          <p className="settings-hint">
+            ⚠ 目前还没有「已启用」的模型：先在上面的提供商里点「🔄 获取模型」，
+            勾选要用的模型并保存，这里才有可选的主/子模型。
+          </p>
+        )}
+
+        <label>
+          <span>新建任务会话默认自动</span>
+          <input
+            type="checkbox"
+            checked={modelSettings.auto_by_default}
+            onChange={(e) => updateModelSettings({ auto_by_default: e.target.checked })}
+          />
+          <span className="settings-hint">
+            勾选后，新建的任务会话直接进入自动模式（普通对话会话不受影响）
+          </span>
+        </label>
+
+        <label>
+          <span>主模型</span>
+          <select
+            value={modelSettings.main ? modelRefValue(modelSettings.main) : ""}
+            onChange={(e) =>
+              updateModelSettings({ main: parseModelRefValue(e.target.value) })
+            }
+          >
+            <option value="">跟随全局活跃提供商</option>
+            {selectableModels.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+          <span className="settings-hint">Work 模式与普通轮次优先使用</span>
+        </label>
+
+        <div className="tool-subsection-title">子模型（按顺序轮转）</div>
+        {modelSettings.subs.length === 0 ? (
+          <p className="settings-hint">
+            还没有子模型：Plan 模式与子代理会退回使用主模型。
+          </p>
+        ) : (
+          <ul className="sub-model-list">
+            {modelSettings.subs.map((sub, index) => (
+              <li key={`${sub.provider_id}-${sub.model}`}>
+                <span className="sub-model-order">{index + 1}</span>
+                <span className="sub-model-name">
+                  {sub.model}
+                  <span className="sub-model-provider">
+                    （
+                    {config.llm.providers.find((p) => p.id === sub.provider_id)?.name ??
+                      "提供商已删除"}
+                    ）
+                  </span>
+                </span>
+                <button type="button" onClick={() => moveSubModel(index, -1)} disabled={index === 0}>
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  onClick={() => moveSubModel(index, 1)}
+                  disabled={index === modelSettings.subs.length - 1}
+                >
+                  ↓
+                </button>
+                <button type="button" onClick={() => removeSubModel(index)}>
+                  ✕
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <label>
+          <span>添加子模型</span>
+          <select
+            value=""
+            onChange={(e) => {
+              addSubModel(e.target.value);
+              e.target.value = "";
+            }}
+          >
+            <option value="">选择模型…</option>
+            {selectableModels
+              .filter(
+                (m) =>
+                  !modelSettings.subs.some(
+                    (s) => modelRefValue(s) === m.value
+                  )
+              )
+              .map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+          </select>
+          <span className="settings-hint">
+            最多 {MAX_SUB_MODELS} 个；多个子模型会轮流分配给各个子代理
+          </span>
+        </label>
+
+        <p className="settings-hint">
+          模型的「深度思考」开关出现在对话界面，且只在该模型被判定支持时显示：
+          名称探测不准时，可在上方提供商模型列表里勾选「深度思考」显式声明。
+        </p>
       </div>
 
       {/* ─── 记忆系统 ─── */}
@@ -783,6 +1079,41 @@ export function SettingsPage() {
             {TOOL_MODE_HINT[toolsConfig.mode] ?? ""}
           </span>
         </label>
+        <label>
+          <span>工作记忆</span>
+          <input
+            type="checkbox"
+            disabled={!toolsConfig.enabled}
+            checked={toolsConfig.working_memory}
+            onChange={(e) => patchTools({ working_memory: e.target.checked })}
+          />
+          <span className="settings-hint">
+            允许角色用 save_note 记下跨轮结论（例如「认证在 auth.rs:42」），
+            避免每轮重复调查。笔记有长度与条数上限、注入时带「不可信」标记，
+            界面上可随时查看与清空；关闭后相关工具会明确报错且不再注入
+          </span>
+        </label>
+        <label>
+          <span>单次工具超时（秒）</span>
+          <input
+            type="number"
+            min="5"
+            max="1800"
+            step="5"
+            disabled={!toolsConfig.enabled}
+            value={toolsConfig.call_timeout_secs}
+            onChange={(e) =>
+              // 后端校验范围是 5 ~ 1800 秒；首次编译这类长命令需要更大的预算
+              patchTools({
+                call_timeout_secs: clampNumber(e.target.value, 5, 1800, 60),
+              })
+            }
+          />
+          <span className="settings-hint">
+            执行命令的等待上限。超时不会直接报错：会带着已经产生的输出提前结束，
+            并把「跑到哪一步超时」如实汇报（首次编译建议 300 秒以上）
+          </span>
+        </label>
 
         {/* 工具清单：让用户知道 agent 到底能做什么 */}
         <div className="tool-list">
@@ -808,6 +1139,139 @@ export function SettingsPage() {
                 <div className="tool-item-desc">{t.description}</div>
               </div>
             ))
+          )}
+        </div>
+
+        {/* 联网检索 */}
+        <h4 className="tool-subsection-title">🔎 联网检索</h4>
+        <label>
+          <span>启用联网检索</span>
+          <input
+            type="checkbox"
+            disabled={!toolsConfig.enabled}
+            checked={toolsConfig.search.enabled}
+            onChange={(e) =>
+              patchTools({ search: { ...toolsConfig.search, enabled: e.target.checked } })
+            }
+          />
+          <span className="settings-hint">
+            这是唯一会把你的提问内容发给第三方的能力，因此默认关闭。
+            检索只返回候选链接，正文仍需用 web_fetch 打开并受域名白名单限制
+          </span>
+        </label>
+        <label>
+          <span>检索后端</span>
+          <select
+            disabled={!toolsConfig.enabled || !toolsConfig.search.enabled}
+            value={toolsConfig.search.provider}
+            onChange={(e) =>
+              patchTools({
+                search: { ...toolsConfig.search, provider: e.target.value as SearchProvider },
+              })
+            }
+          >
+            <option value="searxng">SearXNG（自建）</option>
+            <option value="tavily">Tavily</option>
+            <option value="brave">Brave Search</option>
+          </select>
+          <span className="settings-hint">{SEARCH_PROVIDER_HINT[toolsConfig.search.provider]}</span>
+        </label>
+        <label>
+          <span>检索端点</span>
+          <input
+            disabled={!toolsConfig.enabled || !toolsConfig.search.enabled}
+            value={toolsConfig.search.endpoint}
+            placeholder="https://searx.example.com/search"
+            onChange={(e) =>
+              patchTools({ search: { ...toolsConfig.search, endpoint: e.target.value } })
+            }
+          />
+        </label>
+        <label>
+          <span>检索 API Key</span>
+          <input
+            type="password"
+            disabled={!toolsConfig.enabled || !toolsConfig.search.enabled}
+            value={toolsConfig.search.api_key}
+            placeholder="自建实例可留空"
+            onChange={(e) =>
+              patchTools({ search: { ...toolsConfig.search, api_key: e.target.value } })
+            }
+          />
+        </label>
+        <label>
+          <span>返回条数</span>
+          <input
+            type="number"
+            min="1"
+            max="10"
+            disabled={!toolsConfig.enabled || !toolsConfig.search.enabled}
+            value={toolsConfig.search.max_results}
+            onChange={(e) =>
+              patchTools({
+                search: {
+                  ...toolsConfig.search,
+                  max_results: clampNumber(e.target.value, 1, 10, 5),
+                },
+              })
+            }
+          />
+        </label>
+
+        {/* MCP 服务器 */}
+        <h4 className="tool-subsection-title">🔌 MCP 服务器</h4>
+        <p className="settings-hint">
+          外部工具生态：服务器命令写在 <code>config.json</code> 的 <code>tools.mcp.servers</code> 里，
+          必须同时打开 <code>enabled</code> 与 <code>trusted</code> 才会被启动（加配置不等于授权）。
+          启动的服务器的工具会以 <code>mcp:服务器:工具</code> 出现在工具表里，权限按服务器映射
+        </p>
+        <div className="mcp-list">
+          {toolsConfig.mcp.servers.length === 0 ? (
+            <div className="tool-list-empty">
+              尚未配置 MCP 服务器（在 config.json 里添加 tools.mcp.servers 后重启应用）
+            </div>
+          ) : (
+            toolsConfig.mcp.servers.map((server) => {
+              const status = mcpStatus[server.id];
+              return (
+                <div key={server.id} className={`mcp-item ${server.enabled ? "" : "disabled"}`}>
+                  <div className="mcp-item-main">
+                    <span className="mcp-item-id">{server.id}</span>
+                    <span className={`tool-permission-badge ${server.permission}`}>
+                      {server.permission === "read"
+                        ? "只读"
+                        : server.permission === "write"
+                          ? "写入"
+                          : "执行"}
+                    </span>
+                    {!server.enabled && <span className="tool-item-tag off">已停用</span>}
+                    {server.enabled && !server.trusted && (
+                      <span className="tool-item-tag off">未信任</span>
+                    )}
+                  </div>
+                  <div className="mcp-item-cmd">
+                    {server.command} {server.args.join(" ")}
+                  </div>
+                  <div className="mcp-item-hint">{MCP_PERMISSION_HINT[server.permission]}</div>
+                  <div className="mcp-item-actions">
+                    <button
+                      className="mcp-test-btn"
+                      disabled={mcpTesting === server.id}
+                      onClick={() => void handleTestMcp(server.id)}
+                    >
+                      {mcpTesting === server.id ? "连接中…" : "测试连接"}
+                    </button>
+                    {status && (
+                      <span className={`mcp-status ${status.connected ? "ok" : "error"}`}>
+                        {status.connected
+                          ? `已连接 · ${status.tools.length} 个工具：${status.tools.join("、")}`
+                          : status.error ?? "连接失败"}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })
           )}
         </div>
 

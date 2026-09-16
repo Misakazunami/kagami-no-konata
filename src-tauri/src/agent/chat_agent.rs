@@ -172,8 +172,18 @@ impl ChatAgent {
     fn build_messages(&self, ctx: &AgentContext) -> Result<Vec<LlmMessage>> {
         let mut messages = Vec::new();
 
-        // 1. System prompt（人格注入）
-        let mut system_prompt = {
+        // 1. System prompt（人设或任务模式注入）
+        let mut system_prompt = if ctx.session_type == "task" {
+            let persona_name = {
+                let engine = self.personas.read().unwrap_or_else(|e| e.into_inner());
+                engine.get_persona(&ctx.persona_id).map(|p| p.name.clone())
+            };
+            super::task_prompt::build_task_system_prompt(
+                &ctx.task_mode,
+                persona_name.as_deref(),
+                &ctx.user_nickname,
+            )
+        } else {
             let engine = self.personas.read().unwrap_or_else(|e| e.into_inner());
             engine.build_system_prompt(
                 &ctx.persona_id,
@@ -229,6 +239,19 @@ impl ChatAgent {
         // 2. 工具使用规则（仅在使用工具时注入；纯对话链路保持原样）
         if let Some(runtime) = ctx.tools.as_ref().filter(|r| r.enabled) {
             system_prompt.push_str(&tool_usage_rules(runtime, &self.tools));
+
+            // 3. 会话级任务计划：放在规则之后、system prompt 的最后一块，
+            //    让"做到哪一步了"成为模型动手前看到的最后一条信息。
+            //    计划只属于有工具的主窗口链路——悬浮窗保持与接入工具前完全一致。
+            if let Some(section) = ctx.plan.as_ref().and_then(|plan| plan.prompt_section()) {
+                system_prompt.push_str(&section);
+            }
+
+            // 4. 工作记忆：模型自己记下的跨轮结论，整段带 untrusted 标记。
+            //    放在最后是因为它最"次要"——真值判断仍以本轮工具结果为准。
+            if let Some(section) = crate::agent::notes::prompt_section(&ctx.notes) {
+                system_prompt.push_str(&section);
+            }
         }
 
         messages.push(LlmMessage::system(system_prompt));
@@ -255,17 +278,61 @@ impl ChatAgent {
         Ok(messages)
     }
 
+    /// 解析本轮生成使用的后端
+    ///
+    /// 返回 `(主轮次后端, 子代理模型池)`：
+    /// - `ctx.models` 为空（未做会话级选择）→ 复用共享后端，子代理池里只有一个
+    ///   无名条目（即"与主轮次同模型"，与未引入模型路由时完全一致）；
+    /// - 有会话级方案 → 每个模型一个**请求级** backend，子代理在池上轮转。
+    fn backends_for(
+        &self,
+        ctx: &AgentContext,
+    ) -> (Arc<dyn ChatBackend>, Vec<crate::llm::router::ChildModel>) {
+        match ctx.models.as_deref() {
+            Some(plan) => (plan.main_backend(), plan.child_models()),
+            None => (
+                self.backend.clone(),
+                vec![crate::llm::router::ChildModel::new(
+                    self.backend.clone(),
+                    String::new(),
+                )],
+            ),
+        }
+    }
+
     /// 组装一次工具循环运行所需的参数
     fn harness_run<'a>(
         &'a self,
         ctx: &'a AgentContext,
         runtime: &'a ToolRuntime,
         cancel: Arc<std::sync::atomic::AtomicBool>,
+        main_backend: &'a Arc<dyn ChatBackend>,
+        child_models: Vec<crate::llm::router::ChildModel>,
     ) -> HarnessRun<'a> {
+        // 服务句柄按值克隆：只读子代理要在"父级服务的只读克隆"上再跑一次循环，
+        // 因此这里给父级挂上子代理运行时（子代理自己拿不到它 → 深度恒为 1 层）
+        let mut services = runtime.services.clone();
+        // 子代理模型池 = 子模型池；为空时退化为"与主轮次同一个后端"
+        // （手动模式与未做选择时都是这条路径，行为与接入模型路由前一致）
+        let child_models = if child_models.is_empty() {
+            vec![crate::llm::router::ChildModel::new(
+                main_backend.clone(),
+                String::new(),
+            )]
+        } else {
+            child_models
+        };
+        services.subagent = Some(Arc::new(
+            crate::agent::harness::subagent::AgentRuntime::with_models(
+                child_models,
+                crate::agent::harness::subagent::DEFAULT_MAX_CHILDREN,
+            ),
+        ));
+
         HarnessRun {
-            backend: self.backend.as_ref(),
+            backend: main_backend.as_ref(),
             registry: &self.tools,
-            services: &runtime.services,
+            services,
             session_id: &ctx.session_id,
             stream_id: &ctx.stream_id,
             cancel,
@@ -303,29 +370,30 @@ impl Agent for ChatAgent {
 
     async fn handle(&self, ctx: &AgentContext) -> Result<AgentResponse> {
         let messages = self.build_messages(ctx)?;
+        let (main_backend, child_models) = self.backends_for(ctx);
 
         // 启用工具时走工具循环（无回调：只取最终正文与轨迹）
         if let Some(runtime) = ctx.tools.as_ref().filter(|r| r.enabled) {
             let cancel = Arc::new(AtomicBool::new(false));
-            let run = self.harness_run(ctx, runtime, cancel);
+            let run = self.harness_run(ctx, runtime, cancel, &main_backend, child_models);
             match run.execute(messages, |_| {}, |_| {}).await {
                 Ok(outcome) => {
                     log_step_limit(&outcome);
-                    return Ok(
-                        AgentResponse::text(outcome.content).with_invocations(outcome.invocations)
-                    );
+                    return Ok(AgentResponse::text(outcome.content)
+                        .with_invocations(outcome.invocations)
+                        .with_extra_tokens(outcome.extra_tokens));
                 }
                 Err(e) if is_tools_unsupported(&e) => {
                     eprintln!("[harness] 提供商不支持工具调用，降级为纯对话：{}", e);
                     let plain = plain_context(ctx);
                     let messages = self.build_messages(&plain)?;
-                    return self.plain_stream_response(messages, None).await;
+                    return self.plain_stream_response(&main_backend, messages, None).await;
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        let stream = self.backend.chat_stream(messages, None).await?;
+        let stream = main_backend.chat_stream(messages, None).await?;
         let mut full_response = String::new();
 
         let mut stream = stream;
@@ -334,6 +402,7 @@ impl Agent for ChatAgent {
                 StreamChunk::Content(text) => full_response.push_str(&text),
                 StreamChunk::Thinking(_) => {} // 非流式模式下忽略思考内容
                 StreamChunk::ToolCallDelta(_) => {} // 未启用工具时不会出现
+                StreamChunk::Finish(_) => {} // 结束原因只对工具循环有意义
             }
         }
 
@@ -348,18 +417,19 @@ impl Agent for ChatAgent {
         on_thinking: StreamThinkingCallback,
     ) -> Result<AgentResponse> {
         let messages = self.build_messages(ctx)?;
+        let (main_backend, child_models) = self.backends_for(ctx);
 
         // 启用工具时走工具循环；悬浮窗（ctx.tools = None）保持原有纯对话路径
         if let Some(runtime) = ctx.tools.as_ref().filter(|r| r.enabled) {
-            let run = self.harness_run(ctx, runtime, cancel.clone());
+            let run = self.harness_run(ctx, runtime, cancel.clone(), &main_backend, child_models);
             let on_chunk_ref: &(dyn Fn(&str) + Send + Sync) = &|text| on_chunk(text);
             let on_thinking_ref: &(dyn Fn(&str) + Send + Sync) = &|text| on_thinking(text);
             match run.execute(messages, on_chunk_ref, on_thinking_ref).await {
                 Ok(outcome) => {
                     log_step_limit(&outcome);
-                    return Ok(
-                        AgentResponse::text(outcome.content).with_invocations(outcome.invocations)
-                    );
+                    return Ok(AgentResponse::text(outcome.content)
+                        .with_invocations(outcome.invocations)
+                        .with_extra_tokens(outcome.extra_tokens));
                 }
                 Err(e) if is_tools_unsupported(&e) => {
                     // 已经外发过一部分正文的极端情况下也不重复输出：
@@ -368,15 +438,23 @@ impl Agent for ChatAgent {
                     let plain = plain_context(ctx);
                     let messages = self.build_messages(&plain)?;
                     return self
-                        .plain_stream_response(messages, Some((cancel, on_chunk, on_thinking)))
+                        .plain_stream_response(
+                            &main_backend,
+                            messages,
+                            Some((cancel, on_chunk, on_thinking)),
+                        )
                         .await;
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        self.plain_stream_response(messages, Some((cancel, on_chunk, on_thinking)))
-            .await
+        self.plain_stream_response(
+            &main_backend,
+            messages,
+            Some((cancel, on_chunk, on_thinking)),
+        )
+        .await
     }
 }
 
@@ -389,8 +467,12 @@ fn plain_context(ctx: &AgentContext) -> AgentContext {
 
 impl ChatAgent {
     /// 纯对话流式路径（不携带 `tools` 字段）
+    ///
+    /// `backend` 由调用方按本轮模型方案给出（会话级选择），未做选择时
+    /// 就是共享后端 —— 与未引入模型路由时逐字节一致。
     async fn plain_stream_response(
         &self,
+        backend: &Arc<dyn ChatBackend>,
         messages: Vec<LlmMessage>,
         callbacks: Option<(
             Arc<std::sync::atomic::AtomicBool>,
@@ -398,7 +480,7 @@ impl ChatAgent {
             StreamThinkingCallback,
         )>,
     ) -> Result<AgentResponse> {
-        let stream = self.backend.chat_stream(messages, None).await?;
+        let stream = backend.chat_stream(messages, None).await?;
         let mut full_response = String::new();
         let mut stream = stream;
 
@@ -422,6 +504,8 @@ impl ChatAgent {
                 }
                 // 未启用工具时不会收到工具增量；忽略以保持正文纯净
                 StreamChunk::ToolCallDelta(_) => {}
+                // 纯对话链路不关心结束原因
+                StreamChunk::Finish(_) => {}
             }
         }
 
@@ -530,6 +614,11 @@ mod tests {
             user_info: None,
             retrieved_memories: Vec::new(),
             tools: None,
+            models: None,
+            plan: None,
+            notes: Vec::new(),
+            session_type: "chat".to_string(),
+            task_mode: "plan".to_string(),
             session_id: "s1".to_string(),
             stream_id: "stream-1".to_string(),
         }
@@ -586,6 +675,105 @@ mod tests {
         // 人格、时间、记忆注入顺序不受影响
         assert!(system.contains("【当前时间】"));
         assert_eq!(messages.len(), 2);
+    }
+
+    /// 任务计划只注入"有工具的链路"，且注入位置在工具规则之后（system prompt 最后一块）
+    #[test]
+    fn plan_section_is_injected_only_with_tools() {
+        let agent = make_agent();
+        let plan = crate::agent::plan::SessionPlan::new(
+            vec![
+                crate::agent::plan::PlanItem {
+                    title: "读代码".to_string(),
+                    status: crate::agent::plan::PlanStatus::Done,
+                },
+                crate::agent::plan::PlanItem {
+                    title: "改实现".to_string(),
+                    status: crate::agent::plan::PlanStatus::Doing,
+                },
+            ],
+            Some("等用户确认".to_string()),
+        );
+
+        // 悬浮窗/纯对话链路：没有工具就完全不注入计划（提示词与接入工具前一致）
+        let mut plain = base_ctx("你好", vec![]);
+        plain.plan = Some(plan.clone());
+        let messages = agent.build_messages(&plain).unwrap();
+        assert!(
+            !messages[0].content.contains("【当前任务计划】"),
+            "纯对话链路不得注入计划"
+        );
+
+        // 主窗口链路：注入，并且在工具规则之后
+        let mut with_tools = base_ctx("继续", vec![]);
+        with_tools.tools = Some(test_runtime());
+        with_tools.plan = Some(plan);
+        let messages = agent.build_messages(&with_tools).unwrap();
+        let system = &messages[0].content;
+        let rules_at = system.find("【工具使用规则】").expect("工具规则");
+        let plan_at = system.find("【当前任务计划】").expect("计划段落");
+        assert!(plan_at > rules_at, "计划应排在工具规则之后");
+        assert!(system.contains("[x] 读代码"), "{system}");
+        assert!(system.contains("[>] 改实现"), "{system}");
+        assert!(system.contains("备注：等用户确认"), "{system}");
+        // 计划属于 system 段，不能混进对话历史
+        assert_eq!(messages.len(), 2);
+    }
+
+    /// 会话级模型方案必须真的改变本轮使用的 backend（否则"选了模型没生效"）
+    #[test]
+    fn model_plan_replaces_the_backend_and_feeds_sub_agents() {
+        use crate::config::types::{AppConfig, ModelRef};
+        use crate::llm::router::{resolve, SessionModelPref};
+
+        let agent = make_agent();
+
+        // 未做选择：复用共享 backend，子代理池只有一个无名条目
+        let plain = base_ctx("你好", vec![]);
+        let (main, children) = agent.backends_for(&plain);
+        assert!(Arc::ptr_eq(&main, &agent.backend));
+        assert_eq!(children.len(), 1);
+        assert!(children[0].label.is_empty());
+
+        // 自动选择（任务会话）：主轮次与子代理都用请求级 backend
+        let mut cfg = AppConfig::default();
+        let provider_id = cfg.llm.providers[0].id.clone();
+        cfg.models.main = Some(ModelRef::new(provider_id.clone(), "main-model"));
+        cfg.models.subs = vec![
+            ModelRef::new(provider_id.clone(), "sub-a"),
+            ModelRef::new(provider_id, "sub-b"),
+        ];
+        let plan = resolve(&cfg, Some(&SessionModelPref::auto()), "task", "work");
+
+        let mut task_ctx = base_ctx("干活", vec![]);
+        task_ctx.models = Some(Arc::new(plan));
+        let (main, children) = agent.backends_for(&task_ctx);
+        assert!(
+            !Arc::ptr_eq(&main, &agent.backend),
+            "有会话级方案时必须使用请求级 backend"
+        );
+        assert_eq!(children.len(), 2, "两个子模型都要进子代理池");
+        assert_eq!(children[0].label, "sub-a");
+        assert_eq!(children[1].label, "sub-b");
+    }
+
+    /// 未配置子模型时，子代理池退化为"与主轮次同模型"（含主模型标签）
+    #[test]
+    fn manual_plan_gives_child_agents_the_main_model() {
+        use crate::config::types::AppConfig;
+        use crate::llm::router::{resolve, SessionModelPref};
+
+        let agent = make_agent();
+        let cfg = AppConfig::default();
+        let provider_id = cfg.llm.providers[0].id.clone();
+        let pref = SessionModelPref::manual(provider_id, "only-model");
+        let plan = resolve(&cfg, Some(&pref), "chat", "plan");
+
+        let mut ctx = base_ctx("你好", vec![]);
+        ctx.models = Some(Arc::new(plan));
+        let (_, children) = agent.backends_for(&ctx);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].label, "only-model");
     }
 
     /// 首次带 tools 的请求被提供商拒绝，第二次（不带 tools）成功

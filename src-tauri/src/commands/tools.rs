@@ -114,6 +114,222 @@ pub async fn get_tool_invocations(
         .map_err(|e| e.to_string())
 }
 
+// ─── 任务计划（`update_plan` 工具写、界面读） ───────────────
+
+/// 计划在界面上的视图（`items` 已是结构化数据，前端不再解析 JSON）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlanView {
+    pub session_id: String,
+    pub items: Vec<crate::agent::plan::PlanItem>,
+    pub note: Option<String>,
+    pub updated_at: String,
+}
+
+/// 读取某个会话的任务计划（没有计划时返回 null）
+#[tauri::command]
+pub async fn get_plan(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<PlanView>, String> {
+    ensure_main_window(&window)?;
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    let plan = store
+        .get_plan(&session_id)
+        .map_err(|e| e.to_string())?
+        .filter(|plan| !plan.is_empty());
+    Ok(plan.map(|plan| PlanView {
+        session_id: session_id.clone(),
+        items: plan.items,
+        note: plan.note,
+        updated_at: plan.updated_at,
+    }))
+}
+
+/// 用户手动清空计划（模型自己也能通过 `update_plan` 传空数组清空）
+///
+/// 清空后同样广播 `plan-updated`，界面不必再单独回读一次。
+#[tauri::command]
+pub async fn clear_plan(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        store.clear_plan(&session_id).map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit_to(
+        tauri::EventTarget::webview_window("main"),
+        crate::agent::harness::EVENT_PLAN_UPDATED,
+        serde_json::json!({
+            "session_id": session_id,
+            "items": [],
+            "note": serde_json::Value::Null,
+        }),
+    );
+    Ok(())
+}
+
+// ─── MCP 服务器（诊断用） ───────────────────────────────
+
+/// 已配置的 MCP 服务器（只读视图，命令与参数不对外暴露完整环境变量）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpServerView {
+    pub id: String,
+    pub enabled: bool,
+    pub trusted: bool,
+    pub permission: String,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+fn mcp_server_views(state: &AppState) -> Result<Vec<McpServerView>, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    Ok(config
+        .tools
+        .mcp
+        .servers
+        .iter()
+        .map(|server| McpServerView {
+            id: server.id.clone(),
+            enabled: server.enabled,
+            trusted: server.trusted,
+            permission: server.permission.as_str().to_string(),
+            command: server.command.clone(),
+            args: server.args.clone(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn list_mcp_servers(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Vec<McpServerView>, String> {
+    ensure_main_window(&window)?;
+    mcp_server_views(&state)
+}
+
+/// 测试连接：真的把服务器拉起来并列出它的工具
+///
+/// 这是"配置有没有写对"的唯一可靠答案（进程能否启动、协议是否对得上、
+/// 到底暴露了哪些工具）。没有启用/未标记可信的服务器不会被启动。
+#[tauri::command]
+pub async fn test_mcp_server(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<crate::mcp::McpServerStatus, String> {
+    ensure_main_window(&window)?;
+    let server = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config
+            .tools
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .cloned()
+            .ok_or_else(|| format!("没有找到 id 为 {} 的 MCP 服务器", id))?
+    };
+    Ok(crate::mcp::probe(&server).await)
+}
+
+// ─── 工作记忆（`save_note` 工具写、界面读） ───────────────
+
+/// 读取某个会话的工作记忆
+#[tauri::command]
+pub async fn get_notes(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<crate::agent::notes::SessionNote>, String> {
+    ensure_main_window(&window)?;
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    store
+        .list_notes(&session_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 清空某个会话的工作记忆（模型也能通过 `forget_note` 清空）
+///
+/// 这是用户对"跨轮记忆"的最后一道控制：模型记了什么、什么时候清掉，用户说了算。
+#[tauri::command]
+pub async fn clear_notes(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<usize, String> {
+    ensure_main_window(&window)?;
+    let removed = {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        store
+            .delete_note(&session_id, None)
+            .map_err(|e| e.to_string())?
+    };
+    let _ = app.emit_to(
+        tauri::EventTarget::webview_window("main"),
+        crate::agent::harness::EVENT_NOTES_UPDATED,
+        serde_json::json!({
+            "session_id": session_id,
+            "count": 0,
+            "removed": removed,
+        }),
+    );
+    Ok(removed)
+}
+
+// ─── 文件改动快照与回滚 ─────────────────────────────────
+
+/// 某个 stream 的文件改动快照概况（界面据此决定要不要显示"回滚"）
+#[tauri::command]
+pub async fn get_snapshot(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    stream_id: String,
+) -> Result<Option<crate::agent::harness::SnapshotInfo>, String> {
+    ensure_main_window(&window)?;
+    let data_dir = state
+        .app_data_dir
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let store = crate::agent::harness::SnapshotStore::new(&data_dir, state.chat_store.clone());
+    let info = store.info(&session_id, &stream_id);
+    Ok(if info.is_empty() { None } else { Some(info) })
+}
+
+/// 回滚某一次生成造成的全部文件改动
+///
+/// 这里**不检查 `tools.enabled`**：用户完全可能在关掉工具之后才想撤销上一次的改动，
+/// 回滚只读备份、不执行任何模型指令。
+#[tauri::command]
+pub async fn restore_snapshot(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    stream_id: String,
+) -> Result<crate::agent::harness::snapshot::RestoreReport, String> {
+    ensure_main_window(&window)?;
+    let (tools_cfg, data_dir) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        let data_dir = state
+            .app_data_dir
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone();
+        (config.tools.clone(), data_dir)
+    };
+    // 目标路径重新过一遍工作区监狱（备份索引是我们自己写的，但边界只有一处）
+    let workspaces = crate::agent::harness::WorkspaceSet::from_config(&tools_cfg, &data_dir);
+    let store = crate::agent::harness::SnapshotStore::new(&data_dir, state.chat_store.clone());
+    Ok(store.restore(&stream_id, &workspaces))
+}
+
 // ─── 工作区管理 ─────────────────────────────────────────
 
 /// 已解析的工作区视图（带可用性判定）

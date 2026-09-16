@@ -27,6 +27,39 @@ impl ToolRegistry {
         Self { tools, by_name }
     }
 
+    /// 追加一批工具（MCP 等外部来源）
+    ///
+    /// 在构造期调用一次：注册表本身不做运行时变更，避免"工具集在会话中途变化"
+    /// 这种会让模型与用户都困惑的状态。
+    pub fn with_extra(mut self, extra: Vec<Arc<dyn Tool>>) -> Self {
+        for tool in extra {
+            let descriptor = tool.descriptor();
+            if self.by_name.contains_key(descriptor.name) {
+                eprintln!(
+                    "[harness] 工具名与已有工具冲突，已跳过：{}",
+                    descriptor.name
+                );
+                continue;
+            }
+            self.by_name.insert(descriptor.name, tool.clone());
+            self.tools.push(tool);
+        }
+        self
+    }
+
+    /// 去掉若干工具后的注册表
+    ///
+    /// 用途：子代理的注册表必须排除 `spawn_subagents` 自己——它的权限是只读，
+    /// 光靠模式过滤挡不住；运行时虽然也会拒绝（`services.subagent` 为 `None`），
+    /// 但让模型看到"一个调了必然报错的工具"是纯粹的浪费。
+    pub fn excluding(mut self, names: &[&str]) -> Self {
+        self.tools
+            .retain(|tool| !names.contains(&tool.descriptor().name));
+        self.by_name
+            .retain(|name, _| !names.contains(name));
+        self
+    }
+
     /// 空注册表：悬浮窗链路使用
     pub fn empty() -> Self {
         Self {
@@ -65,7 +98,7 @@ impl ToolRegistry {
             .iter()
             .map(|tool| {
                 let d = tool.descriptor();
-                ToolSchema::function(d.name, d.description, d.parameters.clone())
+                ToolSchema::function(d.name, d.description.clone(), d.parameters.clone())
             })
             .collect()
     }
@@ -80,7 +113,7 @@ impl ToolRegistry {
                 ToolInfo {
                     name: d.name.to_string(),
                     label: d.label.to_string(),
-                    description: d.description.to_string(),
+                    description: d.description.clone(),
                     permission: d.permission,
                     read_only: d.permission.is_read_only(),
                     enabled: d.permission.visible_in(mode),

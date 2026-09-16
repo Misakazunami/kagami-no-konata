@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::Write;
 
+use crate::agent::harness::snapshot::{capture_before_change, snapshot_note};
 use crate::agent::harness::traits::{
     truncate_text, Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput,
 };
@@ -66,16 +67,33 @@ impl Tool for WriteFile {
             }
         }
 
+        // 覆盖前备份原文件：这是"敢让模型改代码"的前提（界面上可一键回滚）
+        let capture = if existed {
+            capture_before_change(
+                cx.services,
+                cx.session_id,
+                cx.stream_id,
+                &resolved.root_id,
+                &resolved.rel,
+                &target,
+            )
+        } else {
+            None
+        };
+
         cx.ensure_not_cancelled()?;
         atomic_write(&target, content.as_bytes())?;
 
-        let text = format!(
+        let mut text = format!(
             "{}：{}（{} 字节，工作区 {}）",
             if existed { "已覆盖" } else { "已创建" },
             target.display(),
             content.len(),
             resolved.root_id
         );
+        if existed {
+            text.push_str(&snapshot_note(capture.as_ref()));
+        }
         Ok(ToolOutput::text(text.clone()).with_preview(text))
     }
 }
@@ -150,14 +168,24 @@ impl Tool for EditFile {
             text.replacen(&old_string, new_string, 1)
         };
 
+        let capture = capture_before_change(
+            cx.services,
+            cx.session_id,
+            cx.stream_id,
+            &resolved.root_id,
+            &resolved.rel,
+            &target,
+        );
+
         cx.ensure_not_cancelled()?;
         atomic_write(&target, updated.as_bytes())?;
 
         let summary = format!(
-            "已修改：{}（替换 {} 处，工作区 {}）",
+            "已修改：{}（替换 {} 处，工作区 {}）{}",
             target.display(),
             if replace_all { count } else { 1 },
-            resolved.root_id
+            resolved.root_id,
+            snapshot_note(capture.as_ref())
         );
         let diff_preview = truncate_text(
             &format!(
@@ -209,6 +237,8 @@ mod tests {
         services: ToolServices,
         sink: Arc<NullSink>,
         cancel: Arc<AtomicBool>,
+        session_id: String,
+        snapshots: Option<Arc<crate::agent::harness::SnapshotStore>>,
     }
 
     impl Drop for Fixture {
@@ -230,13 +260,36 @@ mod tests {
                 dir,
                 sink: Arc::new(NullSink),
                 cancel: Arc::new(AtomicBool::new(false)),
+                session_id: "s1".to_string(),
+                snapshots: None,
             }
+        }
+
+        /// 挂上一个真实的快照服务（覆盖/删除类改动因此可回滚）
+        fn with_snapshots(mut self, tag: &str) -> Self {
+            let conn = crate::store::db::init_db(&self.dir).unwrap();
+            let store = Arc::new(std::sync::Mutex::new(crate::store::chat_store::ChatStore::new(conn)));
+            let session = store
+                .lock()
+                .unwrap()
+                .create_session("konata-default", tag, None, None, None)
+                .unwrap();
+            let snapshots = Arc::new(crate::agent::harness::SnapshotStore::new(
+                &self.dir,
+                store.clone(),
+            ));
+            self.services.chat_store = Some(store);
+            self.services.snapshots = Some(snapshots.clone());
+            self.session_id = session.id;
+            self.snapshots = Some(snapshots);
+            self
         }
 
         fn ctx(&self) -> ToolCtx<'_> {
             ToolCtx {
-                session_id: "s1",
+                session_id: &self.session_id,
                 stream_id: "st1",
+                call_id: "c1",
                 step: 0,
                 cancel: self.cancel.clone(),
                 services: &self.services,
@@ -280,6 +333,55 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".konata-tmp-"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn overwrite_keeps_a_restorable_backup() {
+        let fx = Fixture::new("snap", true).with_snapshots("快照");
+        let cx = fx.ctx();
+        let snapshots = fx.snapshots.clone().unwrap();
+        let session_id = fx.session_id.clone();
+
+        let out = block_on(WriteFile.call(
+            json!({"path": "note.md", "content": "全新内容", "overwrite": true}),
+            &cx,
+        ))
+        .unwrap();
+        assert!(out.content.contains("已覆盖"), "{}", out.content);
+        assert!(out.content.contains("回滚"), "必须告知用户可回滚：{}", out.content);
+
+        let info = snapshots.info(&session_id, "st1");
+        assert_eq!(info.files, 1, "覆盖前必须备份");
+        assert!(info.bytes > 0);
+
+        // 回滚后回到原内容
+        let report = snapshots.restore("st1", &fx.services.workspaces);
+        assert_eq!(report.restored, 1, "{report:?}");
+        assert_eq!(
+            std::fs::read_to_string(fx.dir.join("note.md")).unwrap(),
+            "第一行\n第二行\n第二行\n"
+        );
+    }
+
+    #[test]
+    fn edit_file_backs_up_before_modifying() {
+        let fx = Fixture::new("snapedit", true).with_snapshots("快照");
+        let cx = fx.ctx();
+        let snapshots = fx.snapshots.clone().unwrap();
+        let session_id = fx.session_id.clone();
+
+        block_on(EditFile.call(
+            json!({"path": "note.md", "old_string": "第二行", "new_string": "改过了", "replace_all": true}),
+            &cx,
+        ))
+        .unwrap();
+        assert_eq!(snapshots.info(&session_id, "st1").files, 1);
+
+        snapshots.restore("st1", &fx.services.workspaces);
+        assert_eq!(
+            std::fs::read_to_string(fx.dir.join("note.md")).unwrap(),
+            "第一行\n第二行\n第二行\n"
+        );
     }
 
     #[test]

@@ -49,6 +49,20 @@ pub struct AgentContext {
     pub retrieved_memories: Vec<MemoryEntry>,
     /// 工具运行时；`None` 表示纯对话（悬浮窗链路恒为 `None`）
     pub tools: Option<ToolRuntime>,
+    /// 本轮生成使用的模型方案（会话级选择 + 主/子模型路由）
+    ///
+    /// `None` 表示"未做会话级选择"：Agent 直接使用共享的全局 backend，
+    /// 行为与未引入模型路由时完全一致。解析在 `send_message` 里完成，
+    /// 因此用户中途换模型不会影响正在跑的生成。
+    pub models: Option<Arc<crate::llm::router::ModelPlan>>,
+    /// 会话级任务计划（由 `update_plan` 工具写；注入 system prompt 让模型跨轮记住进度）
+    pub plan: Option<crate::agent::plan::SessionPlan>,
+    /// 工作记忆（由 `save_note` 写；注入时统一带 untrusted 标记）
+    pub notes: Vec<crate::agent::notes::SessionNote>,
+    /// 会话类型："chat" | "task"
+    pub session_type: String,
+    /// 任务模式："plan" | "work"
+    pub task_mode: String,
     /// 当前会话 id（工具事件与轨迹记录需要）
     pub session_id: String,
     /// 当前生成任务 id（用于跨窗口过滤与取消）
@@ -70,6 +84,9 @@ pub struct AgentResponse {
     /// 本轮生成中的工具调用轨迹（落库到 `tool_invocations` 供 UI 回放）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_invocations: Vec<crate::agent::harness::InvocationRecord>,
+    /// 工具额外消耗的 token 估算（目前来自只读子代理），累加进本轮统计
+    #[serde(default)]
+    pub extra_tokens: usize,
 }
 
 impl AgentResponse {
@@ -78,7 +95,14 @@ impl AgentResponse {
             content: content.into(),
             response_type: ResponseType::Text,
             tool_invocations: Vec::new(),
+            extra_tokens: 0,
         }
+    }
+
+    /// 记下工具额外消耗的 token 估算（子代理等"隐藏开销"）
+    pub fn with_extra_tokens(mut self, tokens: usize) -> Self {
+        self.extra_tokens = tokens;
+        self
     }
 
     pub fn with_invocations(

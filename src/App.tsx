@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useChatStore } from "./stores/chatStore";
+import { emptyGenerationState, useChatStore } from "./stores/chatStore";
 import { ChatWindow } from "./components/chat/ChatWindow";
 import { SettingsPage } from "./components/settings/SettingsPage";
 import { PersonaEditor } from "./components/persona/PersonaEditor";
@@ -140,8 +140,11 @@ function App() {
             useChatStore.setState({
               currentSessionId: null,
               messages: [],
-              isStreaming: false,
-              activeStreamId: null,
+              // 报错属于被删掉的会话，不能跟着用户留在界面上
+              errorMessage: null,
+              // liveToolCalls / plan / notes 等"这一轮生成"与"会话级"状态
+              // 必须一起复位，否则会以孤儿卡片的形式出现在下一个会话里
+              ...emptyGenerationState(),
             });
             loadSessions();
           }

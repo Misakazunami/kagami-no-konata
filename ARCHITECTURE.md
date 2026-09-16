@@ -98,6 +98,59 @@
 
 **理由**：不做单一 LLM 绑定。通过统一接口适配多种后端，用户可按需选择云端或本地模型。OpenAI API 格式已成为事实标准，兼容性最广。
 
+#### 2.3.1 会话级模型选择与自动选择（主/子模型路由）
+
+**问题**：`LlmProxy` 在过去是**进程级单例**——一个应用一个模型，靠热更新切换。
+但需求要求「同一轮生成里，主轮次与只读子代理用**不同的**模型」，
+且「用户在对话界面切换模型不能污染正在跑的生成，两个窗口并发生成也不能互相踩」。
+
+**方案：请求级（generation-scoped）模型解析**，代码在 `llm/router.rs`：
+
+```
+send_message（commands/chat.rs）
+  ├─ 读 sessions.model_pref + AppConfig.models + session_type + task_mode
+  ├─ router::resolve(...) → ModelPlan { main, subs, thinking }   ← 永不失败，悬空即降级
+  └─ AgentContext.models = Some(Arc<ModelPlan>)
+
+ChatAgent::handle_stream
+  ├─ main_backend  = plan.main_backend()      // 每个模型一个请求级 LlmProxy
+  ├─ child_models  = plan.child_models()      // 子代理模型池（含展示名）
+  ├─ 主轮次（工具循环 / 纯对话流） → main_backend
+  └─ ToolServices.subagent = AgentRuntime::with_models(child_models, 2)
+        └─ run_child(index) → models[index % n]      ← 多个子模型按序号轮转
+```
+
+**关键不变式**
+
+| 不变式 | 理由 |
+|---|---|
+| 解析只发生在 `send_message`，结果是**快照** | 生成中切换模型只影响下一轮；两窗口并发生成互不影响 |
+| `ctx.models = None` 时完全走共享 backend | 未做选择时行为与接入该功能前逐字节一致（含悬浮窗链路） |
+| `resolve()` 永不返回错误，悬空引用降级到活跃提供商 | 模型选择是"锦上添花"，不能把用户的一条消息变成"发送失败" |
+| `subs` 为空 ⇒ 子代理与主轮次同模型 | 手动模式不引入用户没有选择的模型 |
+| `enable_thinking` 只在**判定支持**的模型上下发 | 严格端点会对未知字段直接 400；判定见 `llm/capabilities.rs` |
+| 自动选择**只对任务会话生效** | 普通会话没有主/子之分；写进 `auto` 也按 `inherit` 处理并记日志 |
+
+**模式语义**（`ModelMode`）
+
+| 会话 pref | session_type / task_mode | 主轮次 | 子代理 |
+|---|---|---|---|
+| `inherit`（默认） | 任意 | 全局活跃提供商 | 同主轮次 |
+| `manual` | 任意 | 会话选定的 (提供商, 模型) | 同主轮次 |
+| `auto` | task / **plan** | `subs[0]`（子模型优先） | `subs` 轮转 |
+| `auto` | task / **work** | `main`（主模型优先） | `subs` 轮转 |
+| `auto` | chat | 按 `inherit` 处理 | — |
+
+**持久化与能力探测**
+
+- 会话级偏好存 `sessions.model_pref`（**单列 JSON**，见迁移 011）：这些字段不参与查询/排序，
+  JSON 便于以后加字段；解析失败一律当"未设置"并记日志。
+- 全局的主/子模型池存 `AppConfig.models`（顶层段，避免触碰 `LlmConfig` 的旧格式迁移逻辑）。
+- 深度思考能力：`llm/capabilities.rs` 按模型名启发式判断（`reasoner`/`r1`/`qwen3`/`gpt-5`…），
+  并用 `LlmProvider.thinking_models` 的显式声明覆盖；界面只对"判定支持"的模型显示开关。
+- 辅助链路（会话摘要、自动标题、记忆提取、embedding）**仍用全局活跃提供商**：
+  换 embedding 提供商会让向量维度与既有记忆不匹配，属于另一个问题域。
+
 ### 2.4 数据存储：SQLite 全家桶
 
 **选型：SQLite 作为唯一数据库引擎**
@@ -277,7 +330,22 @@ Agent 层回答"谁来处理这条输入"（路由在 LLM **之前**），工具
   （`cmd`/`powershell`/`curl`/`rm`/`reg`/`schtasks`/`certutil`… 无法放行）、
   解释器求值参数（`python -c`、`node -e`）一律拒绝、`python -m` 仅限白名单模块、
   参数中的绝对路径必须落在工作区内、子进程只继承白名单环境变量；
-- 输出截断（默认 64 KiB，保留头尾）、审批超时/取消一律拒绝（fail-closed）。
+- **多步命令**：`run_command` 接受 `steps`（≤5 步）串行执行，**不使用 shell 组合**
+  （没有管道/重定向/`&&`）；每一步都单独过守卫，任何一步被拒则整批都不执行；
+  输出裁剪用 `max_output_lines` 而不是管道；
+- **删除走回收站**：`delete_path` 默认按 XDG Trash 规范移入回收站（同名冲突自动改名、跨卷退化为"复制成功后再删源"，复制失败则整体放弃），只有显式 `permanent=true` 才永久删除；
+- **多步命令的预检**：`run_command` 的每一步都先过守卫再执行，第 2 步会被拒时第 1 步绝不执行；
+- **改动前快照**：覆盖/编辑/删除/移动/复制文件前把原内容备份到 `snapshots/{stream_id}/`（仅文件、单文件 ≤4 MB、单 stream ≤64 MB，超限跳过并如实告知），配合 `restore_snapshot` 支持一键回滚；目录级删除由回收站兜底；
+- **只读子代理**：`spawn_subagents` 派出的每个任务都在"只读服务 + DenyAllApprover + 无子代理运行时"的
+  克隆上跑自己的循环，深度因此恒为 1 层；每轮生成有名额预算（默认 2），子代理用量估算回传进统计；
+- **工作记忆**：唯一跨轮保留的内容，且只有模型主动 `save_note` 的结论（≤8 条 / 单条 2 KB / 总量 16 KB，
+  超出淘汰最旧），注入时整段带 `<untrusted>`，不参与任何权限或审批决策；
+- **联网检索**：`web_search` 默认关闭（唯一外发用户提问的能力），只返回链接与摘要，正文仍走 `web_fetch` 的白名单；
+- **MCP**：服务器只能由用户写在 `config.json`（`enabled` + `trusted` 双开关，默认都关），权限按服务器映射，
+  环境变量只传显式列出的键，传输用阻塞 stdio（避免子进程随临时 runtime 一起失效）；
+- 输出截断（默认 64 KiB，保留头尾）、审批超时/取消一律拒绝（fail-closed）；
+- 超时/取消时子进程被强杀，但**已经收到的输出会被保留**：工具自行判定状态
+  （`ok`/`error`/`timeout`/`cancelled`）并如实上报，runner 不再把它当成"调用失败"。
 
 **提供商兼容**
 
@@ -290,9 +358,13 @@ Agent 层回答"谁来处理这条输入"（路由在 LLM **之前**），工具
 | 事件 | 载荷要点 |
 |---|---|
 | `tool-call-start` | `session_id` `stream_id` `call_id` `tool` `args_preview` `permission` `step` |
+| `tool-output-chunk` | `session_id` `stream_id` `call_id` `stream`(`stdout`/`stderr`) `step` `data`；**仅进 UI，绝不进 LLM 上下文** |
 | `tool-call-result` | `call_id` `status`（`ok`/`error`/`denied`/`cancelled`/`timeout`）`preview` `duration_ms` `truncated` |
-| `tool-approval-request` | `approval_id` `call_id` `tool` `args` `permission` `expires_at` |
+| `tool-approval-request` | `approval_id` `call_id` `tool` `args` `summary`（工具自算的说明，可空）`permission` `expires_at` |
 | `tool-approval-resolved` | `approval_id` `decision`（`allow_once`/`allow_session`/`deny`） |
+| `plan-updated` | `session_id` `items`（`{title,status}` 列表）`note`；**会话级**事件，按 `session_id` 过滤 |
+| `notes-updated` | `session_id` `count` `removed?`；**会话级**事件，只带计数（正文由 `get_notes` 回读） |
+| 子代理事件 | 复用 `tool-*` 三类事件，额外带 `parent_call_id` 与 `depth=1`（子代理与父级共用 `stream_id`） |
 
 ### 3.2 记忆系统数据模型
 

@@ -4,6 +4,10 @@ import { listen } from "@tauri-apps/api/event";
 import { useChatStore, type Session } from "../../stores/chatStore";
 import { MessageList } from "./MessageList";
 import { InputBox } from "./InputBox";
+import { NotesPanel } from "./NotesPanel";
+import { PlanPanel } from "./PlanPanel";
+import { SnapshotBanner } from "./SnapshotBanner";
+import type { WorkspaceView } from "../../types/tools";
 import {
   DEFAULT_PERSONA_ID,
   FALLBACK_SHORT_NAME,
@@ -47,6 +51,70 @@ export function ChatWindow() {
   const [personas, setPersonas] = useState<PersonaSummary[]>([]);
   // 默认人格 ID 与后端 persona::types::DEFAULT_PERSONA_ID 保持一致
   const [selectedPersona, setSelectedPersona] = useState("konata-default");
+
+  // 工作区弹窗与状态
+  const [showTaskModal, setShowTaskModal] = useState(false);
+  const [workspaces, setWorkspaces] = useState<WorkspaceView[]>([]);
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string>("");
+  const [customPath, setCustomPath] = useState("");
+  const [customLabel, setCustomLabel] = useState("");
+  const [customWritable, setCustomWritable] = useState(true);
+  const [taskModalError, setTaskModalError] = useState("");
+  const [isCreatingTask, setIsCreatingTask] = useState(false);
+  // 任务会话的模型选择方式：默认手动（跟随全局/会话内再选），可在此直接开启自动选择
+  const [autoModels, setAutoModels] = useState(false);
+
+  const openTaskModal = async () => {
+    setTaskModalError("");
+    // 勾选状态跟随设置里的"新建任务会话默认自动"（用户仍可在弹窗里改）
+    setAutoModels(
+      useChatStore.getState().modelCatalog?.settings.auto_by_default ?? false
+    );
+    try {
+      const list = await invoke<WorkspaceView[]>("list_workspaces");
+      setWorkspaces(list);
+      const defaultWs = list.find((w) => w.is_default) ?? list[0];
+      setSelectedWorkspace(defaultWs ? defaultWs.id : "");
+      setShowTaskModal(true);
+    } catch (e) {
+      console.error("加载工作区失败:", e);
+      // 降级直接创建
+      createSession(undefined, selectedPersona, "task");
+    }
+  };
+
+  const handleConfirmTaskModal = async () => {
+    setTaskModalError("");
+    setIsCreatingTask(true);
+    try {
+      let targetWorkspaceId = selectedWorkspace;
+      // 如果用户输入了自定义新路径，先添加工作区
+      if (customPath.trim()) {
+        const newWs = await invoke<WorkspaceView>("add_workspace", {
+          path: customPath.trim(),
+          label: customLabel.trim() || null,
+          writable: customWritable,
+        });
+        targetWorkspaceId = newWs.id;
+      }
+      await createSession(
+        undefined,
+        selectedPersona,
+        "task",
+        targetWorkspaceId || undefined,
+        // 自动选择：Plan 模式与子代理优先用子模型，Work 模式优先用主模型
+        // （显式传 inherit 表示"跟随全局"，避免被设置里的默认自动覆盖）
+        autoModels ? { mode: "auto" } : { mode: "inherit" }
+      );
+      setShowTaskModal(false);
+      setCustomPath("");
+      setCustomLabel("");
+    } catch (err) {
+      setTaskModalError(typeof err === "string" ? err : String(err));
+    } finally {
+      setIsCreatingTask(false);
+    }
+  };
 
   // 重命名状态
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -97,10 +165,6 @@ export function ChatWindow() {
 
   const cancelRename = () => {
     setEditingId(null);
-  };
-
-  const handleNewSession = () => {
-    createSession(undefined, selectedPersona);
   };
 
   // 悬浮窗状态：通过后端事件实时同步
@@ -156,11 +220,31 @@ export function ChatWindow() {
       <div className="sidebar">
         <div className="sidebar-header">
           <h2>✦ 镜中此方</h2>
+          {/* 第一行：新建入口（两个按钮等宽，各自占一半，避免被侧边栏宽度挤破） */}
           <div className="new-session-controls">
+            <button
+              className="new-chat-btn"
+              onClick={() => createSession(undefined, selectedPersona, "chat")}
+              title="创建普通聊天会话"
+            >
+              + 对话
+            </button>
+            <button
+              className="new-chat-btn task"
+              onClick={openTaskModal}
+              title="创建专业任务工程会话"
+            >
+              ⚡ 任务
+            </button>
+          </div>
+          {/* 第二行：人设选择（单独一行，宽度不再与按钮抢空间） */}
+          <div className="persona-row">
+            <span className="persona-row-label">人设</span>
             <select
               className="persona-select"
               value={selectedPersona}
               onChange={(e) => setSelectedPersona(e.target.value)}
+              title="新建会话使用的人设"
             >
               {personas.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -168,9 +252,6 @@ export function ChatWindow() {
                 </option>
               ))}
             </select>
-            <button className="new-chat-btn" onClick={handleNewSession}>
-              + 新会话
-            </button>
           </div>
         </div>
         <div className="session-list">
@@ -205,6 +286,9 @@ export function ChatWindow() {
                       />
                     ) : (
                       <div className="session-title-wrap">
+                        {s.session_type === "task" && (
+                          <span className="session-type-badge">任务</span>
+                        )}
                         <span className="session-title">{s.title}</span>
                         {personaName && s.persona_id !== DEFAULT_PERSONA_ID && (
                           <span className="session-persona-tag">{personaName}</span>
@@ -278,6 +362,10 @@ export function ChatWindow() {
               </div>
             </div>
             <MessageList personaShortName={currentPersonaShortName} />
+            {/* 回滚条与计划面板都贴着输入框：它们是"这一轮任务"的状态，不是聊天内容 */}
+            <SnapshotBanner />
+            <PlanPanel />
+            <NotesPanel />
             <InputBox />
           </>
         ) : (
@@ -288,6 +376,108 @@ export function ChatWindow() {
           </div>
         )}
       </div>
+
+      {/* 创建任务会话 / 工作区选择弹窗 */}
+      {showTaskModal && (
+        <div className="modal-overlay" onClick={() => setShowTaskModal(false)}>
+          <div
+            className="modal-card task-modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="创建任务会话"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>⚡ 创建任务会话</h3>
+
+            <label>
+              <span>执行工作区</span>
+              <select
+                value={selectedWorkspace}
+                onChange={(e) => setSelectedWorkspace(e.target.value)}
+              >
+                {workspaces.map((w) => (
+                  <option key={w.id} value={w.id}>
+                    {w.label}
+                    {w.is_default ? "（默认沙箱）" : ""}
+                    {w.writable ? "" : " [只读]"}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <div className="task-modal-section">
+              <div className="task-modal-section-title">或添加自定义项目路径</div>
+              <div className="task-modal-inline">
+                <input
+                  type="text"
+                  placeholder="绝对路径，例如 /home/me/project 或 D:\project"
+                  value={customPath}
+                  onChange={(e) => setCustomPath(e.target.value)}
+                />
+              </div>
+              <div className="task-modal-inline">
+                <input
+                  type="text"
+                  placeholder="标签（可选）"
+                  value={customLabel}
+                  onChange={(e) => setCustomLabel(e.target.value)}
+                />
+                <label className="task-modal-check">
+                  <input
+                    type="checkbox"
+                    checked={customWritable}
+                    onChange={(e) => setCustomWritable(e.target.checked)}
+                  />
+                  允许写入
+                </label>
+              </div>
+              <div className="task-modal-hint">
+                填写路径后会先把它加入工作区列表，并用它作为本次任务的执行目录。
+              </div>
+            </div>
+
+            <div className="task-modal-section">
+              <div className="task-modal-section-title">模型选择</div>
+              <label className="task-modal-check">
+                <input
+                  type="checkbox"
+                  checked={autoModels}
+                  onChange={(e) => setAutoModels(e.target.checked)}
+                />
+                自动选择（Plan 模式与子代理用子模型，Work 模式用主模型）
+              </label>
+              <div className="task-modal-hint">
+                主模型与子模型在「设置 → 模型路由」里配置；不勾选则先跟随全局提供商，
+                进入会话后仍可在底部工具条随时切换（只影响下一轮）。
+              </div>
+            </div>
+
+            {taskModalError && (
+              <div className="task-modal-error" role="alert">
+                ⚠ {taskModalError}
+              </div>
+            )}
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="modal-cancel-btn"
+                onClick={() => setShowTaskModal(false)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="modal-confirm-btn"
+                onClick={handleConfirmTaskModal}
+                disabled={isCreatingTask}
+              >
+                {isCreatingTask ? "创建中..." : "确定创建"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

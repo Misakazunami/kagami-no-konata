@@ -17,13 +17,70 @@ use super::traits::{
     ToolServices,
 };
 
-pub const EVENT_TOOL_START: &str = "tool-call-start";
-pub const EVENT_TOOL_RESULT: &str = "tool-call-result";
+/// 事件名的唯一来源是 `harness::traits`，这里只转出 runner 自己发出的两个
+pub use super::traits::{EVENT_TOOL_RESULT, EVENT_TOOL_START};
 
 /// UI 卡片里的结果预览长度上限
 const PREVIEW_CHARS: usize = 600;
 /// 事件里参数预览长度上限
 const ARG_PREVIEW_CHARS: usize = 400;
+
+/// 外层超时相对工具自身超时的宽限
+///
+/// `call_timeout` 是给**工具自己**用的截止时间（`run_command` 会据此在超时前
+/// 主动收手并把已收到的输出带回来）。runner 的外层超时只是兜底，防止某个工具
+/// 彻底卡死；给出的宽限要足够让工具走完"收尾 + 发事件"的路径。
+const CALL_TIMEOUT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 模型返回"既没有正文、也没有工具调用"时的重试次数
+const EMPTY_TURN_RETRIES: usize = 2;
+
+/// 空回合时推给模型的提醒
+///
+/// 关键是**给出可执行的下一步**：`length` 截断的场合让它把动作拆小
+/// （一次写一个小文件），而不是原样重试同一个巨型输出。
+/// `tools_offered` 为 false 表示这一轮已经不给工具了（步数用尽），
+/// 此时只能要一段文字收尾，不能再要求它调用工具。
+fn empty_turn_hint(finish_reason: Option<&str>, tools_offered: bool) -> String {
+    let cause = match finish_reason {
+        Some("length") => {
+            "上一次响应因为达到输出长度上限（max_tokens）被截断，没有产生任何内容。\
+             请把动作拆小：一次只写一个文件、或先写文件的一部分，不要试图一次性输出整份长文件。"
+        }
+        Some("content_filter") => "上一次响应被提供商的内容过滤拦截，没有产生任何内容。",
+        Some(other) => {
+            return format!(
+                "上一次响应被提供商以「{}」结束，没有产生任何正文或工具调用。{}",
+                other,
+                if tools_offered {
+                    "请继续：要么调用工具推进计划，要么用文字汇报当前进展。"
+                } else {
+                    "请直接用文字汇报当前进展与未完成的部分。"
+                }
+            )
+        }
+        None => "上一次响应是空的（既没有正文，也没有工具调用）。",
+    };
+    let next_step = if tools_offered {
+        "请继续：要么调用工具推进计划，要么用文字汇报当前进展。"
+    } else {
+        "请直接用文字汇报当前进展与未完成的部分。"
+    };
+    format!("{}{}", cause, next_step)
+}
+
+/// 重试若干次仍为空时写给用户的说明
+///
+/// 宁可显式告诉用户"这一轮什么都没发生、原因是什么"，也不要落一条空白消息。
+fn empty_turn_notice(finish_reason: Option<&str>) -> String {
+    let detail = finish_reason.unwrap_or("未给出原因");
+    format!(
+        "（本轮没有收到模型的任何输出，任务尚未推进。提供商返回的结束原因：{}。\
+         可以重试一次，或把任务拆得更小（例如分文件实现）；若反复出现，\
+         请检查设置的 max_tokens 是否过小。）",
+        detail
+    )
+}
 
 /// 一次工具调用的完整记录（落库 + UI 轨迹）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +96,9 @@ pub struct InvocationRecord {
     pub truncated: bool,
     pub duration_ms: i64,
     pub approval: Option<String>,
+    /// 工具声明的额外 token 估算（子代理开销），随记录一起展示
+    #[serde(default)]
+    pub extra_tokens: usize,
 }
 
 /// 工具循环的产出
@@ -50,13 +110,22 @@ pub struct HarnessOutcome {
     pub steps: usize,
     /// 是否用尽了步数上限（最后一轮被强制收尾）
     pub hit_step_limit: bool,
+    /// 工具自己声明的额外 token 估算（子代理等"隐藏开销"），用于统计展示
+    pub extra_tokens: usize,
+    /// 模型**始终没有产出任何内容**（重试后仍然为空）
+    ///
+    /// 此时 `content` 里只有一句给用户看的说明；调用方据此判断
+    /// "这一轮其实什么都没做成"（子代理会把它当成失败，而不是一条结论）。
+    pub empty_turn: bool,
 }
 
 /// 一次生成所需的全部运行参数
 pub struct HarnessRun<'a> {
     pub backend: &'a dyn ChatBackend,
     pub registry: &'a ToolRegistry,
-    pub services: &'a ToolServices,
+    /// 服务句柄**按值持有**：子代理需要在"父级服务的只读克隆"上再跑一次循环，
+    /// 引用版本没法构造出这种临时值。克隆发生在每次生成开始时，代价可忽略。
+    pub services: ToolServices,
     pub session_id: &'a str,
     pub stream_id: &'a str,
     pub cancel: Arc<AtomicBool>,
@@ -97,9 +166,13 @@ impl HarnessRun<'_> {
 
         let mut content = String::new();
         let mut invocations: Vec<InvocationRecord> = Vec::new();
+        let mut extra_tokens = 0usize;
         let mut session_grants: HashSet<String> = HashSet::new();
         let mut tool_rounds = 0usize;
         let mut hit_step_limit = false;
+        // 模型"什么都没说也没做"时的重试次数（见 EMPTY_TURN_RETRIES）
+        let mut empty_retries = 0usize;
+        let mut empty_turn = false;
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -116,6 +189,7 @@ impl HarnessRun<'_> {
             let mut stream = self.backend.chat_stream(messages.clone(), tools_arg).await?;
             let mut accumulator = ToolCallAccumulator::default();
             let mut step_text = String::new();
+            let mut finish_reason: Option<String> = None;
 
             while let Some(chunk) = stream.next().await {
                 if self.cancel.load(Ordering::Relaxed) {
@@ -129,6 +203,8 @@ impl HarnessRun<'_> {
                     }
                     StreamChunk::Thinking(text) => on_thinking(&text),
                     StreamChunk::ToolCallDelta(delta) => accumulator.push(delta),
+                    // 提供商声明的结束原因：`length` = 被 max_tokens 截断
+                    StreamChunk::Finish(reason) => finish_reason = Some(reason),
                 }
             }
 
@@ -138,6 +214,38 @@ impl HarnessRun<'_> {
 
             let calls = accumulator.finish(self.stream_id);
             if calls.is_empty() {
+                // ─── 空回合保护 ───
+                //
+                // 现实里常见的一幕：推理模型把 max_tokens 预算全花在思考上，
+                // 或者网关在流里回了半截就断开，于是这一轮既没有正文、也没有
+                // 工具调用。历史实现把这当成"模型说完了"，直接结束生成——
+                // 用户只看到前面几张工具卡片，任务却停在半路（真实报障：
+                // "请求开始实现之后只调用了工具就结束本轮了"）。
+                //
+                // 这里先把空回合当成"没说完"：推一条提醒让模型接着做，
+                // 重试若干次仍为空才收手，并且**留下一句可见的说明**，
+                // 绝不再产出空白回合。
+                if content.trim().is_empty() {
+                    if empty_retries < EMPTY_TURN_RETRIES {
+                        empty_retries += 1;
+                        eprintln!(
+                            "[harness] 空回合（第 {}/{} 次）finish_reason={:?}，提示模型继续",
+                            empty_retries, EMPTY_TURN_RETRIES, finish_reason
+                        );
+                        messages.push(LlmMessage::user(empty_turn_hint(
+                            finish_reason.as_deref(),
+                            offer_tools,
+                        )));
+                        continue;
+                    }
+                    eprintln!(
+                        "[harness] 连续 {} 次空回合，放弃并如实告知用户 finish_reason={:?}",
+                        EMPTY_TURN_RETRIES, finish_reason
+                    );
+                    empty_turn = true;
+                    content = empty_turn_notice(finish_reason.as_deref());
+                    on_chunk(&content);
+                }
                 break;
             }
 
@@ -183,6 +291,7 @@ impl HarnessRun<'_> {
                     });
                     let results = futures::future::join_all(futures).await;
                     for (record, message) in results {
+                        extra_tokens += record.extra_tokens;
                         invocations.push(record);
                         messages.push(message);
                     }
@@ -196,6 +305,7 @@ impl HarnessRun<'_> {
                     if record.approval.as_deref() == Some("allow_session") {
                         session_grants.insert(record.tool.clone());
                     }
+                    extra_tokens += record.extra_tokens;
                     invocations.push(record);
                     messages.push(message);
                 }
@@ -209,6 +319,8 @@ impl HarnessRun<'_> {
             invocations,
             steps: tool_rounds,
             hit_step_limit,
+            extra_tokens,
+            empty_turn,
         })
     }
 
@@ -227,6 +339,7 @@ impl HarnessRun<'_> {
             .unwrap_or_else(|| call.name.clone());
 
         let mut record = InvocationRecord {
+            extra_tokens: 0,
             call_id: call.id.clone(),
             tool: call.name.clone(),
             tool_label: tool_label.clone(),
@@ -271,6 +384,20 @@ impl HarnessRun<'_> {
         let permission = tool.descriptor().permission;
         let args_preview = truncate_text(&call.raw_arguments, ARG_PREVIEW_CHARS).0;
 
+        // 工具上下文要在**审批之前**建好：审批摘要允许做只读检查（例如统计删除规模），
+        // 因此它同样需要 workspaces / limits 这些服务句柄
+        let cx = ToolCtx {
+            session_id: self.session_id,
+            stream_id: self.stream_id,
+            call_id: &call.id,
+            step,
+            cancel: self.cancel.clone(),
+            services: &self.services,
+            limits: self.limits,
+            emit: self.emit.clone(),
+            approver: self.approver.clone(),
+        };
+
         self.emit.emit(
             EVENT_TOOL_START,
             json!({
@@ -307,6 +434,8 @@ impl HarnessRun<'_> {
                         args: call.arguments.clone(),
                         permission,
                         timeout: self.limits.approval_timeout,
+                        // 只读检查：工具按参数与服务算一段人类可读的说明
+                        summary: tool.approval_summary(&call.arguments, &cx),
                     })
                     .await;
                 record.approval = Some(decision.as_str().to_string());
@@ -324,18 +453,11 @@ impl HarnessRun<'_> {
         }
 
         // ─── 执行（超时 + 取消） ───
-        let cx = ToolCtx {
-            session_id: self.session_id,
-            stream_id: self.stream_id,
-            step,
-            cancel: self.cancel.clone(),
-            services: self.services,
-            limits: self.limits,
-            emit: self.emit.clone(),
-            approver: self.approver.clone(),
-        };
-
-        let outcome = tokio::time::timeout(self.limits.call_timeout, tool.call(call.arguments.clone(), &cx)).await;
+        let outcome = tokio::time::timeout(
+            self.limits.call_timeout + CALL_TIMEOUT_GRACE,
+            tool.call(call.arguments.clone(), &cx),
+        )
+        .await;
 
         match outcome {
             Ok(Ok(output)) => {
@@ -346,13 +468,20 @@ impl HarnessRun<'_> {
                     .preview
                     .unwrap_or_else(|| truncate_text(&body, PREVIEW_CHARS).0);
 
-                record.status = "ok".to_string();
+                // 工具自己判定的状态（超时/取消/非零退出）优先于默认的 "ok"：
+                // 内容仍然是**部分/失败结果**，保留它并如实记状态，模型与用户都能
+                // 看到"已经跑到哪儿了"，比一句干巴巴的失败有用得多。
+                record.status = output.status.as_str().to_string();
                 record.truncated = truncated;
                 record.result_preview = Some(preview.clone());
+                record.error = output.status.error_note().map(|note| note.to_string());
+                record.extra_tokens = output.extra_tokens;
                 record.duration_ms = started.elapsed().as_millis() as i64;
 
+                let message =
+                    tool_message(&record.call_id, &record.tool, &record.status, &body);
                 self.emit_result(&record, &preview);
-                (record, tool_message(&call.id, &call.name, "ok", &body))
+                (record, message)
             }
             Ok(Err(e)) => {
                 let message = e.to_string();
@@ -365,11 +494,12 @@ impl HarnessRun<'_> {
                 self.finish_error(record, started, message, status)
             }
             Err(_) => {
-                let timeout = self.limits.call_timeout.as_secs();
+                // 走到这里说明工具连自己的截止时间都没守住（外层兜底超时）
+                let timeout = (self.limits.call_timeout + CALL_TIMEOUT_GRACE).as_secs();
                 self.finish_error(
                     record,
                     started,
-                    format!("工具执行超时（{} 秒）", timeout),
+                    format!("工具执行超时（{} 秒）且未返回任何输出，已被强制终止", timeout),
                     "timeout",
                 )
             }
@@ -431,7 +561,7 @@ mod tests {
     use crate::agent::harness::jail::WorkspaceSet;
     use crate::agent::harness::traits::{
         AllowAllApprover, DenyAllApprover, Permission, Tool, ToolDescriptor,
-        ToolInfo, ToolOutput,
+        ToolInfo, ToolOutput, ToolStatus,
     };
     use crate::config::types::{ToolConfig, ToolMode};
     use crate::llm::types::ToolSchema;
@@ -529,6 +659,8 @@ mod tests {
         result: Result<String, String>,
         sleep_ms: u64,
         calls: Arc<Mutex<usize>>,
+        /// 工具自行上报的状态（模拟"部分输出 + 超时/失败"）
+        status: ToolStatus,
     }
 
     impl MockTool {
@@ -541,9 +673,23 @@ mod tests {
                     result: Ok("工具结果".to_string()),
                     sleep_ms: 0,
                     calls: calls.clone(),
+                    status: ToolStatus::Ok,
                 }),
                 calls,
             )
+        }
+
+        /// 造一个会自行上报非 ok 状态的工具
+        fn with_status(
+            name: &'static str,
+            permission: Permission,
+            status: ToolStatus,
+        ) -> (Arc<Self>, Arc<Mutex<usize>>) {
+            let (mut tool, calls) = Self::new(name, permission);
+            Arc::get_mut(&mut tool)
+                .expect("刚构造的 Arc 必然是独占的")
+                .status = status;
+            (tool, calls)
         }
     }
 
@@ -566,7 +712,7 @@ mod tests {
             }
             cx.ensure_not_cancelled()?;
             match &self.result {
-                Ok(text) => Ok(ToolOutput::text(text.clone())),
+                Ok(text) => Ok(ToolOutput::text(text.clone()).with_status(self.status)),
                 Err(e) => Err(anyhow!(e.clone())),
             }
         }
@@ -643,7 +789,7 @@ mod tests {
         let run = HarnessRun {
             backend: backend.as_ref(),
             registry: &fx.registry,
-            services: &fx.services,
+            services: fx.services.clone(),
             session_id: "s1",
             stream_id: "stream-1",
             cancel,
@@ -681,6 +827,185 @@ mod tests {
         assert_eq!(outcome.steps, 0);
         assert_eq!(*calls.lock().unwrap(), 0);
         assert!(fx.sink.names().is_empty());
+    }
+
+    /// 工具自行上报的状态必须覆盖默认的 "ok"，且部分结果要原样回灌给模型
+    #[test]
+    fn tool_reported_status_is_recorded_and_content_still_returned() {
+        let (tool, _) = MockTool::with_status("slow", Permission::Read, ToolStatus::Timeout);
+        let fx = fixture(vec![tool], ToolMode::Standard);
+        let backend = MockBackend::new(vec![
+            vec![
+                tool_call_chunk(0, "c1", "slow", "{}"),
+            ],
+            vec![StreamChunk::Content("看到了部分输出。".to_string())],
+        ]);
+
+        let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
+        assert_eq!(outcome.invocations.len(), 1);
+        let record = &outcome.invocations[0];
+        assert_eq!(record.status, "timeout");
+        assert!(
+            record.error.as_deref().unwrap_or("").contains("超时"),
+            "{:?}",
+            record.error
+        );
+        assert!(
+            record
+                .result_preview
+                .as_deref()
+                .unwrap_or("")
+                .contains("工具结果"),
+            "部分结果必须保留在预览里：{:?}",
+            record.result_preview
+        );
+
+        // 回灌消息里带着真实状态与部分内容（模型据此修正策略）
+        let seen = backend.seen_messages.lock().unwrap();
+        let last = seen.last().expect("第二轮请求");
+        let tool_msg = last
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("必须回灌 tool 角色消息");
+        assert!(tool_msg.content.contains("status=\"timeout\""), "{}", tool_msg.content);
+        assert!(tool_msg.content.contains("工具结果"), "{}", tool_msg.content);
+
+        // 事件里的状态同样不是 running/ok
+        let result = &fx.sink.payloads(EVENT_TOOL_RESULT)[0];
+        assert_eq!(result["status"], "timeout");
+    }
+
+    // ─── 空回合保护（真实报障回归） ───────────────────────
+    //
+    // 报障现象：任务会话里说"开始实现计划"，模型调了几个工具（update_plan /
+    // list_dir）之后本轮就结束了，什么都没实现，气泡里连一个字都没有。
+    // 根因是"既没有正文、也没有工具调用"的响应被当成"模型说完了"。
+
+    /// 空回合必须重试：模型下一轮继续干活，而不是把回合结束时停在半路
+    #[test]
+    fn empty_turn_is_retried_instead_of_ending_the_run() {
+        let (tool, calls) = MockTool::new("probe", Permission::Read);
+        let fx = fixture(vec![tool], ToolMode::Standard);
+        let backend = MockBackend::new(vec![
+            // 第 1 轮：只调用工具
+            vec![tool_call_chunk(0, "c1", "probe", "{}")],
+            // 第 2 轮：空响应（历史实现就在这里静悄悄结束了）
+            Vec::new(),
+            // 第 3 轮：被提醒后接着做
+            vec![StreamChunk::Content("继续实现：已经写出第一个文件。".to_string())],
+        ]);
+
+        let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
+
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(outcome.steps, 1);
+        assert_eq!(outcome.content, "继续实现：已经写出第一个文件。");
+        assert!(outcome.content.trim().len() > 0, "绝不能再产出空白回合");
+
+        // 提醒确实推给了模型（而不是重发一模一样的请求）
+        let seen = backend.seen_messages.lock().unwrap();
+        assert_eq!(seen.len(), 3, "三次请求：工具轮 + 空回合 + 继续");
+        let reminder = seen[2].last().expect("提醒消息");
+        assert_eq!(reminder.role, "user");
+        assert!(reminder.content.contains("空"), "{}", reminder.content);
+    }
+
+    /// 反复空响应时必须重试有上限，并且留下一句用户可见的说明
+    #[test]
+    fn repeated_empty_turns_end_with_a_visible_notice() {
+        let (tool, _) = MockTool::new("probe", Permission::Read);
+        let fx = fixture(vec![tool], ToolMode::Standard);
+        let backend = MockBackend::new(vec![
+            vec![tool_call_chunk(0, "c1", "probe", "{}")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ]);
+
+        let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
+
+        // 重试最多 EMPTY_TURN_RETRIES 次，随后如实告知用户
+        assert_eq!(backend.seen_messages.lock().unwrap().len(), 1 + EMPTY_TURN_RETRIES + 1);
+        assert!(outcome.empty_turn, "必须标记为空回合，调用方才能区别对待");
+        assert!(
+            outcome.content.contains("没有收到模型的任何输出"),
+            "{}",
+            outcome.content
+        );
+        assert_eq!(outcome.steps, 1);
+    }
+
+    /// `finish_reason=length`（被 max_tokens 截断）必须被翻译成可执行的建议：
+    /// 把动作拆小，而不是原样重试同一个巨型输出
+    #[test]
+    fn truncated_turn_tells_the_model_to_split_the_work() {
+        let (tool, _) = MockTool::new("probe", Permission::Read);
+        let fx = fixture(vec![tool], ToolMode::Standard);
+        let backend = MockBackend::new(vec![
+            vec![StreamChunk::Finish("length".to_string())],
+            vec![StreamChunk::Content("好的，我先写第一个文件。".to_string())],
+        ]);
+
+        let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
+
+        assert_eq!(outcome.content, "好的，我先写第一个文件。");
+        let seen = backend.seen_messages.lock().unwrap();
+        let reminder = seen[1].last().expect("提醒消息").content.clone();
+        assert!(reminder.contains("max_tokens"), "{reminder}");
+        assert!(reminder.contains("拆小"), "{reminder}");
+    }
+
+    /// 端到端（真实工具）：模型在一次请求里用 `steps` 跑两条命令，
+    /// 两步按序回灌、状态为 ok、事件齐备
+    #[cfg(unix)]
+    #[test]
+    fn real_run_command_steps_end_to_end() {        let fx = fixture(
+            vec![Arc::new(crate::agent::harness::tools::shell::RunCommand) as Arc<dyn Tool>],
+            ToolMode::Full,
+        );
+        let backend = MockBackend::new(vec![
+            vec![tool_call_chunk(
+                0,
+                "c1",
+                "run_command",
+                r#"{"steps":[{"program":"echo","args":["alpha"]},{"program":"echo","args":["beta"]}]}"#,
+            )],
+            vec![StreamChunk::Content("两条都跑完了。".to_string())],
+        ]);
+
+        let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
+        assert_eq!(outcome.invocations.len(), 1);
+        let record = &outcome.invocations[0];
+        assert_eq!(record.tool, "run_command");
+        assert_eq!(record.status, "ok", "{:?}", record.error);
+        assert!(record.arguments_json.contains("steps"));
+
+        // 事件：开始 + 结果 + 至少一条增量输出
+        let names = fx.sink.names();
+        assert!(names.contains(&EVENT_TOOL_START.to_string()), "{names:?}");
+        assert!(names.contains(&EVENT_TOOL_RESULT.to_string()), "{names:?}");
+        assert!(
+            names
+                .iter()
+                .any(|n| n == crate::agent::harness::traits::EVENT_TOOL_OUTPUT),
+            "流式输出事件必须由真实工具发出：{names:?}"
+        );
+
+        // 模型看到的是两步的输出，且顺序正确
+        let seen = backend.seen_messages.lock().unwrap();
+        let tool_msg = seen
+            .last()
+            .expect("第二轮请求")
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("必须回灌 tool 角色消息")
+            .content
+            .clone();
+        assert!(tool_msg.contains("step 1/2"), "{tool_msg}");
+        assert!(tool_msg.contains("step 2/2"), "{tool_msg}");
+        let alpha = tool_msg.find("alpha").expect("第一步输出");
+        let beta = tool_msg.find("beta").expect("第二步输出");
+        assert!(alpha < beta, "{tool_msg}");
     }
 
     #[test]
@@ -992,7 +1317,7 @@ mod tests {
         let run = HarnessRun {
             backend: backend.as_ref(),
             registry: &fx.registry,
-            services: &fx.services,
+            services: fx.services.clone(),
             session_id: "s1",
             stream_id: "stream-1",
             cancel,
@@ -1029,7 +1354,7 @@ mod tests {
         let run = HarnessRun {
             backend: backend.as_ref(),
             registry: &fx.registry,
-            services: &fx.services,
+            services: fx.services.clone(),
             session_id: "s1",
             stream_id: "stream-1",
             cancel,

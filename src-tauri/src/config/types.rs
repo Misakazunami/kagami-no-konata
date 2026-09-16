@@ -36,8 +36,17 @@ pub struct LlmProvider {
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     /// 是否启用思考模式（需要模型支持，如 DeepSeek-R1、QwQ 等）
+    ///
+    /// 这是**提供商级默认值**：会话里没有单独开关时以它为准
+    /// （见 `llm::proxy::ProviderOverrides`）。
     #[serde(default)]
     pub enable_thinking: bool,
+    /// 显式声明支持深度思考的模型 id（覆盖名称启发式探测）
+    ///
+    /// 探测不准时（自建端点、新模型）用户可在设置里对具体模型勾选，
+    /// 勾选后界面才会出现"深度思考"开关、请求里才会带 `enable_thinking`。
+    #[serde(default)]
+    pub thinking_models: Vec<String>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -61,6 +70,7 @@ impl LlmProvider {
             max_tokens: 2048,
             temperature: 0.8,
             enable_thinking: false,
+            thinking_models: Vec::new(),
         }
     }
 }
@@ -214,6 +224,7 @@ impl<'de> Deserialize<'de> for LlmConfig {
             max_tokens: legacy.max_tokens,
             temperature: legacy.temperature,
             enable_thinking: false,
+            thinking_models: Vec::new(),
         };
 
         Ok(LlmConfig {
@@ -242,12 +253,111 @@ pub struct AppConfig {
     pub user: UserConfig,
     #[serde(default)]
     pub llm: LlmConfig,
+    /// 模型路由（会话级"自动选择"用的主/子模型池）
+    #[serde(default)]
+    pub models: ModelSettings,
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
     pub tools: ToolConfig,
+}
+
+// ─── 模型路由（自动选择） ────────────────────────────────
+
+/// 子模型池上限（界面与轮转逻辑都要能承载）
+pub const MAX_SUB_MODELS: usize = 8;
+
+/// 指向"某个提供商的某个模型"的稳定引用
+///
+/// 只存 id 而不存地址/密钥：提供商配置变了（换地址、换 key）引用依然有效，
+/// 提供商被删除时由 `llm::router::resolve` 降级到活跃提供商，而不是让整轮失败。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRef {
+    pub provider_id: String,
+    pub model: String,
+}
+
+impl ModelRef {
+    pub fn new(provider_id: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model: model.into(),
+        }
+    }
+
+    /// 人类可读标签（错误信息、日志用）
+    pub fn label(&self) -> String {
+        format!("{}@{}", self.model, self.provider_id)
+    }
+}
+
+/// 模型选择模式
+///
+/// - `Inherit`：跟随全局活跃提供商（默认；与未引入本功能时的行为一致）
+/// - `Manual`：本会话手动选定一个模型
+/// - `Auto`：主/子模型自动路由（**只对任务会话生效**）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelMode {
+    #[default]
+    Inherit,
+    Manual,
+    Auto,
+}
+
+/// 模型路由配置（自动选择的主/子模型池）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelSettings {
+    /// 新建**任务**会话是否默认开启"自动选择"
+    pub auto_by_default: bool,
+    /// 主模型：Work 模式与普通对话优先使用
+    pub main: Option<ModelRef>,
+    /// 子模型池：Plan 模式与子代理优先使用，按顺序轮转
+    pub subs: Vec<ModelRef>,
+}
+
+impl ModelSettings {
+    /// 校验模型池（悬空提供商必须报错：那是前端/配置状态错误，不是可降级的运行时状况）
+    pub fn validate(&self, providers: &[LlmProvider]) -> Result<(), String> {
+        if self.subs.len() > MAX_SUB_MODELS {
+            return Err(format!("子模型数量不能超过 {} 个", MAX_SUB_MODELS));
+        }
+
+        let check = |item: &ModelRef, what: &str| -> Result<(), String> {
+            if item.model.trim().is_empty() {
+                return Err(format!("{}的模型不能为空", what));
+            }
+            if item.provider_id.trim().is_empty() {
+                return Err(format!("{}的提供商不能为空", what));
+            }
+            if !providers.iter().any(|p| p.id == item.provider_id) {
+                return Err(format!(
+                    "{}引用的提供商不存在：{}（请先在设置里选择有效模型）",
+                    what,
+                    item.provider_id
+                ));
+            }
+            Ok(())
+        };
+
+        if let Some(main) = &self.main {
+            check(main, "主模型")?;
+        }
+        let mut seen: HashSet<(&str, &str)> = HashSet::new();
+        for sub in &self.subs {
+            check(sub, "子模型")?;
+            if !seen.insert((sub.provider_id.as_str(), sub.model.as_str())) {
+                return Err(format!("子模型重复：{}", sub.label()));
+            }
+        }
+
+        // 说明：主模型同时出现在子模型池里是允许的（用户可能只想给子代理固定用同一个模型），
+        // 因此这里不做交叉去重。
+        Ok(())
+    }
 }
 
 impl Default for UserConfig {
@@ -306,6 +416,8 @@ impl AppConfig {
         {
             return Err("活跃提供商 id 不存在".to_string());
         }
+
+        self.models.validate(&self.llm.providers)?;
 
         if self.user.nickname.chars().count() > MAX_NICKNAME_CHARS {
             return Err(format!("昵称长度不能超过 {} 个字符", MAX_NICKNAME_CHARS));
@@ -578,6 +690,14 @@ fn default_approval_timeout_secs() -> u64 {
     120
 }
 
+/// 单次工具调用的超时（秒）
+///
+/// 这个值曾经写死为 60 秒，导致 `cargo build` 这类首次编译要几分钟的命令必然超时；
+/// 现在可配，默认仍是 60 秒以免改变既有行为。
+fn default_call_timeout_secs() -> u64 {
+    60
+}
+
 /// 工具运行时配置（只作用于主窗口；悬浮窗恒不使用工具）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -594,11 +714,178 @@ pub struct ToolConfig {
     pub max_steps: usize,
     pub max_output_bytes: usize,
     pub approval_timeout_secs: u64,
+    /// 单次工具调用的超时（`run_command` 会据此在超时前收手并保留部分输出）
+    pub call_timeout_secs: u64,
+    /// 工作记忆：模型主动记下的跨轮结论（默认开；关闭后相关工具明确报错且不再注入提示词）
+    pub working_memory: bool,
     /// 额外允许执行的程序（不能覆盖内置黑名单）
     pub command_allowlist: Vec<String>,
     /// `web_fetch` 允许访问的域名（为空表示禁用联网工具）
     pub web_domain_allowlist: Vec<String>,
+    /// 联网检索（`web_search`）
+    pub search: SearchConfig,
+    /// MCP 服务器（外部工具生态）
+    pub mcp: McpConfig,
 }
+
+/// 联网检索配置
+///
+/// 为什么默认关闭：这是唯一会把**用户的问题文本**主动发给第三方的能力，
+/// 必须由用户显式打开并填写自己的端点/密钥。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub enabled: bool,
+    pub provider: SearchProvider,
+    /// SearXNG 之类的自建实例地址；Tavily/Brave 用官方地址时留空
+    pub endpoint: String,
+    pub api_key: String,
+    /// 默认返回条数（1~10）
+    pub max_results: usize,
+}
+
+/// 检索后端
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchProvider {
+    /// 自建 SearXNG（推荐：数据不出自己的机器）
+    Searxng,
+    Tavily,
+    Brave,
+}
+
+impl SearchProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchProvider::Searxng => "searxng",
+            SearchProvider::Tavily => "tavily",
+            SearchProvider::Brave => "brave",
+        }
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: SearchProvider::Searxng,
+            endpoint: String::new(),
+            api_key: String::new(),
+            max_results: 5,
+        }
+    }
+}
+
+impl SearchConfig {
+    /// 直接可用的检索设置（端点与密钥齐备）
+    pub fn resolved(&self) -> Option<ResolvedSearch> {
+        if !self.enabled {
+            return None;
+        }
+        let endpoint = self.endpoint.trim();
+        let endpoint = if endpoint.is_empty() {
+            match self.provider {
+                SearchProvider::Tavily => "https://api.tavily.com/search",
+                SearchProvider::Brave => "https://api.search.brave.com/res/v1/web/search",
+                // 自建实例没有默认地址：没填就是没配好
+                SearchProvider::Searxng => return None,
+            }
+        } else {
+            endpoint
+        };
+        if matches!(self.provider, SearchProvider::Tavily | SearchProvider::Brave)
+            && self.api_key.trim().is_empty()
+        {
+            return None;
+        }
+        if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
+            return None;
+        }
+        Some(ResolvedSearch {
+            provider: self.provider,
+            endpoint: endpoint.to_string(),
+            api_key: self.api_key.trim().to_string(),
+            max_results: self.max_results.clamp(1, 10),
+        })
+    }
+}
+
+/// 已解析、可直接发起请求的检索设置
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSearch {
+    pub provider: SearchProvider,
+    pub endpoint: String,
+    pub api_key: String,
+    pub max_results: usize,
+}
+
+/// MCP 配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct McpConfig {
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// 一个 MCP 服务器
+///
+/// 安全默认值：`permission` 默认 `write`（即需要审批），`env` 默认为空
+/// （**不继承应用的任何密钥**），`enabled` 默认 false —— 加配置不等于授权。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// 稳定标识（工具名会用到：`mcp:<id>:<tool>`）
+    pub id: String,
+    pub enabled: bool,
+    /// 启动命令（必须是 PATH 中的程序）
+    pub command: String,
+    pub args: Vec<String>,
+    /// 传给子进程的环境变量（只传这里写明的，不继承应用密钥）
+    pub env: Vec<McpEnvVar>,
+    /// 这些工具需要的权限（决定是否审批）
+    pub permission: McpPermission,
+    /// 用户是否确认过"这个服务器可信"（不勾选则完全不连接）
+    pub trusted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct McpEnvVar {
+    pub key: String,
+    pub value: String,
+}
+
+/// MCP 工具的权限映射
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpPermission {
+    /// 只读：不审批
+    Read,
+    /// 可能有副作用：审批（默认）
+    #[default]
+    Write,
+    /// 执行外部动作：审批 + 只在完整模式可见
+    Execute,
+}
+
+impl McpPermission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            McpPermission::Read => "read",
+            McpPermission::Write => "write",
+            McpPermission::Execute => "execute",
+        }
+    }
+
+    /// 映射到 harness 的权限等级
+    pub fn to_permission(self) -> crate::agent::harness::Permission {
+        match self {
+            McpPermission::Read => crate::agent::harness::Permission::Read,
+            McpPermission::Write => crate::agent::harness::Permission::WriteFs,
+            McpPermission::Execute => crate::agent::harness::Permission::Execute,
+        }
+    }
+}
+
+
 
 impl Default for ToolConfig {
     fn default() -> Self {
@@ -611,11 +898,15 @@ impl Default for ToolConfig {
             max_steps: default_max_steps(),
             max_output_bytes: default_max_output_bytes(),
             approval_timeout_secs: default_approval_timeout_secs(),
+            call_timeout_secs: default_call_timeout_secs(),
+            working_memory: true,
             command_allowlist: DEFAULT_COMMAND_ALLOWLIST
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
             web_domain_allowlist: Vec::new(),
+            search: SearchConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -645,6 +936,10 @@ impl ToolConfig {
         }
         if !(5..=600).contains(&self.approval_timeout_secs) {
             return Err("审批超时必须在 5 ~ 600 秒之间".to_string());
+        }
+        // 上限 30 分钟：再长就该改用后台任务，而不是让一轮生成一直挂着
+        if !(5..=1800).contains(&self.call_timeout_secs) {
+            return Err("单次工具超时必须在 5 ~ 1800 秒之间".to_string());
         }
         if self.workspaces.len() > MAX_WORKSPACE_ROOTS {
             return Err(format!("工作区数量不能超过 {} 个", MAX_WORKSPACE_ROOTS));
@@ -854,5 +1149,95 @@ mod tests {
         let mut cfg = base;
         cfg.llm.active_provider_id = id;
         assert!(cfg.validate().is_ok());
+    }
+
+    /// 单次工具超时可配：默认 60 秒，越界必须被拒（否则会写出"永远挂着"的配置）
+    #[test]
+    fn tool_call_timeout_is_configurable_with_bounds() {
+        assert_eq!(ToolConfig::default().call_timeout_secs, 60);
+
+        let mut cfg = AppConfig::default();
+        cfg.tools.call_timeout_secs = 1800;
+        assert!(cfg.validate().is_ok(), "30 分钟应当合法");
+
+        cfg.tools.call_timeout_secs = 4;
+        assert!(cfg.validate().is_err(), "低于 5 秒会误杀正常命令");
+
+        cfg.tools.call_timeout_secs = 1801;
+        assert!(cfg.validate().is_err(), "超过 30 分钟应当拒绝");
+
+        // 旧配置里没有这个字段时必须落到默认值，而不是 0（0 会导致每次调用立即超时）
+        let legacy: ToolConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.call_timeout_secs, 60);
+    }
+
+    // ─── 模型路由（自动选择） ───────────────────────
+
+    /// 旧配置里没有 `models` 段时必须落到默认值（不自动路由、无悬空引用）
+    #[test]
+    fn missing_model_settings_fall_back_to_defaults() {
+        let mut json = serde_json::to_value(AppConfig::default()).unwrap();
+        json.as_object_mut().unwrap().remove("models");
+
+        let cfg: AppConfig = serde_json::from_value(json).expect("旧配置必须能解析");
+        assert!(!cfg.models.auto_by_default, "默认不自动路由");
+        assert!(cfg.models.main.is_none());
+        assert!(cfg.models.subs.is_empty());
+        assert!(cfg.validate().is_ok(), "旧配置必须依然合法");
+    }
+
+    #[test]
+    fn model_settings_reject_dangling_provider_references() {
+        let mut cfg = AppConfig::default();
+        let provider_id = cfg.llm.providers[0].id.clone();
+
+        cfg.models.main = Some(ModelRef::new(provider_id.clone(), "m1"));
+        cfg.models.subs = vec![ModelRef::new(provider_id.clone(), "m2")];
+        assert!(cfg.validate().is_ok(), "引用真实提供商必须通过");
+
+        // 主模型指向不存在的提供商
+        cfg.models.main = Some(ModelRef::new("ghost", "m1"));
+        assert!(cfg.validate().is_err());
+        cfg.models.main = Some(ModelRef::new(provider_id.clone(), "m1"));
+
+        // 子模型指向不存在的提供商
+        cfg.models.subs = vec![ModelRef::new("ghost", "m2")];
+        assert!(cfg.validate().is_err());
+
+        // 空模型名
+        cfg.models.subs = vec![ModelRef::new(provider_id.clone(), "  ")];
+        assert!(cfg.validate().is_err());
+
+        // 子模型重复
+        cfg.models.subs = vec![
+            ModelRef::new(provider_id.clone(), "m2"),
+            ModelRef::new(provider_id.clone(), "m2"),
+        ];
+        assert!(cfg.validate().is_err(), "重复的子模型必须被拒绝");
+
+        // 数量上限
+        cfg.models.subs = (0..=MAX_SUB_MODELS)
+            .map(|i| ModelRef::new(provider_id.clone(), format!("m{}", i)))
+            .collect();
+        assert!(cfg.validate().is_err());
+    }
+
+    /// 新增的 `thinking_models` 声明必须能被序列化往返（旧配置缺字段时为空）
+    #[test]
+    fn provider_thinking_models_round_trip() {
+        let mut provider = LlmProvider::new("A", "https://a.example/v1", "sk");
+        provider.thinking_models.push("my-model".to_string());
+
+        let json = serde_json::to_string(&provider).unwrap();
+        let back: LlmProvider = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.thinking_models, vec!["my-model".to_string()]);
+
+        // 旧配置没有该字段 → 空列表（而不是解析失败）
+        let legacy: LlmProvider = serde_json::from_str(
+            r#"{"id":"p","name":"n","api_base_url":"https://a/v1","api_key":"k","model":"m","max_tokens":100,"temperature":0.5}"#,
+        )
+        .unwrap();
+        assert!(legacy.thinking_models.is_empty());
+        assert!(!legacy.enable_thinking);
     }
 }

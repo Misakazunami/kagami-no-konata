@@ -51,7 +51,7 @@ must carry both ids; the frontend filters on them:
 | Event | Payload |
 |---|---|
 | `stream-chunk` / `stream-thinking-chunk` / `stream-end` | `{ session_id, stream_id, data }` |
-| `message-stats` | `{ session_id, stream_id, token_count, thinking_ms }` |
+| `message-stats` | `{ session_id, stream_id, token_count, thinking_ms, model? }` |
 | `stream-error` | `{ session_id, stream_id, message }` |
 
 - `session_id` isolates conversations; `stream_id` isolates concurrent generations
@@ -60,6 +60,63 @@ must carry both ids; the frontend filters on them:
 - `send_message` takes an optional `stream_id` (auto-generated if omitted) and `persist: false`
   for one-shot interactions (poke reactions) that must not touch the database.
 - `isStreaming` must always be reset in a `finally` block — never rely on an event arriving.
+- A generation's listeners are registered per `stream_id` and are **not** unregistered when the user changes
+  session, so every handler must also require the payload's `session_id` to still be the current session
+  (`chatStore.sendMessage`'s `isCurrentGeneration`) — otherwise the old session's reply or tool card lands in
+  the new one.
+- `tool-output-chunk` carries the same `session_id` / `stream_id` / `call_id` and is **UI-only**: it feeds the
+  live output box in `ToolCallCard`, never the LLM context (only `ToolOutput::content` is fed back).
+- `run_command` is the only `Execute` tool and never uses a shell: consecutive commands go through its `steps`
+  array (≤5, each step re-checked by `CommandGuard` before *any* step runs), output trimming goes through
+  `max_output_lines`. `tools.call_timeout_secs` is the per-call budget; on timeout/cancel the command is killed
+  and the partial output is kept, with the tool reporting its own `ToolStatus` (`ok`/`error`/`timeout`/`cancelled`)
+  instead of the runner turning it into a failed call.
+- `liveToolCalls` / `pendingApproval` describe "this turn's generation" only and are deliberately **kept**
+  after `stream-end`, so every session change (create / switch / delete / current session disappeared) must
+  reset them together — `chatStore.emptyGenerationState()` is the single place doing that. Forgetting it is
+  what made finished tool cards reappear inside a brand-new empty session. Session-scoped leftovers
+  (`plan`, `snapshot`) are reset there too and re-read per session.
+- `plan-updated` is **session-scoped** (no `stream_id`): the task plan is written by `update_plan`, injected
+  into the system prompt of every tool-enabled turn (`agent/plan.rs::prompt_section`), and mirrored into the
+  UI panel. It is model-authored structured data (titles + status), so it carries no untrusted payload.
+- **Read-only subagents** (`spawn_subagents`): each task runs its own `HarnessRun` with `ToolMode::ReadOnly`
+  services, a `DenyAllApprover`, and `services.subagent = None` (depth is therefore exactly 1 by construction,
+  not by argument checking). Children share the parent's `cancel` flag and their tool events reuse the parent
+  `stream_id` with extra `parent_call_id` / `depth` fields, so the UI counts them on the spawn card instead of
+  rendering dozens of unrelated cards. Per-generation budget is `DEFAULT_MAX_CHILDREN` (2), each child gets
+  `DEFAULT_CHILD_STEPS` (3) tool rounds, and its token usage is estimated back into `HarnessOutcome.extra_tokens`
+  → `message-stats` so the hidden cost stays visible.
+- **Working memory** (`save_note` / `forget_note` → `tool_notes`, injected by `agent::notes::prompt_section`):
+  the only cross-turn content, and deliberately narrow — model-authored summaries only (never raw tool output),
+  ≤8 notes / 2 KB each / 16 KB total with oldest-first eviction, always wrapped in `<untrusted>` markers, never
+  allowed to change tool visibility, approvals or config. Gated by `tools.working_memory`, with a UI panel and a
+  one-click clear.
+- **`web_search`** is the only capability that sends the user's question to a third party, hence `enabled: false`
+  by default and `tools.search.{provider,endpoint,api_key,max_results}` must be filled in. Results are links +
+  snippets only (untrusted); bodies still go through `web_fetch` and its domain allow-list.
+- **MCP** (`src-tauri/src/mcp/`) bridges external tool servers: servers exist only in `config.json` (the model
+  can never add/modify/start one), `enabled` and `trusted` both default to false, permission is mapped per server
+  (read = no approval, write = approval, execute = approval + full mode only), env is limited to explicitly listed
+  keys plus `command_guard::sanitized_env()`. Transport is **blocking** stdio on purpose: `tokio::process::Child`
+  dies with the runtime that spawned it, and servers are started on the app-startup path.
+- **Model selection & auto-routing** (`llm/router.rs` + `llm/capabilities.rs`): the model for a turn is
+  resolved **per generation** in `commands/chat.rs::send_message` (session pref → global active provider) and
+  handed to the agent as `AgentContext.models`; `ChatAgent` then builds one request-scoped `LlmProxy` per model.
+  Consequences to preserve: (a) switching models mid-generation must never affect the in-flight turn — the whole
+  point of resolving at send time; (b) an `inherit` plan (nothing selected) must resolve to exactly the active
+  provider the shared backend was built from, so the float window and every no-selection path behave as before
+  the feature; `ctx.models = None` (tests, internal callers) still falls back to that shared backend; (c)
+  `resolve()` never returns an error — a dangling provider/model degrades to the active provider with a log,
+  because model choice must never turn a message into "发送失败". Session prefs live in `sessions.model_pref`
+  (single JSON column, migration 011);
+  the global main/sub pool lives in `AppConfig.models`. `Auto` mode is **task-sessions only** (Plan → sub model,
+  Work → main model; subagents always rotate over `subs`), and `enable_thinking` is only ever sent to models
+  judged capable (`llm/capabilities.rs` heuristic + `LlmProvider.thinking_models` explicit override) — strict
+  OpenAI-compatible endpoints reject unknown fields with 400 rather than ignoring them.
+- File-changing tools (`write_file` overwrite, `edit_file`, `delete_path`, `move_path`, `copy_path`) snapshot
+  the affected bytes into `{app_data_dir}/snapshots/{stream_id}/` **before** mutating, indexed in
+  `workspace_snapshots`; `get_snapshot` / `restore_snapshot` drive the UI rollback banner. Snapshots are
+  file-only (<=4 MB each, <=64 MB per stream) and skipped-with-a-note beyond that — never silently.
 
 ### Frontend (src/)
 
@@ -80,9 +137,9 @@ Layer breakdown:
 - **llm/**: `LlmProxy` wraps `OpenAiClient` (OpenAI-compatible API). Supports non-streaming chat, SSE streaming, embeddings, model listing. Uses `reqwest` + `rustls-tls`
 - **persona/**: `PersonaEngine` loads YAML personas (built-in via `include_str!` + user files from disk). Variable interpolation (`{user_nickname}`) in system prompts
 - **memory/** + **store/memory_store.rs**: LLM-based fact extraction with dedup. Cosine similarity search in Rust over normalized f32 BLOBs. Scoring: `similarity * 0.7 + importance * 0.3`. Vectors whose dimension differs from the current embedding model are skipped, not silently truncated.
-- **store/**: Single SQLite database (`data.db`, WAL mode). Migrations in `store/migrations/`, each applied inside a transaction together with its `schema_version` row (never re-run partially). `ChatStore` for sessions/messages/stats, `MemoryStore` for memories, `tool_invocations` for UI-only tool traces
+- **store/**: Single SQLite database (`data.db`, WAL mode). Migrations in `store/migrations/`, each applied inside a transaction together with its `schema_version` row (never re-run partially). `ChatStore` for sessions/messages/stats, `MemoryStore` for memories, `tool_invocations` for UI-only tool traces, `session_plans` for the task plan (one JSON row per session) and `workspace_snapshots` for rollback
 - **Never trust `schema_version` alone**: `init_db` also runs `ensure_schema`, an idempotent reconciliation (`CREATE ... IF NOT EXISTS` scripts + a declarative `REQUIRED_COLUMNS` list probed via `PRAGMA table_info`) on **every** start. A `data.db` written by another build of this app can carry a ledger far ahead of this repo's migrations (a real incident: ledger at 16 while this repo shipped 1–6 → `sessions.context_summary` was never created → app started fine and only failed at `no such column: context_summary` on the first message). New migrations must therefore add their table to `CREATE_SCRIPTS` or their column to `REQUIRED_COLUMNS`; `fresh_and_repaired_schemas_match` fails loudly if you forget
-- **commands/**: 47 Tauri IPC commands registered in `lib.rs` — chat, settings, persona, memory, backup, stats, window management, tools (tool list / approvals / workspace roots)
+- **commands/**: 59 Tauri IPC commands registered in `lib.rs` — chat, settings, persona, memory, backup, stats, window management, tools (tool list / approvals / workspace roots)
 - **agent/harness/**: tool runtime — `Tool` trait + `ToolRegistry` (mode-gated visibility), SSE `tool_calls` accumulation, the multi-step loop (`runner.rs`), the workspace path jail (`jail.rs`), the sensitive-command guard (`command_guard.rs`) and the approval channel (`approve.rs`). See ARCHITECTURE.md §3.3.
 
 ### Context Window

@@ -109,6 +109,7 @@ impl Agent for SystemAgent {
         let cx = ToolCtx {
             session_id: &ctx.session_id,
             stream_id: &ctx.stream_id,
+            call_id: &ctx.stream_id, // /sys 链路没有模型调用 id，用 stream_id 兜底
             step: 0,
             cancel,
             services: &runtime.services,

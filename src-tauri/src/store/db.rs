@@ -10,6 +10,11 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (4, include_str!("migrations/004_thinking.sql")),
     (5, include_str!("migrations/005_perf.sql")),
     (6, include_str!("migrations/006_tools.sql")),
+    (7, include_str!("migrations/007_plan.sql")),
+    (8, include_str!("migrations/008_snapshots.sql")),
+    (9, include_str!("migrations/009_notes.sql")),
+    (10, include_str!("migrations/010_session_types.sql")),
+    (11, include_str!("migrations/011_session_model_pref.sql")),
 ];
 
 /// 打开数据库连接（应用 WAL 等 PRAGMA，不执行迁移）
@@ -38,6 +43,9 @@ const CREATE_SCRIPTS: &[&str] = &[
     include_str!("migrations/001_init.sql"),
     include_str!("migrations/002_memory.sql"),
     include_str!("migrations/006_tools.sql"),
+    include_str!("migrations/007_plan.sql"),
+    include_str!("migrations/008_snapshots.sql"),
+    include_str!("migrations/009_notes.sql"),
     STATS_DDL,
 ];
 
@@ -97,6 +105,28 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str)] = &[
         "memories",
         "embedding_blob",
         "ALTER TABLE memories ADD COLUMN embedding_blob BLOB DEFAULT NULL",
+    ),
+    // 010_session_types
+    (
+        "sessions",
+        "session_type",
+        "ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'chat'",
+    ),
+    (
+        "sessions",
+        "task_mode",
+        "ALTER TABLE sessions ADD COLUMN task_mode TEXT NOT NULL DEFAULT 'plan'",
+    ),
+    (
+        "sessions",
+        "workspace_id",
+        "ALTER TABLE sessions ADD COLUMN workspace_id TEXT DEFAULT NULL",
+    ),
+    // 011_session_model_pref
+    (
+        "sessions",
+        "model_pref",
+        "ALTER TABLE sessions ADD COLUMN model_pref TEXT DEFAULT NULL",
     ),
 ];
 
@@ -398,7 +428,16 @@ mod tests {
         }
         let repaired = init_db(&foreign_dir).unwrap();
 
-        for table in ["sessions", "messages", "memories", "usage_stats", "tool_invocations"] {
+        for table in [
+            "sessions",
+            "messages",
+            "memories",
+            "usage_stats",
+            "tool_invocations",
+            "session_plans",
+            "workspace_snapshots",
+            "tool_notes",
+        ] {
             let fresh_cols = table_columns(&fresh, table);
             let repaired_cols = table_columns(&repaired, table);
             for column in &fresh_cols {

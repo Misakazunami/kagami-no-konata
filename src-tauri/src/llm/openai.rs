@@ -162,53 +162,60 @@ impl OpenAiClient {
         }
 
         let byte_stream = response.bytes_stream();
-        // 状态：字节缓冲 / think 标签状态 / 待发送 chunk 队列
         let stream = futures::stream::unfold(
-            (
-                byte_stream,
-                Vec::<u8>::new(),
-                0u8,
-                VecDeque::<StreamChunk>::new(),
-            ),
-            |(mut byte_stream, mut buffer, mut think_state, mut pending)| async move {
+            (byte_stream, SseState::default()),
+            |(mut byte_stream, mut state)| async move {
                 use futures::StreamExt;
                 loop {
-                    // 如果有待发送的 chunk，优先发送
-                    if let Some(chunk) = pending.pop_front() {
-                        return Some((
-                            Ok(chunk),
-                            (byte_stream, buffer, think_state, pending),
-                        ));
+                    // 1. 先把已解析出的 chunk 发完（收尾顺序：内容 → 错误）
+                    if let Some(chunk) = state.pending.pop_front() {
+                        return Some((Ok(chunk), (byte_stream, state)));
                     }
 
-                    // 在字节缓冲中查找完整事件分隔符 \n\n
-                    if let Some(pos) = find_event_separator(&buffer) {
-                        let event_bytes: Vec<u8> = buffer.drain(..pos + 2).collect();
+                    // 2. 提供商在流内报的错：等上面队列排空后再上报，
+                    //    否则半截答案会被一句报错吞掉
+                    if let Some(message) = state.error.take() {
+                        state.finished = true;
+                        return Some((Err(anyhow!(message)), (byte_stream, state)));
+                    }
+
+                    // 3. 流已结束（[DONE] 或对端关闭）且无残留内容
+                    if state.finished {
+                        return None;
+                    }
+
+                    // 4. 在字节缓冲中查找完整事件分隔符 \n\n
+                    if let Some(pos) = find_event_separator(&state.buffer) {
+                        let event_bytes: Vec<u8> = state.buffer.drain(..pos + 2).collect();
                         // 只解码完整事件，多字节字符不会在分隔符处被切断
                         let event = String::from_utf8_lossy(&event_bytes);
-                        if parse_sse_event(&event, &mut think_state, &mut pending) {
-                            // 收到 [DONE]
-                            return None;
-                        }
+                        state.handle_event(&event);
                         continue;
                     }
 
-                    // 从流中读取更多数据
+                    // 5. 从流中读取更多数据
                     match byte_stream.next().await {
                         Some(Ok(bytes)) => {
-                            buffer.extend_from_slice(&bytes);
+                            state.buffer.extend_from_slice(&bytes);
                         }
                         Some(Err(e)) => {
-                            return Some((Err(anyhow!("Stream error: {}", e)), (byte_stream, buffer, think_state, pending)));
+                            state.finished = true;
+                            return Some((
+                                Err(anyhow!("Stream error: {}", e)),
+                                (byte_stream, state),
+                            ));
                         }
                         None => {
-                            // 流结束：flush 残余的不完整事件
-                            if !buffer.is_empty() {
-                                let event_bytes = std::mem::take(&mut buffer);
-                                let event = String::from_utf8_lossy(&event_bytes);
-                                let _ = parse_sse_event(&event, &mut think_state, &mut pending);
+                            // 对端关闭：flush 残余的不完整事件。
+                            // **必须继续走上面的循环**而不是直接 return None——
+                            // 最后一个事件（常常正好是 finish_reason 或最后一片
+                            // 工具参数）否则会被解析出来后原地丢掉。
+                            if !state.buffer.is_empty() {
+                                let event_bytes = std::mem::take(&mut state.buffer);
+                                let event = String::from_utf8_lossy(&event_bytes).to_string();
+                                state.handle_event(&event);
                             }
-                            return None;
+                            state.finished = true;
                         }
                     }
                 }
@@ -219,6 +226,37 @@ impl OpenAiClient {
     }
 }
 
+/// SSE 解析状态（`futures::stream::unfold` 的累积状态）
+#[derive(Default)]
+struct SseState {
+    /// 未凑齐一个完整事件的字节
+    buffer: Vec<u8>,
+    /// `<think>` 标签状态：0=正常, 1=思考中
+    think_state: u8,
+    /// 已解析、待下发的 chunk
+    pending: VecDeque<StreamChunk>,
+    /// 对端已结束
+    finished: bool,
+    /// 提供商在流内报告的错误（延迟到 pending 排空后上报）
+    error: Option<String>,
+}
+
+impl SseState {
+    /// 解析一个完整 SSE 事件，把结果并入自身状态
+    fn handle_event(&mut self, event: &str) {
+        match parse_sse_event(event, &mut self.think_state, &mut self.pending) {
+            Ok(true) => self.finished = true,
+            Ok(false) => {}
+            // 首个错误胜出：后续事件通常只是同一故障的重复
+            Err(message) => {
+                if self.error.is_none() {
+                    self.error = Some(message.to_string());
+                }
+            }
+        }
+    }
+}
+
 /// 在字节缓冲中查找 `\n\n` 分隔符
 fn find_event_separator(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
@@ -226,19 +264,37 @@ fn find_event_separator(buf: &[u8]) -> Option<usize> {
 
 /// 解析一个完整 SSE 事件（可能包含多行 data:）
 ///
-/// 返回是否遇到 `[DONE]` 终止标记
+/// 返回值：
+/// - `Ok(true)` 收到 `[DONE]` 终止标记
+/// - `Ok(false)` 正常（含"这一行不是我们能识别的格式"，已记诊断日志）
+/// - `Err(msg)` 提供商在流内报错（如 `{"error":{"message":...}}`）
+///
+/// 历史实现的坑：只认 `"data: "`（带空格）、JSON 解析失败一律静默丢弃。
+/// 于是网关用 `data:{...}` 或直接在 200 响应里回一段错误 JSON 时，
+/// 整个响应会被悄悄吃掉——上层看到的是"既没正文也没工具调用"的空回合。
 fn parse_sse_event(
     event: &str,
     think_state: &mut u8,
     pending: &mut VecDeque<StreamChunk>,
-) -> bool {
+) -> Result<bool> {
+    let mut done = false;
+
     for line in event.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            let data = data.trim();
-            if data == "[DONE]" {
-                return true;
-            }
-            if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
+        // `data:` 与 `data: ` 两种写法都接受（部分网关不带空格）
+        let Some(data) = line.strip_prefix("data:").map(str::trim_start) else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            done = true;
+            continue;
+        }
+
+        match serde_json::from_str::<ChatChunk>(data) {
+            Ok(chunk) => {
                 if let Some(choice) = chunk.choices.first() {
                     // 优先处理 reasoning_content（结构化思考字段）
                     if let Some(reasoning) = &choice.delta.reasoning_content {
@@ -258,11 +314,56 @@ fn parse_sse_event(
                             pending.push_back(StreamChunk::ToolCallDelta(call.clone().into()));
                         }
                     }
+                    // 结束原因必须带上去：`length` 意味着输出被 max_tokens 截断，
+                    // runner 据此才能区分"说完了"和"被切断了"
+                    if let Some(reason) = &choice.finish_reason {
+                        if !reason.is_empty() {
+                            pending.push_back(StreamChunk::Finish(reason.clone()));
+                        }
+                    }
                 }
+            }
+            Err(parse_error) => {
+                // 不是标准 chunk：先看是不是提供商塞进来的错误对象
+                if let Some(message) = extract_stream_error(data) {
+                    return Err(anyhow!("LLM 流式响应报错：{}", message));
+                }
+                // 其余情况如实记诊断，但不打断流（可能是 keep-alive 之类的噪声）
+                eprintln!(
+                    "[llm] 忽略无法解析的流式事件（{}）：{}",
+                    parse_error,
+                    truncate_for_log(data)
+                );
             }
         }
     }
-    false
+
+    Ok(done)
+}
+
+/// 从非 chunk 载荷里提取提供商的错误信息
+///
+/// 兼容 `{"error":{"message":...}}` 与 `{"error":"..."}` 两种形态；
+/// 不是错误载荷时返回 `None`。
+fn extract_stream_error(data: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| error.as_str())
+        .unwrap_or("（提供商未给出原因）");
+    Some(message.to_string())
+}
+
+/// 日志里的事件预览（多字节安全，避免把整段响应刷进终端）
+fn truncate_for_log(text: &str) -> String {
+    let truncated: String = text.chars().take(300).collect();
+    if truncated.chars().count() < text.chars().count() {
+        format!("{}…", truncated)
+    } else {
+        truncated
+    }
 }
 
 /// 解析内容中的 `<think>...</think>` 标签，将结果追加到 pending 列表
@@ -315,12 +416,71 @@ mod tests {
         let mut pending: VecDeque<StreamChunk> = VecDeque::new();
         let mut done = false;
         for event in events {
-            if parse_sse_event(&format!("data: {}\n\n", event), &mut think_state, &mut pending) {
-                done = true;
-                break;
+            match parse_sse_event(
+                &format!("data: {}\n\n", event),
+                &mut think_state,
+                &mut pending,
+            ) {
+                Ok(true) => {
+                    done = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => panic!("不该报错的事件：{} -> {}", event, e),
             }
         }
         (pending.into_iter().collect(), done)
+    }
+
+    /// 单事件解析结果（断言"错误路径"用）
+    fn parse_one(event: &str) -> Result<bool> {
+        let mut think_state = 0u8;
+        let mut pending: VecDeque<StreamChunk> = VecDeque::new();
+        parse_sse_event(
+            &format!("data: {}\n\n", event),
+            &mut think_state,
+            &mut pending,
+        )
+    }
+
+    /// 非标准 `data:{...}`（不带空格）也必须能解析
+    ///
+    /// 历史实现对这种写法整段丢弃——整个响应会变成"什么都没有"
+    #[test]
+    fn accepts_data_prefix_without_space() {
+        let mut think_state = 0u8;
+        let mut pending: VecDeque<StreamChunk> = VecDeque::new();
+        let done = parse_sse_event(
+            "data:{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            &mut think_state,
+            &mut pending,
+        )
+        .unwrap();
+        assert!(!done);
+        assert!(matches!(pending.front(), Some(StreamChunk::Content(t)) if t == "hi"));
+    }
+
+    /// 提供商在流内报错时必须上报，绝不能静默丢弃（否则就是一个空回合）
+    #[test]
+    fn provider_stream_error_is_surfaced() {
+        let err =
+            parse_one(r#"{"error":{"message":"upstream timeout","type":"server_error"}}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("upstream timeout"), "{err}");
+
+        // 字符串形态的 error 同样识别
+        let err = parse_one(r#"{"error":"rate limited"}"#).unwrap_err();
+        assert!(err.to_string().contains("rate limited"), "{err}");
+
+        // 普通噪声载荷不报错，只是被忽略
+        assert!(parse_one(r#"{"noise":true}"#).is_ok());
+    }
+
+    /// `finish_reason` 必须带上去：`length` 意味着输出被 max_tokens 截断
+    #[test]
+    fn finish_reason_is_forwarded() {
+        let (chunks, _) = parse(&[r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#]);
+        assert!(matches!(chunks.first(), Some(StreamChunk::Finish(r)) if r == "length"));
     }
 
     fn deltas(chunks: &[StreamChunk]) -> Vec<ToolCallDelta> {
