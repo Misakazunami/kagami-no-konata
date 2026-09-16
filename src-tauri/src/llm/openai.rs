@@ -317,6 +317,22 @@ fn parse_sse_event(
 ) -> Result<bool> {
     let mut done = false;
 
+    // 非标准网关会在 200 响应里直接回一段裸 JSON（没有 `data:` 前缀），
+    // 例如 `{"error":{"message":"upstream timeout"}}`。只按 data: 行解析时
+    // 这类载荷会被整段忽略，上层看到的是"空回合"，真正的错误无处可见。
+    // 这里给裸 JSON 补上 data: 前缀后走同一条解析路径。
+    let bare = event.trim();
+    let has_data_line = event
+        .lines()
+        .any(|line| line.trim_start().starts_with("data:"));
+    let normalized;
+    let event = if !has_data_line && (bare.starts_with('{') || bare.starts_with('[')) {
+        normalized = format!("data: {}", bare.replace(['\r', '\n'], " "));
+        normalized.as_str()
+    } else {
+        event
+    };
+
     for line in event.lines() {
         // `data:` 与 `data: ` 两种写法都接受（部分网关不带空格）
         let Some(data) = line.strip_prefix("data:").map(str::trim_start) else {
@@ -571,6 +587,24 @@ mod tests {
         assert!(parse_one(r#"{"error":{}}"#).is_ok());
         // 只有带内容的 error 才是真错误
         assert!(parse_one(r#"{"error":{"code":500,"message":"boom"}}"#).is_err());
+    }
+
+    /// 200 + 裸 JSON（没有 `data:` 前缀）也必须能解析：
+    /// 错误体要上报，正常 chunk 要照常入队
+    #[test]
+    fn bare_json_payload_without_data_prefix_is_parsed() {
+        let mut state = SseState::default();
+        state.handle_event(r#"{"error":{"message":"upstream timeout"}}"#);
+        let error = state.error.as_deref().unwrap_or_default();
+        assert!(error.contains("upstream timeout"), "{error}");
+
+        let mut state = SseState::default();
+        state.handle_event(r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
+        assert!(
+            matches!(state.pending.front(), Some(StreamChunk::Content(t)) if t == "hi"),
+            "{:?}",
+            state.pending
+        );
     }
 
     /// CRLF 分隔符必须被识别，否则整个响应要等到连接关闭才会解析

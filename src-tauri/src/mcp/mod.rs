@@ -60,10 +60,26 @@ pub fn connect_configured(app_config: &Arc<Mutex<AppConfig>>) -> Vec<Arc<dyn Too
         Ok(config) => config.tools.mcp.servers.clone(),
         Err(poisoned) => poisoned.into_inner().tools.mcp.servers.clone(),
     };
-    let targets: Vec<McpServerConfig> = servers
-        .into_iter()
-        .filter(|server| server.enabled && server.trusted)
-        .collect();
+    let targets: Vec<McpServerConfig> = {
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        servers
+            .into_iter()
+            .filter(|server| server.enabled && server.trusted)
+            .filter(|server| {
+                if server.id.trim().is_empty() {
+                    eprintln!("[mcp] 忽略没有 id 的服务器配置");
+                    return false;
+                }
+                if !seen_ids.insert(server.id.clone()) {
+                    // 重复 id 会让两个服务器的工具在注册表里重名、后者被静默丢弃，
+                    // 这里显式忽略并留下日志（配置校验也会拒绝这种配置）
+                    eprintln!("[mcp] 服务器 id 重复，已忽略后一个：{}", server.id);
+                    return false;
+                }
+                true
+            })
+            .collect()
+    };
 
     // **并发**启动：每个服务器最坏等两个 5 秒握手（initialize + tools/list），
     // 串行连接时 N 个无响应的服务器会把启动拖成 N×10 秒（真实可感知的
@@ -633,6 +649,26 @@ rl.on("line", (line) => {
         let status = block_on(probe(&config));
         assert!(!status.connected);
         assert!(status.error.is_some());
+    }
+
+    /// 重复 id 的服务器只能连接第一个：否则两套工具在注册表里重名，
+    /// 后者会被静默丢弃（模型找不到工具，用户也看不到原因）
+    #[test]
+    fn duplicate_server_ids_are_ignored() {
+        if !node_available() {
+            eprintln!("未安装 node，跳过 MCP 集成测试");
+            return;
+        }
+        let fx = FakeFixture::new("dup-id");
+        let mut first = fx.config(McpPermission::Read);
+        first.id = "dup".to_string();
+        let mut second = fx.config(McpPermission::Read);
+        second.id = "dup".to_string();
+
+        let tools = connect_configured(&config_with_servers(vec![first, second]));
+        assert_eq!(tools.len(), 2, "重复 id 的第二个服务器必须被忽略");
+        let names: Vec<String> = tools.iter().map(|t| t.descriptor().name.to_string()).collect();
+        assert!(names.iter().all(|name| name.starts_with("mcp:dup:")), "{names:?}");
     }
 
     #[test]

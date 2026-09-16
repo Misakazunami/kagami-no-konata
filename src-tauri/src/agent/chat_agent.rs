@@ -490,22 +490,38 @@ impl ChatAgent {
                     break;
                 }
             }
-            match chunk? {
-                StreamChunk::Content(text) => {
+            match chunk {
+                Ok(StreamChunk::Content(text)) => {
                     full_response.push_str(&text);
                     if let Some((_, on_chunk, _)) = &callbacks {
                         on_chunk(&text);
                     }
                 }
-                StreamChunk::Thinking(text) => {
+                Ok(StreamChunk::Thinking(text)) => {
                     if let Some((_, _, on_thinking)) = &callbacks {
                         on_thinking(&text);
                     }
                 }
                 // 未启用工具时不会收到工具增量；忽略以保持正文纯净
-                StreamChunk::ToolCallDelta(_) => {}
+                Ok(StreamChunk::ToolCallDelta(_)) => {}
                 // 纯对话链路不关心结束原因
-                StreamChunk::Finish(_) => {}
+                Ok(StreamChunk::Finish(_)) => {}
+                Err(e) => {
+                    // 已经流出的正文保留（用户已经看到），补一句中断说明；
+                    // 什么都不产出才按错误上报
+                    if full_response.trim().is_empty() {
+                        return Err(e);
+                    }
+                    let note = format!(
+                        "\n\n（连接中断：{}。以上为已生成的部分内容）",
+                        e
+                    );
+                    full_response.push_str(&note);
+                    if let Some((_, on_chunk, _)) = &callbacks {
+                        on_chunk(&note);
+                    }
+                    break;
+                }
             }
         }
 

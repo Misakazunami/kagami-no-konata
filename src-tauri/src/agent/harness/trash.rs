@@ -82,7 +82,11 @@ fn move_to_trash_in(target: &Path, files_dir: &Path, info_dir: &Path) -> Result<
         .unwrap_or_else(|| "item".to_string());
 
     // 同名的回收站条目已存在时改名，保证 files 与 info 同名配对
-    let (_entry_name, trashed_path, info_path) = pick_free_name(files_dir, info_dir, &name)?;
+    let target_is_dir = fs::symlink_metadata(target)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+    let (_entry_name, trashed_path, info_path) =
+        pick_free_name(files_dir, info_dir, &name, target_is_dir)?;
 
     // 先写 info：万一写入失败，文件还没被动过，原位置完好
     let info_body = format!(
@@ -90,8 +94,11 @@ fn move_to_trash_in(target: &Path, files_dir: &Path, info_dir: &Path) -> Result<
         encode_path(&absolute(target)?),
         format_deletion_date()
     );
-    fs::write(&info_path, info_body)
-        .with_context(|| format!("写入回收站信息失败：{}", info_path.display()))?;
+    if let Err(e) = fs::write(&info_path, info_body) {
+        // 占位符是本次创建的空文件/空目录，一并撤掉
+        let _ = remove_any(&trashed_path);
+        return Err(e).with_context(|| format!("写入回收站信息失败：{}", info_path.display()));
+    }
 
     match fs::rename(target, &trashed_path) {
         Ok(()) => Ok(trashed_path),
@@ -189,22 +196,42 @@ fn copy_symlink(from: &Path, _to: &Path) -> Result<()> {
     )
 }
 
-/// 找一个还没被占用的条目名（`name`、`name.1`、`name.2`…）
+/// 找一个还没被占用的条目名并**原子占位**
+///
+/// 先试原名，冲突则用 `原名.<随机后缀>`（而不是顺序计数）：两个并发的删除
+/// 操作各自生成的随机名几乎不可能相同，杜绝"探测空闲 → rename"之间被抢名
+/// 导致 rename 静默覆盖回收站里已有条目的竞态。
+///
+/// 占位方式：文件用 `create_new`（O_EXCL），目录用 `create_dir`（同样原子），
+/// 随后的 `rename`/复制会直接替换这个空占位符。回收站只在 Unix 平台启用，
+/// `rename(dir, 已存在空目录)` 在 Unix 上是允许的。
 fn pick_free_name(
     files_dir: &Path,
     info_dir: &Path,
     name: &str,
+    is_dir: bool,
 ) -> Result<(String, PathBuf, PathBuf)> {
-    for attempt in 0..1000 {
-        let candidate = if attempt == 0 {
-            name.to_string()
-        } else {
-            format!("{}.{}", name, attempt)
-        };
+    let candidates = std::iter::once(name.to_string()).chain(
+        (0..64).map(|_| format!("{}.{}", name, uuid::Uuid::new_v4().simple())),
+    );
+    for candidate in candidates {
         let files_path = files_dir.join(&candidate);
         let info_path = info_dir.join(format!("{}.trashinfo", candidate));
-        if !files_path.exists() && !info_path.exists() {
-            return Ok((candidate, files_path, info_path));
+        let claimed = if is_dir {
+            fs::create_dir(&files_path)
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&files_path)
+                .map(|_| ())
+        };
+        match claimed {
+            Ok(()) => return Ok((candidate, files_path, info_path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                anyhow::bail!("无法在回收站中占位「{}」：{}", candidate, e);
+            }
         }
     }
     anyhow::bail!("回收站里同名条目过多，无法为「{}」生成唯一名字", name)
@@ -379,6 +406,18 @@ mod tests {
             .map(|dir| dir.count())
             .unwrap_or(0);
         assert_eq!(leftovers, 0, "失败路径必须清理掉刚写的 trashinfo");
+    }
+
+    /// 原子占位符在失败路径也必须被清理（否则回收站里会留下空文件）
+    #[test]
+    fn missing_target_leaves_no_placeholder_behind() {
+        let fx = Fixture::new("missing-clean");
+        let ghost = fx.root.join("nope.txt");
+        assert!(fx.trash(&ghost).is_err());
+        let files_left = std::fs::read_dir(&fx.files_dir)
+            .map(|dir| dir.count())
+            .unwrap_or(0);
+        assert_eq!(files_left, 0, "占位符必须被清理");
     }
 
     #[test]

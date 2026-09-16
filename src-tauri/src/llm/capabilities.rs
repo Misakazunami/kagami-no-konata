@@ -43,7 +43,12 @@ pub fn supports_thinking(model: &str) -> bool {
 /// 声明优先于启发式：探测不准时用户可以在设置里勾选该模型，勾选后
 /// 界面会出现"深度思考"开关，请求里也才会带 `enable_thinking`。
 pub fn provider_supports_thinking(provider: &LlmProvider, model: &str) -> bool {
-    if provider.thinking_models.iter().any(|m| m == model) {
+    // 模型 id 的大小写/首尾空白不应让显式声明失效（声明与使用处必须同一套比较规则）
+    if provider
+        .thinking_models
+        .iter()
+        .any(|declared| declared.trim().eq_ignore_ascii_case(model.trim()))
+    {
         return true;
     }
     supports_thinking(model)
@@ -113,6 +118,9 @@ mod tests {
             "用户声明必须生效"
         );
         assert!(provider_supports_thinking(&provider, "deepseek-r1"));
+        // 大小写/空白不敏感：设置页保存的写法与请求使用的写法可能不同
+        assert!(provider_supports_thinking(&provider, "My-Private-Model"));
+        assert!(provider_supports_thinking(&provider, "  DEEPSEEK-R1 "));
         // 声明只影响被点名的模型
         assert!(!provider_supports_thinking(&provider, "another-private-model"));
     }

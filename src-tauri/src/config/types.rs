@@ -653,12 +653,19 @@ pub const DEFAULT_DENY_GLOBS: &[&str] = &[
     "**/.ssh/**",
     "**/.aws/**",
     "**/.gnupg/**",
+    "**/.kube/**",
     "**/id_rsa*",
     "**/id_ed25519*",
     "**/*.pem",
     "**/*.key",
     "**/*.pfx",
     "**/credentials*",
+    // 凭据文件（command_guard 的敏感路径片段已把它们视为高危，这里保持同一标准）
+    "**/.git-credentials",
+    "**/.netrc",
+    "**/.npmrc",
+    "**/.pypirc",
+    "**/.docker/config.json",
     "**/AppData/Roaming/**",
     "**/AppData/Local/**",
     "**/.git/config",
@@ -917,11 +924,19 @@ impl Default for ToolConfig {
 
 /// 词法层面的路径包含判断（不访问文件系统，供配置校验使用）
 ///
-/// 两边都必须是绝对路径；Windows 下大小写不敏感。
+/// 两边都必须是绝对路径；只有 Windows 的文件系统大小写不敏感，
+/// Linux/macOS 上 `/Data` 与 `/data` 是两个互不嵌套的目录。
 fn lexical_starts_with(child: &std::path::Path, parent: &std::path::Path) -> bool {
     let norm = |p: &std::path::Path| -> Vec<String> {
         p.components()
-            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .map(|c| {
+                let segment = c.as_os_str().to_string_lossy().to_string();
+                if cfg!(windows) {
+                    segment.to_ascii_lowercase()
+                } else {
+                    segment
+                }
+            })
             .collect()
     };
     let c = norm(child);
@@ -994,6 +1009,35 @@ impl ToolConfig {
                 }
             }
             seen_paths.push(path);
+        }
+
+        // MCP 服务器：id 会拼进工具名（`mcp:<id>:<tool>`），必须非空、唯一、
+        // 且不含冒号等分隔符；重复 id 会让后者的工具在注册表里静默丢失
+        let mut seen_mcp_ids: HashSet<&str> = HashSet::new();
+        for server in &self.mcp.servers {
+            if server.id.trim().is_empty() {
+                return Err("MCP 服务器 id 不能为空".to_string());
+            }
+            if server.id.len() > 32
+                || !server
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(format!(
+                    "MCP 服务器 id「{}」非法：只允许字母、数字、-、_（≤32 字符）",
+                    server.id
+                ));
+            }
+            if !seen_mcp_ids.insert(server.id.as_str()) {
+                return Err(format!("MCP 服务器 id 重复：{}", server.id));
+            }
+            if server.enabled && server.command.trim().is_empty() {
+                return Err(format!(
+                    "MCP 服务器「{}」已启用但没有填写启动命令",
+                    server.id
+                ));
+            }
         }
 
         if self
@@ -1157,6 +1201,72 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.tools.deny_globs.push("**/secrets/**".to_string());
         assert!(cfg.validate().is_ok());
+    }
+
+    /// MCP 服务器 id 必须非空、唯一、字符集合法，启用时必须填命令
+    #[test]
+    fn validate_guards_mcp_servers() {
+        use crate::config::types::{McpPermission, McpServerConfig};
+
+        let server = |id: &str| McpServerConfig {
+            id: id.to_string(),
+            permission: McpPermission::Read,
+            ..Default::default()
+        };
+
+        let mut cfg = AppConfig::default();
+        cfg.tools.mcp.servers = vec![server("")];
+        assert!(cfg.validate().is_err(), "空 id 必须被拒绝");
+
+        cfg.tools.mcp.servers = vec![server("dup"), server("dup")];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("重复"), "{err}");
+
+        cfg.tools.mcp.servers = vec![server("bad:id")];
+        assert!(cfg.validate().is_err(), "分隔符字符必须被拒绝");
+
+        let mut enabled = server("ok");
+        enabled.enabled = true;
+        cfg.tools.mcp.servers = vec![enabled];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("启动命令"), "{err}");
+
+        // 合法配置通过
+        let mut ok = server("my-server");
+        ok.enabled = true;
+        ok.command = "npx".to_string();
+        cfg.tools.mcp.servers = vec![ok];
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    }
+
+    /// Linux 上大小写不同就是不同目录，不应判成"互相嵌套"
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn case_different_workspaces_are_not_nested_on_linux() {
+        let base = std::env::temp_dir().join(format!("konata-case-{}", uuid::Uuid::new_v4()));
+        let upper = base.join("Data");
+        let lower = base.join("data");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&lower).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.tools.workspaces = vec![
+            WorkspaceRoot {
+                id: "upper".to_string(),
+                label: "U".to_string(),
+                path: WorkspacePath::Absolute(upper.display().to_string()),
+                writable: true,
+            },
+            WorkspaceRoot {
+                id: "lower".to_string(),
+                label: "L".to_string(),
+                path: WorkspacePath::Absolute(lower.display().to_string()),
+                writable: true,
+            },
+        ];
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

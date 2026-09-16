@@ -206,6 +206,15 @@ fn remove_any(target: &Path) -> Result<()> {
     }
 }
 
+/// 目录类改动的备份说明
+///
+/// 目录不参与内容快照（由回收站兜底）。不能套用 `snapshot_note(None)` 的
+/// "当前环境未启用文件快照"兜底文案——快照其实是启用的，那会误导模型与用户。
+fn directory_snapshot_note() -> String {
+    "\n（目录不做内容快照，本次改动无法在应用内一键回滚；非永久删除可从系统回收站找回）"
+        .to_string()
+}
+
 /// 若目标已存在且允许覆盖，先给目标做快照（否则回滚拿不回被覆盖的内容）
 fn capture_existing(
     cx: &ToolCtx<'_>,
@@ -351,6 +360,11 @@ impl Tool for DeletePath {
         };
 
         let kind = if metadata.is_dir() { "目录" } else { "文件" };
+        let backup_note = if metadata.is_dir() {
+            directory_snapshot_note()
+        } else {
+            snapshot_note(capture.as_ref())
+        };
         let body = format!(
             "已删除{}：{}（{}，{} 个条目）\n方式：{}{}",
             kind,
@@ -358,7 +372,7 @@ impl Tool for DeletePath {
             stats.human_bytes(),
             stats.entries,
             removal.label(),
-            snapshot_note(capture.as_ref())
+            backup_note
         );
         let preview = format!(
             "删除{} {} · {}",
@@ -495,14 +509,20 @@ impl Tool for MovePath {
             None
         };
 
+        let source_is_dir = from.abs_path.is_dir();
+
         cx.ensure_not_cancelled()?;
         move_any(&from.abs_path, &to.abs_path)?;
 
-        let mut notes = snapshot_note(source_capture.as_ref());
+        let mut notes = if source_is_dir {
+            directory_snapshot_note()
+        } else {
+            snapshot_note(source_capture.as_ref())
+        };
         if target_capture.is_some() {
             notes.push_str("；被覆盖的目标也已备份");
         }
-        if from.abs_path.is_dir() {
+        if source_is_dir {
             notes.push_str("\n（注意：回滚会把源放回原位，但不会删除已经移动过去的副本）");
         }
 

@@ -342,18 +342,21 @@ impl Tool for GrepSearch {
         let mut hits: Vec<String> = Vec::new();
         let mut files_scanned = 0usize;
 
-        let files: Vec<PathBuf> = if target.abs_path.is_file() {
-            vec![target.abs_path.clone()]
+        // 惰性遍历：历史实现先把全部路径 collect 进 Vec，数十万文件的工作区
+        // 会先吃掉几百 MB 内存，而且收集阶段无法响应取消
+        let files: Box<dyn Iterator<Item = PathBuf>> = if target.abs_path.is_file() {
+            Box::new(std::iter::once(target.abs_path.clone()))
         } else {
-            walkdir::WalkDir::new(&target.abs_path)
-                .max_depth(24)
-                .into_iter()
-                // 根条目也要放行（见 glob_search 的同款说明）
-                .filter_entry(|e| e.depth() == 0 || !is_hidden_dir(e.path()))
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-                .map(|e| e.into_path())
-                .collect()
+            Box::new(
+                walkdir::WalkDir::new(&target.abs_path)
+                    .max_depth(24)
+                    .into_iter()
+                    // 根条目也要放行（见 glob_search 的同款说明）
+                    .filter_entry(|e| e.depth() == 0 || !is_hidden_dir(e.path()))
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .map(|e| e.into_path()),
+            )
         };
 
         'outer: for file in files {

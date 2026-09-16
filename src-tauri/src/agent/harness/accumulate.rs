@@ -34,7 +34,11 @@ pub struct ToolCallAccumulator {
 
 impl ToolCallAccumulator {
     pub fn push(&mut self, delta: ToolCallDelta) {
-        let slot = self.slots.entry(delta.index).or_default();
+        let index = match delta.index {
+            Some(index) => index,
+            None => self.slot_for_unindexed(&delta),
+        };
+        let slot = self.slots.entry(index).or_default();
 
         if let Some(id) = delta.id.filter(|s| !s.is_empty()) {
             slot.id = Some(id);
@@ -52,6 +56,25 @@ impl ToolCallAccumulator {
         if let Some(args) = delta.arguments {
             slot.arguments.push_str(&args);
         }
+    }
+
+    /// 网关未提供 `index` 时决定这条分片属于哪个槽位
+    ///
+    /// - 带 id 且与最后一个槽位的 id 不同 → **新调用**。并行调用必须分开，
+    ///   否则第二个调用的 name/arguments 会被拼进第一个（历史缺陷：
+    ///   `read_file` + `list_dir` 拼成 `read_filelist_dir`）；
+    /// - 其余情况（arguments/name 续片）视为最后一个槽位的续片；
+    /// - 一个槽位都没有时用 0 号槽位。
+    fn slot_for_unindexed(&self, delta: &ToolCallDelta) -> usize {
+        let Some((&last, slot)) = self.slots.iter().next_back() else {
+            return 0;
+        };
+        if let Some(id) = delta.id.as_deref().filter(|id| !id.is_empty()) {
+            if slot.id.as_deref() != Some(id) {
+                return last.saturating_add(1);
+            }
+        }
+        last
     }
 
     #[allow(dead_code)]
@@ -105,7 +128,16 @@ mod tests {
 
     fn delta(index: usize, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> ToolCallDelta {
         ToolCallDelta {
-            index,
+            index: Some(index),
+            id: id.map(|s| s.to_string()),
+            name: name.map(|s| s.to_string()),
+            arguments: args.map(|s| s.to_string()),
+        }
+    }
+
+    fn unindexed(id: Option<&str>, name: Option<&str>, args: Option<&str>) -> ToolCallDelta {
+        ToolCallDelta {
+            index: None,
             id: id.map(|s| s.to_string()),
             name: name.map(|s| s.to_string()),
             arguments: args.map(|s| s.to_string()),
@@ -197,5 +229,48 @@ mod tests {
         let mut acc = ToolCallAccumulator::default();
         acc.push(delta(0, Some("c1"), None, Some("{}")));
         assert!(acc.finish("s1").is_empty());
+    }
+
+    /// 网关不带 index 时的并行调用必须分开，而不是拼成一个
+    ///
+    /// 历史缺陷：第二个调用的 name/arguments 会被拼进第一个槽位
+    /// （`read_file` + `list_dir` → `read_filelist_dir`），参数 JSON 也随之损坏。
+    #[test]
+    fn unindexed_parallel_calls_get_separate_slots() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.push(unindexed(
+            Some("c1"),
+            Some("read_file"),
+            Some(r#"{"path":"a.txt"}"#),
+        ));
+        acc.push(unindexed(
+            Some("c2"),
+            Some("list_dir"),
+            Some(r#"{"path":"."}"#),
+        ));
+
+        let calls = acc.finish("s1");
+        assert_eq!(calls.len(), 2, "两个并行调用必须各占一个槽位");
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "a.txt");
+        assert_eq!(calls[1].id, "c2");
+        assert_eq!(calls[1].name, "list_dir");
+        assert_eq!(calls[1].arguments["path"], ".");
+        assert!(calls.iter().all(|c| c.parse_error.is_none()));
+    }
+
+    /// 不带 index 的 arguments/name 续片仍留在同一个槽位
+    #[test]
+    fn unindexed_fragments_stay_in_one_slot() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.push(unindexed(Some("c1"), Some("read_"), Some("{\"pa")));
+        acc.push(unindexed(None, None, Some("th\":\"a.")));
+        acc.push(unindexed(None, Some("file"), Some("txt\"}")));
+
+        let calls = acc.finish("s1");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "a.txt");
     }
 }

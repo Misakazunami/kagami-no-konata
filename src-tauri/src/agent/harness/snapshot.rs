@@ -129,7 +129,17 @@ impl SnapshotStore {
         }
 
         let dir = self.stream_dir(stream_id);
-        let rel_str = rel.to_string_lossy().to_string();
+        // 非 UTF-8 路径直接拒绝备份：rel_path 要落库为 TEXT，lossy 转换后
+        // 根本拼不回原路径（回滚会写到乱码名的新文件上），不如如实告知
+        let rel_str = match rel.to_str() {
+            Some(rel) => rel.to_string(),
+            None => {
+                return Capture::Skipped {
+                    reason: "路径包含非 UTF-8 字符，无法可靠记录与回滚（已跳过备份）"
+                        .to_string(),
+                }
+            }
+        };
         {
             // 只在"查重 + 额度检查"期间持锁：随后的复制最多 4 MB，
             // 让全局 ChatStore 锁陪跑磁盘 IO 会拖住所有消息落库/记忆读写
@@ -536,6 +546,30 @@ mod tests {
         let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "原始版本");
+    }
+
+    /// 非 UTF-8 路径无法可靠落库/回滚，必须跳过并如实说明
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_are_skipped_with_reason() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let fx = Fixture::new("nonutf8");
+        let name = std::ffi::OsStr::from_bytes(b"bad-\xFF.txt");
+        let abs = fx.dir.join(name);
+        std::fs::write(&abs, "内容").unwrap();
+        let rel = PathBuf::from(name);
+
+        match fx
+            .snapshots
+            .capture(&fx.session_id, &fx.stream_id, "default", &rel, &abs)
+        {
+            Capture::Skipped { reason } => {
+                assert!(reason.contains("UTF-8"), "{reason}");
+            }
+            other => panic!("非 UTF-8 路径必须跳过备份：{other:?}"),
+        }
+        assert_eq!(fx.snapshots.info(&fx.session_id, &fx.stream_id).files, 0);
     }
 
     #[test]

@@ -191,24 +191,42 @@ impl HarnessRun<'_> {
             let mut step_text = String::new();
             let mut finish_reason: Option<String> = None;
 
+            let mut stream_error: Option<String> = None;
             while let Some(chunk) = stream.next().await {
                 if self.cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                match chunk? {
-                    StreamChunk::Content(text) => {
+                match chunk {
+                    Ok(StreamChunk::Content(text)) => {
                         step_text.push_str(&text);
                         content.push_str(&text);
                         on_chunk(&text);
                     }
-                    StreamChunk::Thinking(text) => on_thinking(&text),
-                    StreamChunk::ToolCallDelta(delta) => accumulator.push(delta),
+                    Ok(StreamChunk::Thinking(text)) => on_thinking(&text),
+                    Ok(StreamChunk::ToolCallDelta(delta)) => accumulator.push(delta),
                     // 提供商声明的结束原因：`length` = 被 max_tokens 截断
-                    StreamChunk::Finish(reason) => finish_reason = Some(reason),
+                    Ok(StreamChunk::Finish(reason)) => finish_reason = Some(reason),
+                    Err(e) => {
+                        stream_error = Some(e.to_string());
+                        break;
+                    }
                 }
             }
 
             if self.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if let Some(message) = stream_error {
+                // 网络中断时把**已经流出的正文**保留下来（用户已经看到了），
+                // 补一句说明后正常收尾。工具调用不再组装/执行：参数很可能被
+                // 截断，拿半截 JSON 去调工具比报错更危险。
+                if content.trim().is_empty() {
+                    return Err(anyhow::anyhow!("流式响应中断：{}", message));
+                }
+                let note = format!("\n\n（连接中断：{}。以上为已生成的部分内容）", message);
+                content.push_str(&note);
+                on_chunk(&note);
                 break;
             }
 
@@ -732,7 +750,7 @@ mod tests {
 
     fn tool_call_chunk(index: usize, id: &str, name: &str, args: &str) -> StreamChunk {
         StreamChunk::ToolCallDelta(crate::llm::types::ToolCallDelta {
-            index,
+            index: Some(index),
             id: Some(id.to_string()),
             name: Some(name.to_string()),
             arguments: Some(args.to_string()),
@@ -1384,5 +1402,90 @@ mod tests {
         let infos: Vec<ToolInfo> = fx.registry.infos(fx.services.mode);
         assert_eq!(infos.len(), 1);
         assert!(infos[0].enabled);
+    }
+
+    // ─── 流中断：已流出的正文必须保留 ───
+
+    /// 先产出内容再报错的流（模拟网络抖动/网关断流）
+    struct BrokenStreamBackend {
+        chunks: Mutex<Vec<anyhow::Result<StreamChunk>>>,
+    }
+
+    impl BrokenStreamBackend {
+        fn new(chunks: Vec<anyhow::Result<StreamChunk>>) -> Arc<Self> {
+            Arc::new(Self {
+                chunks: Mutex::new(chunks),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChatBackend for BrokenStreamBackend {
+        async fn chat(&self, _messages: Vec<LlmMessage>) -> Result<String> {
+            Ok("mock".to_string())
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: Vec<LlmMessage>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+            let chunks = std::mem::take(&mut *self.chunks.lock().unwrap());
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    fn run_broken(
+        fx: &Fixture,
+        backend: &Arc<BrokenStreamBackend>,
+    ) -> Result<HarnessOutcome> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let run = HarnessRun {
+            backend: backend.as_ref(),
+            registry: &fx.registry,
+            services: fx.services.clone(),
+            session_id: "s1",
+            stream_id: "stream-1",
+            cancel,
+            emit: fx.sink.clone(),
+            approver: Arc::new(AllowAllApprover),
+            tools_enabled: true,
+            auto_approve: Vec::new(),
+            limits: fx.limits,
+            max_steps: 8,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(run.execute(messages(), |_| {}, |_| {}))
+    }
+
+    /// 用户已经看到一半回复时连接断开：部分内容必须保留并说明中断，
+    /// 而不是把整轮变成"发送失败"、让已显示的文字消失
+    #[test]
+    fn partial_content_survives_a_stream_break() {
+        let fx = fixture(vec![], ToolMode::Standard);
+        let backend = BrokenStreamBackend::new(vec![
+            Ok(StreamChunk::Content("前半段。".to_string())),
+            Err(anyhow!("connection reset by peer")),
+        ]);
+
+        let outcome = run_broken(&fx, &backend).expect("必须保留部分输出而不是报错");
+        assert!(outcome.content.contains("前半段。"), "{}", outcome.content);
+        assert!(outcome.content.contains("连接中断"), "{}", outcome.content);
+        assert!(
+            outcome.invocations.is_empty(),
+            "中断时不得执行半截工具调用"
+        );
+    }
+
+    /// 一个字都没产出就断开：仍然按错误上报（没有可保留的内容）
+    #[test]
+    fn stream_break_without_content_is_an_error() {
+        let fx = fixture(vec![], ToolMode::Standard);
+        let backend = BrokenStreamBackend::new(vec![Err(anyhow!("broken pipe"))]);
+        let result = run_broken(&fx, &backend);
+        assert!(result.is_err(), "没有任何内容时应当报错");
     }
 }

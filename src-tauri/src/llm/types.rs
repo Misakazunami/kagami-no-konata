@@ -218,7 +218,12 @@ pub struct RawFunctionDelta {
 /// 工具调用增量（已归一化，供累积器消费）
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCallDelta {
-    pub index: usize,
+    /// 提供商给出的分片序号
+    ///
+    /// `None` = 该网关没有推送 `index`（协议允许但不多见）。必须保留 `None`
+    /// 让累积器去判断"这是续片还是新调用"，直接 `unwrap_or(0)` 会把并行调用
+    /// 合并进同一个槽位。
+    pub index: Option<usize>,
     pub id: Option<String>,
     pub name: Option<String>,
     pub arguments: Option<String>,
@@ -231,7 +236,7 @@ impl From<RawToolCallDelta> for ToolCallDelta {
             arguments: None,
         });
         Self {
-            index: raw.index.unwrap_or(0),
+            index: raw.index,
             id: raw.id,
             name: function.name,
             arguments: function.arguments,
@@ -344,7 +349,7 @@ mod tests {
         let raw: RawToolCallDelta =
             serde_json::from_str(r#"{"function":{"arguments":"{\"a\""}}"#).unwrap();
         let delta: ToolCallDelta = raw.into();
-        assert_eq!(delta.index, 0);
+        assert_eq!(delta.index, None, "缺 index 必须保留 None 交给累积器判断");
         assert_eq!(delta.id, None);
         assert_eq!(delta.name, None);
         assert_eq!(delta.arguments.as_deref(), Some("{\"a\""));

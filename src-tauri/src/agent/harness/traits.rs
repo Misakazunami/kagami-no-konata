@@ -529,6 +529,8 @@ pub struct HeadTailBuffer {
     tail_limit: usize,
     tail_bytes: usize,
     dropped: usize,
+    /// 头部是否已关闭（有内容进过尾部）；关闭后所有行都只能进尾部
+    head_closed: bool,
 }
 
 impl HeadTailBuffer {
@@ -541,6 +543,7 @@ impl HeadTailBuffer {
             tail_limit: max_bytes.saturating_sub(head_limit),
             tail_bytes: 0,
             dropped: 0,
+            head_closed: false,
         }
     }
 
@@ -556,11 +559,14 @@ impl HeadTailBuffer {
         }
 
         let entry_len = rest.len() + 1;
-        if self.head.len() + entry_len <= self.head_limit {
+        // 头部一旦关闭（有内容进了尾部）就不能再往头部追加：
+        // 否则"长行之后又来了短行"会插到长行之前，输出顺序与执行顺序不一致
+        if !self.head_closed && self.head.len() + entry_len <= self.head_limit {
             self.head.push_str(rest);
             self.head.push('\n');
             return;
         }
+        self.head_closed = true;
 
         let entry = format!("{}\n", rest);
         self.tail_bytes += entry.len();
@@ -794,6 +800,26 @@ mod tests {
         assert!(truncated);
         assert!(out.contains('此'));
         assert!(out.len() <= 64 + "已省略 字节\n".len() + 8, "实际 {} 字节", out.len());
+    }
+
+    /// 头部关闭后，短行不能再插到已进尾部的长行之前（输出必须保持执行顺序）
+    ///
+    /// 修复前：长行进尾部后头部仍未关闭，后续短行会继续追加进头部，
+    /// 于是输出变成 "aaaa, cc, 省略标记, bbbb…"——因果顺序被调换。
+    #[test]
+    fn head_tail_buffer_never_reorders_lines() {
+        // 上限 4096：head_limit=1365、tail=2731
+        let mut buffer = HeadTailBuffer::new(4096);
+        buffer.push_line("aaaa"); // 进头部
+        let long = "b".repeat(2000); // 超头部预算 → 进尾部（并关闭头部）
+        buffer.push_line(&long);
+        buffer.push_line("cc"); // 头部已关闭 → 必须进尾部
+
+        let (out, _truncated) = buffer.finish();
+        let a = out.find("aaaa").expect("第一行");
+        let b = out.find("bbbb").expect("第二行");
+        let c = out.find("cc").expect("第三行");
+        assert!(a < b && b < c, "行序必须保持执行顺序：{out}");
     }
 
     #[test]
