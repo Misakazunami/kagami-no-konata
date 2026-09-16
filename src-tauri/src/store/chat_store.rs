@@ -76,11 +76,12 @@ fn map_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         token_count: row.get(5).unwrap_or(0),
         thinking_ms: row.get(6).unwrap_or(0),
         thinking: row.get(7).ok(),
+        model: row.get(8).ok(),
     })
 }
 
 const MESSAGE_COLUMNS: &str =
-    "id, session_id, role, content, created_at, token_count, thinking_ms, thinking";
+    "id, session_id, role, content, created_at, token_count, thinking_ms, thinking, model";
 
 /// 会话行的列清单（新增列请同时改这里与 [`map_session_row`]）
 const SESSION_COLUMNS: &str =
@@ -193,6 +194,9 @@ impl ChatStore {
     }
 
     /// 添加消息（带元数据，事务保证消息与会话更新原子性）
+    ///
+    /// `model` 只对 assistant 消息有意义（会话级模型选择的展示标签），
+    /// 用户/系统消息传 `None`。
     pub fn add_message(
         &self,
         session_id: &str,
@@ -201,6 +205,7 @@ impl ChatStore {
         token_count: i64,
         thinking_ms: i64,
         thinking: Option<String>,
+        model: Option<&str>,
     ) -> Result<Message> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -209,8 +214,8 @@ impl ChatStore {
 
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO messages (id, session_id, role, content, created_at, date_key, token_count, thinking_ms, thinking) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![id, session_id, role.to_string(), content, timestamp, date_key, token_count, thinking_ms, thinking],
+            "INSERT INTO messages (id, session_id, role, content, created_at, date_key, token_count, thinking_ms, thinking, model) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![id, session_id, role.to_string(), content, timestamp, date_key, token_count, thinking_ms, thinking, model],
         )?;
         tx.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -227,6 +232,7 @@ impl ChatStore {
             token_count,
             thinking_ms,
             thinking,
+            model: model.map(|m| m.to_string()),
         })
     }
 
@@ -916,6 +922,40 @@ mod tests {
             Some(&pref),
             "列表查询"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// assistant 消息的模型标签必须落库并随所有读取路径返回
+    /// （否则 `session-updated` 的全量回读会把它抹掉，用户永远看不到"这条是谁答的"）
+    #[test]
+    fn assistant_model_label_round_trips() {
+        let (store, dir) = temp_store("model-label");
+        let session = store
+            .create_session("konata-default", "t", None, None, None)
+            .unwrap();
+        store
+            .add_message(&session.id, Role::User, "你好", 1, 0, None, None)
+            .unwrap();
+        store
+            .add_message(
+                &session.id,
+                Role::Assistant,
+                "你好呀",
+                2,
+                0,
+                None,
+                Some("qwen3-32b（主模型）"),
+            )
+            .unwrap();
+
+        let messages = store.get_messages(&session.id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].model, None, "用户消息没有模型标签");
+        assert_eq!(messages[1].model.as_deref(), Some("qwen3-32b（主模型）"));
+
+        // 上下文窗口读取路径同样带着它（结构一致，不会因缺列而失败）
+        let recent = store.get_recent_messages(&session.id, 10).unwrap();
+        assert_eq!(recent[1].model.as_deref(), Some("qwen3-32b（主模型）"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -37,6 +37,11 @@ pub struct Message {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// 生成这条回复的模型标签（仅 assistant 消息，自动选择下主/子模型不同，
+    /// 落库后历史消息也能显示"这条是谁答的"）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Message {
@@ -50,6 +55,7 @@ impl Message {
             token_count: 0,
             thinking_ms: 0,
             thinking: None,
+            model: None,
         }
     }
 }

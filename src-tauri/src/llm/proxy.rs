@@ -139,11 +139,16 @@ fn build_chat_request(
     tools: Option<Vec<ToolSchema>>,
 ) -> ChatRequest {
     let tools = tools.filter(|t| !t.is_empty());
-    // 单轮覆盖优先；未覆盖时沿用提供商的持久化默认（历史行为）
+    // 单轮覆盖优先；未覆盖时沿用提供商的持久化默认（历史行为）。
+    //
+    // **能力过滤必须放在合并之后**：先把 `Some(false)` 过滤成 `None` 再回落
+    // 提供商默认 `true`，会把用户的"显式关闭"反转成开启（真实缺陷）。
+    // 判定为不支持时一律不发该字段——严格端点会对未知字段直接 400。
     let enable_thinking = match overrides.thinking {
         Some(value) => Some(value),
         None => provider.enable_thinking.then_some(true),
-    };
+    }
+    .filter(|_| crate::llm::capabilities::provider_supports_thinking(provider, &provider.model));
     ChatRequest {
         model: provider.model.clone(),
         messages,
@@ -162,7 +167,8 @@ mod tests {
 
     fn provider() -> LlmProvider {
         let mut p = LlmProvider::new("测试", "https://example.com/v1", "sk-test");
-        p.model = "deepseek-reasoner".to_string();
+        // 用"显式开关型"模型（Qwen3 家族）作为默认，原生推理模型见专门用例
+        p.model = "qwen3-32b".to_string();
         p
     }
 
@@ -205,9 +211,38 @@ mod tests {
         let json = request_json(&provider(), ProviderOverrides { thinking: Some(true) });
         assert_eq!(json["enable_thinking"], serde_json::json!(true));
         // 其他字段不受影响
-        assert_eq!(json["model"], "deepseek-reasoner");
+        assert_eq!(json["model"], "qwen3-32b");
         assert_eq!(json["stream"], true);
         assert!(json.get("tools").is_none());
+    }
+
+    /// 原生推理模型（官方端点不认 `enable_thinking`）绝不能收到该字段，
+    /// 即使提供商默认打开了思考
+    #[test]
+    fn native_reasoner_never_receives_the_field() {
+        let mut p = provider();
+        p.model = "gpt-5".to_string();
+        p.enable_thinking = true;
+        let json = request_json(&p, ProviderOverrides { thinking: Some(true) });
+        assert!(
+            json.get("enable_thinking").is_none(),
+            "严格端点会 400：{json}"
+        );
+    }
+
+    /// 用户显式关闭必须保留"关闭"语义，而不能因为模型不支持该字段
+    /// 就回落到提供商默认（历史缺陷：Some(false) 被 filter 成 None，
+    /// 再被 provider.enable_thinking=true 反转成开启）
+    #[test]
+    fn explicit_off_is_never_flipped_back_to_on() {
+        let mut p = provider();
+        p.model = "gpt-4o".to_string();
+        p.enable_thinking = true;
+        let json = request_json(&p, ProviderOverrides { thinking: Some(false) });
+        assert!(
+            json.get("enable_thinking").is_none(),
+            "不支持时不下发；绝不能变成 true：{json}"
+        );
     }
 
     /// 覆盖项属于"这一轮"：热更新提供商配置不得把它冲掉

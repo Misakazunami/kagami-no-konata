@@ -15,6 +15,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (9, include_str!("migrations/009_notes.sql")),
     (10, include_str!("migrations/010_session_types.sql")),
     (11, include_str!("migrations/011_session_model_pref.sql")),
+    (12, include_str!("migrations/012_message_model.sql")),
 ];
 
 /// 打开数据库连接（应用 WAL 等 PRAGMA，不执行迁移）
@@ -127,6 +128,12 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str)] = &[
         "sessions",
         "model_pref",
         "ALTER TABLE sessions ADD COLUMN model_pref TEXT DEFAULT NULL",
+    ),
+    // 012_message_model
+    (
+        "messages",
+        "model",
+        "ALTER TABLE messages ADD COLUMN model TEXT DEFAULT NULL",
     ),
 ];
 

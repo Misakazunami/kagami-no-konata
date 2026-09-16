@@ -412,7 +412,7 @@ pub async fn send_message(
     let user_tokens = estimate_tokens(&content);
     if persist {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-        if let Err(e) = store.add_message(&session_id, Role::User, &content, user_tokens, 0, None) {
+        if let Err(e) = store.add_message(&session_id, Role::User, &content, user_tokens, 0, None, None) {
             return Err(persist_failure(&store, &session_id, e));
         }
     }
@@ -644,6 +644,8 @@ pub async fn send_message(
 
     // 存储 AI 回复（含元数据和思考内容）
     let invocations = response.tool_invocations.clone();
+    // 本轮实际使用的模型：随消息落库，历史消息也能显示"这条是谁答的"
+    let model_label = models.label();
     let full_conversation = {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
         let assistant_message = match store.add_message(
@@ -653,6 +655,7 @@ pub async fn send_message(
             assistant_tokens,
             thinking_ms,
             thinking_content,
+            Some(model_label.as_str()),
         ) {
             Ok(message) => message,
             Err(e) => {
@@ -709,7 +712,17 @@ pub async fn send_message(
     };
 
     // 通知所有窗口会话已更新（用于跨窗口同步）
-    let _ = app.emit("session-updated", &session_id);
+    //
+    // 载荷必须带 `stream_id`：主窗口据此跳过"自己发起的生成"的回读
+    // （本地消息已经带着 stats/模型标签落位，回读只会造成闪烁；其它窗口
+    // 以及悬浮窗的生成仍然要靠它同步）。
+    let _ = app.emit(
+        "session-updated",
+        json!({
+            "session_id": &session_id,
+            "stream_id": &stream_id,
+        }),
+    );
 
     // 自动标题生成
     let should_generate_title = {
@@ -1127,7 +1140,7 @@ mod tests {
 
         // 此时再写消息：底层就是那句外键错误
         let error = store
-            .add_message(&session.id, Role::Assistant, "回复", 1, 0, None)
+            .add_message(&session.id, Role::Assistant, "回复", 1, 0, None, None)
             .unwrap_err();
         assert!(
             error.to_string().contains("FOREIGN KEY"),

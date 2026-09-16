@@ -474,7 +474,7 @@ mod tests {
             "不支持的模型不得收到 enable_thinking"
         );
 
-        provider.model = "deepseek-reasoner".to_string();
+        provider.model = "qwen3-32b".to_string();
         assert_eq!(overrides_for(&provider, Some(true)).thinking, Some(true));
         assert_eq!(overrides_for(&provider, Some(false)).thinking, Some(false));
         assert_eq!(

@@ -40,10 +40,10 @@ export interface Message {
   thinking_ms: number;
   thinking?: string;
   /**
-   * 生成这条回复的模型（来自 `message-stats` 事件，仅本次会话内可见）
+   * 生成这条回复的模型（来自 `message-stats` 事件；后端已把同一标签写入
+   * `messages.model`，因此历史回读也带着它）
    *
-   * 自动选择下主轮次与子代理用的模型不同，必须让用户看得见"这条是谁答的"；
-   * 历史消息从数据库回读，没有这个字段（数据库不存模型名）。
+   * 自动选择下主轮次与子代理用的模型不同，必须让用户看得见"这条是谁答的"。
    */
   model?: string;
 }
@@ -271,6 +271,18 @@ const bindPlanEvents = (set: (partial: Partial<ChatState>) => void, get: () => C
     console.error("Failed to subscribe notes events:", e);
   });
 };
+
+/**
+ * 最近一次由**本窗口**发起的 stream_id
+ *
+ * `session-updated` 是全局广播：主窗口收到自己发起的那一轮时不需要回读
+ * （本地消息已带统计与模型标签，回读只会闪烁）。store 之外用模块变量记录，
+ * 避免为一个只读比较项引入可订阅的状态。
+ */
+let lastLocalStreamId: string | null = null;
+
+/** 本窗口最近发起的 stream_id（供 App 的事件监听判断"是不是自己"） */
+export const getLastLocalStreamId = (): string | null => lastLocalStreamId;
 
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
@@ -504,6 +516,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (isStreaming) return;
 
     const streamId = crypto.randomUUID();
+    lastLocalStreamId = streamId;
     const isCurrentStream = () => get().activeStreamId === streamId;
 
     /*

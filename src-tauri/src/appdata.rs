@@ -249,7 +249,7 @@ mod tests {
         let store = ChatStore::new(conn);
         let session = store.create_session("konata-default", "旧会话", None, None, None).unwrap();
         store
-            .add_message(&session.id, crate::agent::context::Role::User, "你好", 1, 0, None)
+            .add_message(&session.id, crate::agent::context::Role::User, "你好", 1, 0, None, None)
             .unwrap();
 
         std::fs::write(dir.join("config.json"), "{\"user\":{\"nickname\":\"主人\"}}").unwrap();
@@ -377,7 +377,7 @@ mod tests {
         let store = ChatStore::new(conn);
         let session = store.create_session("konata-default", "WAL 里的会话", None, None, None).unwrap();
         store
-            .add_message(&session.id, crate::agent::context::Role::User, "hi", 1, 0, None)
+            .add_message(&session.id, crate::agent::context::Role::User, "hi", 1, 0, None, None)
             .unwrap();
         assert!(legacy.join("data.db-wal").exists(), "应处于 WAL 模式");
         drop(store);

@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { emptyGenerationState, useChatStore } from "./stores/chatStore";
+import { emptyGenerationState, getLastLocalStreamId, useChatStore } from "./stores/chatStore";
 import { ChatWindow } from "./components/chat/ChatWindow";
 import { SettingsPage } from "./components/settings/SettingsPage";
 import { PersonaEditor } from "./components/persona/PersonaEditor";
@@ -127,11 +127,15 @@ function App() {
           useChatStore.getState().updateSessionTitle(sid, title);
         }),
         // 监听跨窗口会话更新（悬浮窗发送了消息时同步到主窗口）
-        listen<string>("session-updated", (event) => {
+        listen<{ session_id: string; stream_id: string }>("session-updated", (event) => {
           const { currentSessionId, refreshCurrentSession } = useChatStore.getState();
-          if (event.payload === currentSessionId) {
-            refreshCurrentSession();
-          }
+          const { session_id, stream_id } = event.payload ?? {};
+          if (session_id !== currentSessionId) return;
+          // 自己发起的那一轮不回读：本地消息已带统计/模型标签，回读只会闪一下
+          // （历史实现每次发送都触发全量刷新，把模型标签当场抹掉）。
+          // 其它窗口（含悬浮窗）的生成仍要通过回读同步。
+          if (stream_id && stream_id === getLastLocalStreamId()) return;
+          refreshCurrentSession();
         }),
         // 监听会话删除事件（确保主窗口状态同步）
         listen<string>("session-deleted", (event) => {
