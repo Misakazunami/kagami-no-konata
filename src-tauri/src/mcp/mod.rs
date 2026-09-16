@@ -60,18 +60,39 @@ pub fn connect_configured(app_config: &Arc<Mutex<AppConfig>>) -> Vec<Arc<dyn Too
         Ok(config) => config.tools.mcp.servers.clone(),
         Err(poisoned) => poisoned.into_inner().tools.mcp.servers.clone(),
     };
+    let targets: Vec<McpServerConfig> = servers
+        .into_iter()
+        .filter(|server| server.enabled && server.trusted)
+        .collect();
+
+    // **并发**启动：每个服务器最坏等两个 5 秒握手（initialize + tools/list），
+    // 串行连接时 N 个无响应的服务器会把启动拖成 N×10 秒（真实可感知的
+    // "应用打不开"）；并发后总耗时约等于最慢的那一个。
+    let results: Vec<(String, Result<ConnectedServer>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|server| scope.spawn(|| (server.id.clone(), connect_server(server))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_else(|_| {
+                ("unknown".to_string(), Err(anyhow::anyhow!("MCP 连接线程 panic")))
+            }))
+            .collect()
+    });
+
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    for server in servers.iter().filter(|s| s.enabled && s.trusted) {
-        match connect_server(server) {
+    for (server_id, result) in results {
+        match result {
             Ok(connected) => {
                 eprintln!(
                     "[mcp] 服务器「{}」已连接，注册 {} 个工具",
-                    server.id,
+                    server_id,
                     connected.tools.len()
                 );
                 tools.extend(bridge_tools(connected, app_config.clone()));
             }
-            Err(e) => eprintln!("[mcp] 服务器「{}」连接失败（已跳过）：{}", server.id, e),
+            Err(e) => eprintln!("[mcp] 服务器「{}」连接失败（已跳过）：{}", server_id, e),
         }
     }
     tools
@@ -349,10 +370,17 @@ rl.on("line", (line) => {
   }
   if (msg.method === "notifications/initialized") return;
   if (msg.method === "tools/list") {
-    send({ jsonrpc: "2.0", id: msg.id, result: { tools: [
-      { name: "echo", description: "回显输入", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } },
-      { name: "boom", description: "总是失败", inputSchema: { type: "object", properties: {} } }
-    ]}});
+    // 分两页返回：第 1 页带 nextCursor，第 2 页收尾（覆盖分页逻辑）
+    const cursor = msg.params && msg.params.cursor;
+    if (cursor) {
+      send({ jsonrpc: "2.0", id: msg.id, result: { tools: [
+        { name: "boom", description: "总是失败", inputSchema: { type: "object", properties: {} } }
+      ]}});
+    } else {
+      send({ jsonrpc: "2.0", id: msg.id, result: { tools: [
+        { name: "echo", description: "回显输入", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } }
+      ], nextCursor: "page-2" }});
+    }
     return;
   }
   if (msg.method === "tools/call") {

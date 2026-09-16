@@ -14,6 +14,8 @@ use super::args;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// 回灌给模型的正文上限
 const MAX_TEXT_CHARS: usize = 12_000;
+/// `web_fetch` 手动跟随重定向的最大跳数
+const MAX_REDIRECTS: usize = 3;
 
 /// 禁止打开的可执行/脚本扩展名（调起系统程序等于执行代码）
 const BLOCKED_EXTENSIONS: &[&str] = &[
@@ -29,10 +31,43 @@ fn http_client() -> &'static reqwest::Client {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .user_agent("KonataMirror/0.1 (+tool-harness)")
-            .redirect(reqwest::redirect::Policy::limited(3))
+            // **不自动跟随重定向**：自动跟随会绕过域名白名单与"禁止本机/内网"
+            // 检查（允许域名 302 到 127.0.0.1 就是一条 SSRF 通道）。
+            // web_fetch 逐跳手动跟随并重新校验；检索 API 不需要重定向。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build http client")
     })
+}
+
+/// 校验一个 URL 是否可以访问：http(s) + 域名白名单 + 拒绝本机/裸 IP
+///
+/// `web_fetch` 的初始 URL 与**每一跳重定向**都要过这里。
+fn ensure_host_allowed(url: &reqwest::Url, domains: &[String]) -> Result<String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("只支持 http/https 链接");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("链接缺少域名"))?
+        .to_ascii_lowercase();
+
+    if domains.is_empty() {
+        anyhow::bail!(
+            "联网工具尚未启用：请在「设置 → 工具」中添加允许访问的域名（当前白名单为空）"
+        );
+    }
+    let allowed = domains.iter().any(|domain| {
+        let domain = domain.trim().to_ascii_lowercase();
+        host == domain || host.ends_with(&format!(".{}", domain))
+    });
+    if !allowed {
+        anyhow::bail!("域名 {} 不在允许清单中。允许的域名：{}", host, domains.join("、"));
+    }
+    if host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
+        anyhow::bail!("不允许访问本机地址或裸 IP");
+    }
+    Ok(host)
 }
 
 /// 抓取网页并转成纯文本
@@ -63,36 +98,34 @@ impl Tool for WebFetch {
 
         let parsed = reqwest::Url::parse(&url)
             .map_err(|e| anyhow::anyhow!("链接不合法：{}", e))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            anyhow::bail!("只支持 http/https 链接");
-        }
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("链接缺少域名"))?
-            .to_ascii_lowercase();
-
-        if cx.services.web_domains.is_empty() {
-            anyhow::bail!(
-                "联网工具尚未启用：请在「设置 → 工具」中添加允许访问的域名（当前白名单为空）"
-            );
-        }
-        let allowed = cx.services.web_domains.iter().any(|domain| {
-            let domain = domain.trim().to_ascii_lowercase();
-            host == domain || host.ends_with(&format!(".{}", domain))
-        });
-        if !allowed {
-            anyhow::bail!(
-                "域名 {} 不在允许清单中。允许的域名：{}",
-                host,
-                cx.services.web_domains.join("、")
-            );
-        }
-        if host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
-            anyhow::bail!("不允许访问本机地址或裸 IP");
-        }
+        // 初始 URL 先校验一次；后续每一跳重定向再各自校验（见循环）
+        ensure_host_allowed(&parsed, &cx.services.web_domains)?;
 
         cx.ensure_not_cancelled()?;
-        let response = http_client().get(parsed).send().await?;
+        // 手动逐跳跟随重定向：每一跳都重新过白名单与"非本机/裸 IP"检查，
+        // 否则允许域名可以 302 到内网地址（SSRF）
+        let mut current = parsed;
+        let mut redirects = 0usize;
+        let response = loop {
+            let response = http_client().get(current.clone()).send().await?;
+            if !response.status().is_redirection() {
+                break response;
+            }
+            if redirects >= MAX_REDIRECTS {
+                anyhow::bail!("重定向次数过多（超过 {} 次）", MAX_REDIRECTS);
+            }
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                break response;
+            };
+            let location = location
+                .to_str()
+                .map_err(|_| anyhow::anyhow!("重定向地址不是合法文本"))?;
+            current = current
+                .join(location)
+                .map_err(|e| anyhow::anyhow!("重定向地址不合法：{}", e))?;
+            ensure_host_allowed(&current, &cx.services.web_domains)?;
+            redirects += 1;
+        };
         let status = response.status();
         if !status.is_success() {
             anyhow::bail!("抓取失败：HTTP {}", status);
@@ -162,17 +195,8 @@ impl Tool for OpenWithSystem {
         let full = if target.starts_with("http://") || target.starts_with("https://") {
             let parsed = reqwest::Url::parse(&target)
                 .map_err(|e| anyhow::anyhow!("链接不合法：{}", e))?;
-            let host = parsed
-                .host_str()
-                .ok_or_else(|| anyhow::anyhow!("链接缺少域名"))?
-                .to_ascii_lowercase();
-            let allowed = cx.services.web_domains.iter().any(|domain| {
-                let domain = domain.trim().to_ascii_lowercase();
-                host == domain || host.ends_with(&format!(".{}", domain))
-            });
-            if !allowed {
-                anyhow::bail!("域名 {} 不在允许清单中", host);
-            }
+            // 与 web_fetch 同一套校验：白名单 + 拒绝本机/裸 IP
+            ensure_host_allowed(&parsed, &cx.services.web_domains)?;
             target.clone()
         } else {
             let resolved = cx.services.workspaces.resolve_existing(&target).map_err(anyhow::Error::msg)?;
@@ -380,6 +404,19 @@ mod tests {
         let cx = fx.ctx();
         assert!(block_on(WebFetch.call(json!({"url": "file:///etc/passwd"}), &cx)).is_err());
         assert!(block_on(WebFetch.call(json!({"url": "http://127.0.0.1:8080/"}), &cx)).is_err());
+    }
+
+    /// 重定向的每一跳都要重新校验（允许域名 → 内网是经典 SSRF）
+    #[test]
+    fn redirect_targets_are_revalidated() {
+        let domains = vec!["example.com".to_string()];
+        let allow = |url: &str| ensure_host_allowed(&reqwest::Url::parse(url).unwrap(), &domains);
+        assert!(allow("https://example.com/a").is_ok());
+        assert!(allow("https://a.example.com/x").is_ok());
+        assert!(allow("http://127.0.0.1/x").is_err(), "重定向到本机必须被拒");
+        assert!(allow("http://[::1]/x").is_err(), "IPv6 回环同样拒绝");
+        assert!(allow("https://evil.test/x").is_err(), "白名单外域名必须被拒");
+        assert!(allow("file:///etc/passwd").is_err(), "非 http(s) 必须被拒");
     }
 
     #[test]

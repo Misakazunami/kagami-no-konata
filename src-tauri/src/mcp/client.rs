@@ -15,7 +15,7 @@
 //! （复用 `command_guard::sanitized_env` 的白名单，应用自己的密钥不会泄漏）。
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -30,6 +30,8 @@ use crate::config::types::McpServerConfig;
 const PROTOCOL_VERSION: &str = "2024-11-05";
 /// 单条响应的体积上限（防止一个恶意服务器把内存打满）
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// `tools/list` 最多翻多少页（防分页服务器无限循环）
+const MAX_TOOL_PAGES: usize = 10;
 /// 握手/列工具的超时（发生在启动路径上，必须短）
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -53,21 +55,34 @@ pub struct McpCallResult {
 pub struct McpClient {
     server_id: String,
     child: Child,
-    stdin: ChildStdin,
-    /// 读线程把子进程输出的每一行送进来（带超时地等它）
-    lines: Receiver<String>,
+    /// 写线程入口：`stdin` 被移进线程，`write_all` 卡在满管道时不会把调用方
+    /// 永远钉死在 `Mutex<McpClient>` 上（调用方超时后会 kill 子进程，
+    /// 阻塞中的写随之获得 EPIPE 而退出）
+    writes: mpsc::Sender<Vec<u8>>,
+    writer: Option<JoinHandle<()>>,
+    /// 读线程把子进程输出的每一行送进来（带超时地等它）；
+    /// `Err` 表示这一行非法/超限（例如超过 1 MB），由调用方原样上报
+    lines: Receiver<std::result::Result<String, String>>,
     reader: Option<JoinHandle<()>>,
     next_id: u64,
 }
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        // 进程由我们自己管：客户端没了就把服务器收掉，别留孤儿进程
+        // 进程由我们自己管：客户端没了就把服务器收掉，别留孤儿进程。
+        // kill 之后管道两端关闭：写线程从阻塞的 write_all 返回并因 Sender
+        // 随后被释放而退出，读线程拿到 EOF。
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // **绝不 join 这两个线程**：
+        // - 读线程可能因孙进程（npx/uvx 包一层）仍持有 stdout 而永远等不到 EOF；
+        // - 写线程要等 Sender 释放才结束，而 Drop 执行时字段尚未释放，join 必死锁。
+        // 二者都 detach 掉：进程退出不会等它们。
         if let Some(reader) = self.reader.take() {
-            // 读线程会因为管道关闭而自然结束，不强求 join 成功
-            let _ = reader.join();
+            drop(reader);
+        }
+        if let Some(writer) = self.writer.take() {
+            drop(writer);
         }
     }
 }
@@ -102,17 +117,37 @@ impl McpClient {
         let stdin = child.stdin.take().context("MCP 服务器没有 stdin")?;
         let stdout = child.stdout.take().context("MCP 服务器没有 stdout")?;
 
-        let (sender, lines) = mpsc::channel::<String>();
+        // 写线程：调用方只往 channel 里投递，永不阻塞在满管道上
+        let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>();
+        let writer = std::thread::spawn(move || {
+            let mut stdin = stdin;
+            for payload in write_rx {
+                if stdin
+                    .write_all(&payload)
+                    .and_then(|_| stdin.flush())
+                    .is_err()
+                {
+                    break; // 子进程已退出/管道已断
+                }
+            }
+        });
+
+        let (sender, lines) = mpsc::channel::<std::result::Result<String, String>>();
         let reader = std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        if sender.send(line).is_err() {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match read_bounded_line(&mut reader, MAX_RESPONSE_BYTES) {
+                    Ok(Some(line)) => {
+                        if sender.send(Ok(line)).is_err() {
                             break; // 客户端已销毁
                         }
                     }
-                    Err(_) => break,
+                    Ok(None) => break, // 对端关闭
+                    Err(e) => {
+                        // 超限/IO 错误：如实上报给等待中的请求，然后收手
+                        let _ = sender.send(Err(e.to_string()));
+                        break;
+                    }
                 }
             }
         });
@@ -120,7 +155,8 @@ impl McpClient {
         let mut client = Self {
             server_id: cfg.id.clone(),
             child,
-            stdin,
+            writes: write_tx,
+            writer: Some(writer),
             lines,
             reader: Some(reader),
             next_id: 1,
@@ -143,22 +179,37 @@ impl McpClient {
         Ok(client)
     }
 
-    /// 列出服务器提供的工具
+    /// 列出服务器提供的工具（自动翻页，直到没有 `nextCursor`）
     pub fn list_tools(&mut self) -> Result<Vec<McpToolInfo>> {
-        let result = self.request("tools/list", json!({}), HANDSHAKE_TIMEOUT)?;
-        let tools = result
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut out = Vec::with_capacity(tools.len());
-        for tool in tools {
-            match serde_json::from_value::<McpToolInfo>(tool) {
-                Ok(info) if !info.name.is_empty() => out.push(info),
-                Ok(_) => eprintln!("[mcp] 忽略没有名字的工具（服务器 {}）", self.server_id),
-                Err(e) => {
-                    eprintln!("[mcp] 忽略无法解析的工具声明（服务器 {}）：{}", self.server_id, e)
+        let mut out: Vec<McpToolInfo> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_PAGES {
+            let params = match &cursor {
+                Some(cursor) => json!({"cursor": cursor}),
+                None => json!({}),
+            };
+            let result = self.request("tools/list", params, HANDSHAKE_TIMEOUT)?;
+            let tools = result
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for tool in tools {
+                match serde_json::from_value::<McpToolInfo>(tool) {
+                    Ok(info) if !info.name.is_empty() => out.push(info),
+                    Ok(_) => eprintln!("[mcp] 忽略没有名字的工具（服务器 {}）", self.server_id),
+                    Err(e) => {
+                        eprintln!("[mcp] 忽略无法解析的工具声明（服务器 {}）：{}", self.server_id, e)
+                    }
                 }
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .filter(|cursor| !cursor.is_empty())
+                .map(|cursor| cursor.to_string());
+            if cursor.is_none() {
+                break;
             }
         }
         Ok(out)
@@ -229,7 +280,12 @@ impl McpClient {
                 );
             }
             let line = match self.lines.recv_timeout(remaining) {
-                Ok(line) => line,
+                Ok(Ok(line)) => line,
+                Ok(Err(message)) => anyhow::bail!(
+                    "MCP 服务器「{}」输出异常：{}",
+                    self.server_id,
+                    message
+                ),
                 Err(RecvTimeoutError::Timeout) => anyhow::bail!(
                     "MCP 服务器「{}」在 {} 秒内没有响应 {}",
                     self.server_id,
@@ -283,12 +339,89 @@ impl McpClient {
     fn send(&mut self, payload: &Value) -> Result<()> {
         let mut line = serde_json::to_vec(payload)?;
         line.push(b'\n');
-        self.stdin
-            .write_all(&line)
-            .with_context(|| format!("向 MCP 服务器「{}」写入失败", self.server_id))?;
-        self.stdin
-            .flush()
-            .with_context(|| format!("刷新 MCP 服务器「{}」输入失败", self.server_id))?;
-        Ok(())
+        // 投递给写线程即返回：即使子进程不读 stdin、管道已满，也不会在这里
+        // 永久阻塞（调用方的超时因此始终有效）
+        self.writes.send(line).map_err(|_| {
+            anyhow::anyhow!("向 MCP 服务器「{}」写入失败（写线程已退出）", self.server_id)
+        })
+    }
+}
+
+/// 有上限的按行读取（一次只保留一条线，超限立即报错）
+///
+/// `BufRead::lines` 会把整行（可能几百 MB）完整读进内存后才交给调用方，
+/// 单条响应上限形同虚设；这里边读边计数，超过 `max` 立刻失败。
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
+            buf.extend_from_slice(&available[..position]);
+            reader.consume(position + 1);
+            break;
+        }
+        buf.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+        if buf.len() > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("单条响应超过 {} KB", max / 1024),
+            ));
+        }
+    }
+    if buf.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("单条响应超过 {} KB", max / 1024),
+        ));
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn bounded_line_reader_splits_and_strips_crlf() {
+        let data: &[u8] = b"line one\r\nline two\nlast";
+        let mut reader = BufReader::new(Cursor::new(data));
+        assert_eq!(
+            read_bounded_line(&mut reader, 1024).unwrap().as_deref(),
+            Some("line one")
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, 1024).unwrap().as_deref(),
+            Some("line two")
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, 1024).unwrap().as_deref(),
+            Some("last")
+        );
+        assert_eq!(read_bounded_line(&mut reader, 1024).unwrap(), None);
+    }
+
+    /// 单条超限必须在**读满之前**失败，而不是先把整行分配出来再检查
+    #[test]
+    fn bounded_line_reader_rejects_oversized_lines() {
+        let mut data = vec![b'x'; MAX_RESPONSE_BYTES + 100];
+        data.push(b'\n');
+        let mut reader = BufReader::new(Cursor::new(data));
+        let err = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

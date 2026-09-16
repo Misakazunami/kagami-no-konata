@@ -278,10 +278,16 @@ fn inherit_plan(provider: &LlmProvider, thinking: Option<bool>, degraded: bool) 
 fn resolve_auto(cfg: &AppConfig, thinking: Option<bool>, task_mode: &str) -> ModelPlan {
     let settings = &cfg.models;
 
-    // 子模型池：逐个解析，悬空的单独丢掉（其余的仍然可用）
+    // 子模型池：逐个解析，悬空/缺 model id 的单独丢掉（其余的仍然可用）
     let mut subs: Vec<LlmProvider> = Vec::new();
     let mut degraded = false;
     for sub in settings.subs.iter().take(MAX_SUB_MODELS) {
+        if sub.model.trim().is_empty() {
+            // 空 model id 会发出 `"model": ""` 的请求并 400：视同悬空降级
+            eprintln!("[models] 子模型 {} 缺少 model id，已跳过", sub.label());
+            degraded = true;
+            continue;
+        }
         match provider_by_id(cfg, &sub.provider_id) {
             Some(provider) => subs.push(with_model(provider, &sub.model)),
             None => {
@@ -294,19 +300,30 @@ fn resolve_auto(cfg: &AppConfig, thinking: Option<bool>, task_mode: &str) -> Mod
         }
     }
 
-    // 主模型：配置缺失或悬空 → 全局活跃提供商
+    // 主模型：配置缺失、悬空或缺 model id → 全局活跃提供商
     let main = match settings.main.as_ref() {
-        Some(reference) => match provider_by_id(cfg, &reference.provider_id) {
-            Some(provider) => with_model(provider, &reference.model),
-            None => {
+        Some(reference) => {
+            if reference.model.trim().is_empty() {
                 eprintln!(
-                    "[models] 主模型 {} 引用的提供商不存在，已回退全局提供商",
+                    "[models] 主模型 {} 缺少 model id，已回退全局提供商",
                     reference.label()
                 );
                 degraded = true;
                 cfg.llm.active_provider().clone()
+            } else {
+                match provider_by_id(cfg, &reference.provider_id) {
+                    Some(provider) => with_model(provider, &reference.model),
+                    None => {
+                        eprintln!(
+                            "[models] 主模型 {} 引用的提供商不存在，已回退全局提供商",
+                            reference.label()
+                        );
+                        degraded = true;
+                        cfg.llm.active_provider().clone()
+                    }
+                }
             }
-        },
+        }
         None => cfg.llm.active_provider().clone(),
     };
 
@@ -461,6 +478,27 @@ mod tests {
         assert_eq!(plan.main_provider().model, "b-fast");
         assert!(plan.degraded());
         let _ = a_id;
+    }
+
+    /// 空 model id 不得进入请求（会发出 `"model": ""` 并 400），按悬空降级
+    #[test]
+    fn empty_model_ids_degrade_instead_of_being_sent() {
+        let (mut cfg, a_id, b_id) = auto_config();
+        cfg.models.main = Some(ModelRef::new(a_id.clone(), "   "));
+        cfg.models.subs = vec![
+            ModelRef::new(b_id, ""),
+            ModelRef::new(a_id, "a-fast"),
+        ];
+
+        let plan = resolve(&cfg, Some(&SessionModelPref::auto()), "task", "work");
+        assert_eq!(
+            plan.main_provider().model,
+            "a-model",
+            "主模型缺 id 必须回退活跃提供商而不是发空 model"
+        );
+        assert_eq!(plan.sub_providers().len(), 1);
+        assert_eq!(plan.sub_providers()[0].model, "a-fast");
+        assert!(plan.degraded());
     }
 
     /// 深度思考开关按模型能力过滤：不支持的模型**不发** enable_thinking

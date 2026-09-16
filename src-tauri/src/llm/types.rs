@@ -169,8 +169,12 @@ pub struct ChatChoice {
 }
 
 /// 流式响应 chunk
+///
+/// `choices` 允许缺省：部分提供商的 usage/保活帧只有 `usage` 字段，
+/// 缺省值让它们走"忽略"而不是被当成解析错误刷日志。
 #[derive(Debug, Deserialize)]
 pub struct ChatChunk {
+    #[serde(default)]
     pub choices: Vec<ChatChunkChoice>,
 }
 

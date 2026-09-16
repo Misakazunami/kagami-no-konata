@@ -184,9 +184,9 @@ impl OpenAiClient {
                         return None;
                     }
 
-                    // 4. 在字节缓冲中查找完整事件分隔符 \n\n
-                    if let Some(pos) = find_event_separator(&state.buffer) {
-                        let event_bytes: Vec<u8> = state.buffer.drain(..pos + 2).collect();
+                    // 4. 在字节缓冲中查找完整事件分隔符（LF 或 CRLF）
+                    if let Some(end) = find_event_separator(&state.buffer) {
+                        let event_bytes: Vec<u8> = state.buffer.drain(..end).collect();
                         // 只解码完整事件，多字节字符不会在分隔符处被切断
                         let event = String::from_utf8_lossy(&event_bytes);
                         state.handle_event(&event);
@@ -257,9 +257,23 @@ impl SseState {
     }
 }
 
-/// 在字节缓冲中查找 `\n\n` 分隔符
+/// 在字节缓冲中查找事件结束位置（返回值可直接用于 `drain(..end)`）
+///
+/// SSE 规范允许 `\n` 与 `\r\n` 两种行结束符。只认 `\n\n` 的话，使用 CRLF 的
+/// 网关（大量 Java 服务/代理）永远凑不出"完整事件"，整个响应会被缓冲到
+/// 连接关闭才解析——界面全程没有流式输出，长回复还会退化成 O(n²) 扫描。
 fn find_event_separator(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|pos| pos + 2);
+    let crlf = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 /// 解析一个完整 SSE 事件（可能包含多行 data:）
@@ -295,6 +309,15 @@ fn parse_sse_event(
 
         match serde_json::from_str::<ChatChunk>(data) {
             Ok(chunk) => {
+                if chunk.choices.is_empty() {
+                    // 空 choices 的帧有两类：usage/保活统计（忽略），以及
+                    // `{"error":{...}}` 这类会被 `#[serde(default)]` 解析成空
+                    // choices 的错误载荷（必须上报，否则真错误被静默吞掉）
+                    if let Some(message) = extract_stream_error(data) {
+                        return Err(anyhow!("LLM 流式响应报错：{}", message));
+                    }
+                    continue;
+                }
                 if let Some(choice) = chunk.choices.first() {
                     // 优先处理 reasoning_content（结构化思考字段）
                     if let Some(reasoning) = &choice.delta.reasoning_content {
@@ -348,6 +371,11 @@ fn parse_sse_event(
 fn extract_stream_error(data: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(data).ok()?;
     let error = value.get("error")?;
+    // `{"error":null}` / `{"error":{}}` 是网关的占位/统计帧，不是真错误；
+    // 当成错误会把健康的流当场打断（真实缺陷：用户看到"提供商未给出原因"）
+    if error.is_null() || error.as_object().is_some_and(|object| object.is_empty()) {
+        return None;
+    }
     let message = error
         .get("message")
         .and_then(|m| m.as_str())
@@ -474,6 +502,28 @@ mod tests {
 
         // 普通噪声载荷不报错，只是被忽略
         assert!(parse_one(r#"{"noise":true}"#).is_ok());
+        // 网关的占位帧（error 为 null / 空对象）不能当成错误打断健康的流
+        assert!(parse_one(r#"{"error":null}"#).is_ok());
+        assert!(parse_one(r#"{"error":{}}"#).is_ok());
+        // 只有带内容的 error 才是真错误
+        assert!(parse_one(r#"{"error":{"code":500,"message":"boom"}}"#).is_err());
+    }
+
+    /// CRLF 分隔符必须被识别，否则整个响应要等到连接关闭才会解析
+    #[test]
+    fn crlf_event_separators_are_recognized() {
+        let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n";
+        let end = find_event_separator(event).expect("CRLF 分隔符必须被识别");
+        assert_eq!(end, event.len());
+        let text = String::from_utf8_lossy(&event[..end]);
+        let mut think_state = 0u8;
+        let mut pending: VecDeque<StreamChunk> = VecDeque::new();
+        parse_sse_event(&text, &mut think_state, &mut pending).unwrap();
+        assert!(matches!(pending.front(), Some(StreamChunk::Content(t)) if t == "hi"));
+
+        // 混用分隔符时取最早结束的那个事件
+        let mixed = b"data: a\n\ndata: b\r\n\r\n";
+        assert_eq!(find_event_separator(mixed), Some(9));
     }
 
     /// `finish_reason` 必须带上去：`length` 意味着输出被 max_tokens 截断

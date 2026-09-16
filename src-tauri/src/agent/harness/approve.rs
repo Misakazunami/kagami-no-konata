@@ -61,6 +61,23 @@ impl TauriApprover {
     }
 }
 
+/// 审批表条目的 RAII 守卫
+///
+/// `request` 的 future 可能被直接 drop（任务中止、runtime 关闭）：那样
+/// "插入"与"移除"之间不会有任何代码执行，条目与 oneshot sender 会永久残留。
+/// 守卫保证无论正常返回、超时还是 future 被丢弃，表项都会被清掉。
+struct PendingGuard {
+    map: ApprovalMap,
+    id: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&self.id);
+    }
+}
+
 #[async_trait::async_trait]
 impl Approver for TauriApprover {
     async fn request(&self, req: ApprovalRequest) -> ToolDecision {
@@ -81,6 +98,11 @@ impl Approver for TauriApprover {
                 },
             );
         }
+        // 从这里开始，任何退出路径（含 future 被 drop）都会清理表项
+        let _guard = PendingGuard {
+            map: self.pending.clone(),
+            id: approval_id.clone(),
+        };
 
         let expires_at = chrono::Local::now()
             + chrono::Duration::from_std(req.timeout)
@@ -114,10 +136,7 @@ impl Approver for TauriApprover {
             Err(_) => ToolDecision::Deny,
         };
 
-        {
-            let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            map.remove(&approval_id);
-        }
+        // 表项由 `_guard` 的 Drop 统一移除（这里不再手写 remove）
 
         let _ = self.app.emit_to(
             target,
@@ -171,5 +190,30 @@ mod tests {
 
         // 清理不存在的 stream 是安全的空操作
         assert_eq!(cancel_pending_for_stream(&map, "nope"), 0);
+    }
+
+    /// future 被 drop 时表项也必须被回收（守卫兜底）
+    #[test]
+    fn pending_guard_removes_entry_on_drop() {
+        let map = new_approval_map();
+        let (tx, _rx) = oneshot::channel();
+        map.lock().unwrap().insert(
+            "a1".to_string(),
+            PendingApproval {
+                session_id: "s1".to_string(),
+                stream_id: "stream-1".to_string(),
+                tool: "write_file".to_string(),
+                sender: tx,
+            },
+        );
+
+        {
+            let _guard = PendingGuard {
+                map: map.clone(),
+                id: "a1".to_string(),
+            };
+            assert_eq!(map.lock().unwrap().len(), 1);
+        }
+        assert!(map.lock().unwrap().is_empty(), "守卫离开作用域必须清掉表项");
     }
 }
