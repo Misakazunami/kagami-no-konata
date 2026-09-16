@@ -147,7 +147,15 @@ impl Tool for EditFile {
         if super::fs_read::is_binary(&bytes) {
             anyhow::bail!("{} 是二进制文件，无法编辑", target.display());
         }
-        let text = String::from_utf8_lossy(&bytes).to_string();
+        // 必须**严格**按 UTF-8 解码：`from_utf8_lossy` 会把 GBK/Latin-1 等编码里的
+        // 非法字节替换成 U+FFFD，随后整体写回会把整个文件永久写成乱码
+        // （中文 Windows 上 GBK 的 .txt/.csv/.c 很常见）。
+        let text = String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "{} 不是 UTF-8 编码（可能是 GBK/GB18030 等）。为避免写坏文件已拒绝编辑，请先转换为 UTF-8",
+                target.display()
+            )
+        })?;
 
         let count = text.matches(&old_string).count();
         if count == 0 {
@@ -382,6 +390,24 @@ mod tests {
             std::fs::read_to_string(fx.dir.join("note.md")).unwrap(),
             "第一行\n第二行\n第二行\n"
         );
+    }
+
+    #[test]
+    fn edit_file_refuses_non_utf8_instead_of_corrupting() {
+        let fx = Fixture::new("gbk", true);
+        // GBK 编码的「测试」：合法文本但不是合法 UTF-8
+        let gbk = vec![0xB2u8, 0xE2, 0xCA, 0xD4, b'\n'];
+        std::fs::write(fx.dir.join("gbk.txt"), &gbk).unwrap();
+
+        let cx = fx.ctx();
+        let err = block_on(EditFile.call(
+            json!({"path": "gbk.txt", "old_string": "x", "new_string": "y"}),
+            &cx,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+        // 关键：文件必须一个字节都没动，而不是被 U+FFFD 替换后写回
+        assert_eq!(std::fs::read(fx.dir.join("gbk.txt")).unwrap(), gbk);
     }
 
     #[test]

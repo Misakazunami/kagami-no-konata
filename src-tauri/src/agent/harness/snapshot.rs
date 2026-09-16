@@ -12,6 +12,7 @@
 //!   绝不静默假装备份成功；
 //! - 备份是按 stream 分目录的，`prune` 按天数回收磁盘。
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -132,14 +133,31 @@ impl SnapshotStore {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        let used: u64 = match store.list_snapshots(stream_id) {
-            Ok(rows) => rows.iter().map(|row| row.bytes.max(0) as u64).sum(),
+        // 同一个文件在本次生成里只需要备份**最早**的那一份：
+        // 回滚的目标是"生成开始前的状态"，而后续备份记录的是中间版本。
+        // 不去重的话，回滚按时间顺序重放会把文件停在中间版本；
+        // 重复备份也纯属浪费磁盘（每个 stream 有 64 MB 上限）。
+        let rows = match store.list_snapshots(stream_id) {
+            Ok(rows) => rows,
             Err(e) => {
                 return Capture::Skipped {
                     reason: format!("读取已有备份失败：{}", e),
                 }
             }
         };
+        let dir = self.stream_dir(stream_id);
+        let rel_str = rel.to_string_lossy();
+        let already_backed_up = rows.iter().any(|row| {
+            row.root_id == root_id
+                && row.rel_path == rel_str
+                // 备份文件已被外部清理时不算数，否则会留下"看似可回滚、实际 missing"的记录
+                && dir.join(&row.backup_name).is_file()
+        });
+        if already_backed_up {
+            return Capture::Captured { bytes: 0 };
+        }
+
+        let used: u64 = rows.iter().map(|row| row.bytes.max(0) as u64).sum();
         if used + metadata.len() > MAX_TOTAL_BYTES {
             return Capture::Skipped {
                 reason: format!(
@@ -149,7 +167,6 @@ impl SnapshotStore {
             };
         }
 
-        let dir = self.stream_dir(stream_id);
         if let Err(e) = fs::create_dir_all(&dir) {
             return Capture::Skipped {
                 reason: format!("创建备份目录失败：{}", e),
@@ -195,10 +212,17 @@ impl SnapshotStore {
                 .list_snapshots(stream_id)
                 .unwrap_or_default(),
         };
+        // `files` 是"可回滚的文件数"：同一路径的重复备份只算一个文件
+        // （回滚只会应用最早的一份，重复计数会显示成"改动了 2 个文件"而实际只有 1 个）
+        let mut seen: HashSet<(&str, &str)> = HashSet::new();
+        let files = rows
+            .iter()
+            .filter(|row| seen.insert((row.root_id.as_str(), row.rel_path.as_str())))
+            .count();
         SnapshotInfo {
             session_id: session_id.to_string(),
             stream_id: stream_id.to_string(),
-            files: rows.len(),
+            files,
             bytes: rows.iter().map(|row| row.bytes.max(0) as u64).sum(),
         }
     }
@@ -224,7 +248,16 @@ impl SnapshotStore {
         };
 
         let mut report = RestoreReport::default();
+        // 同一路径只还原**最早**的一份备份：`list_snapshots` 按 created_at ASC，
+        // 首次出现即生成开始前的原始内容。旧版本可能留下同路径的重复记录
+        // （当时会在每次改动前都备份一次），这里做防御性去重——按时间顺序重放
+        // 重复记录会把文件停在中间版本，原始内容再也取不回。
+        let mut restored_paths: HashSet<(String, String)> = HashSet::new();
         for row in rows {
+            let key = (row.root_id.clone(), row.rel_path.clone());
+            if !restored_paths.insert(key) {
+                continue;
+            }
             let backup_path = self.stream_dir(stream_id).join(&row.backup_name);
             if !backup_path.is_file() {
                 report.missing += 1;
@@ -402,6 +435,73 @@ mod tests {
         assert_eq!(report.restored, 1, "{report:?}");
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "原始内容");
+    }
+
+    /// 同一文件连续两次改动：只保留最早一份备份，回滚必须回到生成开始前
+    ///
+    /// 修复前：每次改动前都备份，回滚按时间顺序重放 → 最终停在中间版本，
+    /// 原始内容再也取不回（`write_file` 后再 `edit_file` 的常见模式）。
+    #[test]
+    fn repeated_capture_keeps_the_earliest_backup() {
+        let fx = Fixture::new("repeat");
+        let (rel, abs) = fx.rel("note.txt");
+        std::fs::write(&abs, "v0").unwrap();
+
+        let first = fx
+            .snapshots
+            .capture(&fx.session_id, &fx.stream_id, "default", &rel, &abs);
+        assert!(first.is_captured(), "{first:?}");
+
+        std::fs::write(&abs, "v1").unwrap();
+        let second = fx
+            .snapshots
+            .capture(&fx.session_id, &fx.stream_id, "default", &rel, &abs);
+        assert!(second.is_captured(), "已有备份时仍应报告可回滚：{second:?}");
+
+        std::fs::write(&abs, "v2").unwrap();
+        let info = fx.snapshots.info(&fx.session_id, &fx.stream_id);
+        assert_eq!(info.files, 1, "同一路径不能被计成两个文件");
+
+        let report = fx.snapshots.restore(&fx.stream_id, &fx.workspaces);
+        assert_eq!(report.restored, 1, "{report:?}");
+        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "v0");
+    }
+
+    /// 旧版本留下的重复记录：回滚必须挑最早一条，而不是按时间顺序重放
+    #[test]
+    fn restore_of_legacy_duplicate_rows_prefers_the_earliest() {
+        let fx = Fixture::new("earliest");
+        let (rel, abs) = fx.rel("legacy.txt");
+        std::fs::write(&abs, "中间版本").unwrap();
+
+        let dir = fx.snapshots.stream_dir(&fx.stream_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("first.bak"), "原始版本").unwrap();
+        std::fs::write(dir.join("second.bak"), "中间版本").unwrap();
+        {
+            let store = fx.snapshots.store.lock().unwrap();
+            for (id, backup, at) in [
+                ("r1", "first.bak", "2026-01-01T00:00:00+00:00"),
+                ("r2", "second.bak", "2026-01-01T00:00:01+00:00"),
+            ] {
+                store
+                    .record_snapshot(&SnapshotRow {
+                        id: id.to_string(),
+                        session_id: fx.session_id.clone(),
+                        stream_id: fx.stream_id.clone(),
+                        root_id: "default".to_string(),
+                        rel_path: rel.to_string_lossy().to_string(),
+                        backup_name: backup.to_string(),
+                        bytes: 12,
+                        created_at: at.to_string(),
+                    })
+                    .unwrap();
+            }
+        }
+
+        let report = fx.snapshots.restore(&fx.stream_id, &fx.workspaces);
+        assert_eq!(report.restored, 1, "{report:?}");
+        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "原始版本");
     }
 
     #[test]
