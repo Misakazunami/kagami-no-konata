@@ -12,7 +12,7 @@
 
 pub mod client;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use crate::agent::harness::traits::{
     Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput, ToolStatus,
 };
-use crate::config::types::{McpConfig, McpServerConfig};
+use crate::config::types::{AppConfig, McpServerConfig};
 
 pub use client::{McpClient, McpToolInfo};
 
@@ -51,9 +51,17 @@ struct ConnectedServer {
 ///
 /// **阻塞函数**：调用点是应用启动路径（那时还没有常驻 runtime）。
 /// 连不上的服务器只记录日志：**一个外部进程起不来，绝不能拖垮应用启动**。
-pub fn connect_configured(config: &McpConfig) -> Vec<Arc<dyn Tool>> {
+///
+/// `app_config` 会被每个 [`McpTool`] 持有：权限与"是否仍然可信"在每次
+/// `descriptor()` / `enabled()` / `call()` 时实时读取，因此用户在设置里
+/// 取消信任、停用或删除服务器后**立即生效**，不需要重启应用。
+pub fn connect_configured(app_config: &Arc<Mutex<AppConfig>>) -> Vec<Arc<dyn Tool>> {
+    let servers: Vec<McpServerConfig> = match app_config.lock() {
+        Ok(config) => config.tools.mcp.servers.clone(),
+        Err(poisoned) => poisoned.into_inner().tools.mcp.servers.clone(),
+    };
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    for server in config.servers.iter().filter(|s| s.enabled && s.trusted) {
+    for server in servers.iter().filter(|s| s.enabled && s.trusted) {
         match connect_server(server) {
             Ok(connected) => {
                 eprintln!(
@@ -61,7 +69,7 @@ pub fn connect_configured(config: &McpConfig) -> Vec<Arc<dyn Tool>> {
                     server.id,
                     connected.tools.len()
                 );
-                tools.extend(bridge_tools(connected));
+                tools.extend(bridge_tools(connected, app_config.clone()));
             }
             Err(e) => eprintln!("[mcp] 服务器「{}」连接失败（已跳过）：{}", server.id, e),
         }
@@ -82,7 +90,10 @@ fn connect_server(server: &McpServerConfig) -> Result<ConnectedServer> {
 }
 
 /// 把服务器的工具映射成 harness 工具
-fn bridge_tools(connected: ConnectedServer) -> Vec<Arc<dyn Tool>> {
+fn bridge_tools(
+    connected: ConnectedServer,
+    app_config: Arc<Mutex<AppConfig>>,
+) -> Vec<Arc<dyn Tool>> {
     let ConnectedServer {
         client,
         tools,
@@ -97,6 +108,8 @@ fn bridge_tools(connected: ConnectedServer) -> Vec<Arc<dyn Tool>> {
                 client: client.clone(),
                 info,
                 permission,
+                app_config: app_config.clone(),
+                names: OnceLock::new(),
             }) as Arc<dyn Tool>
         })
         .collect()
@@ -156,13 +169,51 @@ pub struct McpTool {
     server_id: String,
     client: Arc<Mutex<McpClient>>,
     info: McpToolInfo,
+    /// 连接时映射的权限（仅作兜底；实时值以当前配置为准，见 [`Self::live_permission`]）
     permission: Permission,
+    /// 实时配置句柄：撤销信任/停用/改权限必须立刻生效，而不是等到重启
+    app_config: Arc<Mutex<AppConfig>>,
+    /// 注册表要求 `&'static str` 的名字与标签：只泄漏一次并缓存
+    /// （历史实现每次 `descriptor()` 都 `Box::leak`，长驻进程内存会单调增长）
+    names: OnceLock<(&'static str, &'static str)>,
 }
 
 impl McpTool {
     /// 暴露给模型的完整名字
     fn full_name(&self) -> String {
         format!("mcp:{}:{}", self.server_id, self.info.name)
+    }
+
+    /// 当前配置里这个服务器的条目（被删除/从未存在时为 `None`）
+    fn live_server(&self) -> Option<McpServerConfig> {
+        let config = match self.app_config.lock() {
+            Ok(config) => config,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        config
+            .tools
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.id == self.server_id)
+            .cloned()
+    }
+
+    /// 实时权限：用户把权限从 read 调到 write（或反过来）要立即反映到审批上
+    fn live_permission(&self) -> Permission {
+        self.live_server()
+            .map(|server| server.permission.to_permission())
+            .unwrap_or(self.permission)
+    }
+
+    fn descriptor_names(&self) -> (&'static str, &'static str) {
+        *self.names.get_or_init(|| {
+            let name: &'static str = Box::leak(self.full_name().into_boxed_str());
+            let label: &'static str = Box::leak(
+                format!("MCP · {} · {}", self.server_id, self.info.name).into_boxed_str(),
+            );
+            (name, label)
+        })
     }
 
     fn call_timeout(cx: &ToolCtx<'_>) -> Duration {
@@ -173,14 +224,15 @@ impl McpTool {
 
 #[async_trait::async_trait]
 impl Tool for McpTool {
+    fn enabled(&self) -> bool {
+        // 服务器被删除、停用或取消信任后，工具立即从可见/可调用集合中消失
+        self.live_server()
+            .map(|server| server.enabled && server.trusted)
+            .unwrap_or(false)
+    }
+
     fn descriptor(&self) -> ToolDescriptor {
-        // `ToolDescriptor.name` 是 `&'static str`（注册表按名字做静态索引）。
-        // 这些名字在进程生命周期内固定不变，因此这里故意泄漏 —— 一个服务器
-        // 的工具数量很小，泄漏量可以忽略；换来的是注册表无需引入动态键。
-        let name: &'static str = Box::leak(self.full_name().into_boxed_str());
-        let label: &'static str = Box::leak(
-            format!("MCP · {} · {}", self.server_id, self.info.name).into_boxed_str(),
-        );
+        let (name, label) = self.descriptor_names();
         let mut description = if self.info.description.trim().is_empty() {
             format!("来自 MCP 服务器「{}」的工具。", self.server_id)
         } else {
@@ -198,7 +250,7 @@ impl Tool for McpTool {
             json!({"type": "object", "properties": {}})
         };
 
-        ToolDescriptor::new(name, label, description, self.permission, parameters)
+        ToolDescriptor::new(name, label, description, self.live_permission(), parameters)
     }
 
     fn approval_summary(&self, _args: &Value, _cx: &ToolCtx<'_>) -> Option<String> {
@@ -206,12 +258,20 @@ impl Tool for McpTool {
             "将调用外部 MCP 服务器「{}」的工具「{}」\n（权限映射：{}，进程由你配置的启动命令拉起）",
             self.server_id,
             self.info.name,
-            self.permission.risk_label()
+            self.live_permission().risk_label()
         ))
     }
 
     async fn call(&self, args: Value, cx: &ToolCtx<'_>) -> Result<ToolOutput> {
         cx.ensure_not_cancelled()?;
+        // 防御性复查：从本轮生成开始到工具真正执行的间隙里，用户可能已经
+        // 撤销信任/停用/删除服务器。注册表与这里各挡一道，绝不"看起来关了还能跑"。
+        if !self.enabled() {
+            anyhow::bail!(
+                "MCP 服务器「{}」已被停用或取消信任，调用已拒绝",
+                self.server_id
+            );
+        }
         // 参数必须是对象：多数服务器按对象取字段，传数组/标量只会得到难懂的报错
         if !args.is_object() {
             anyhow::bail!("MCP 工具的参数必须是对象");
@@ -261,8 +321,15 @@ impl Tool for McpTool {
 mod tests {
     use super::*;
     use crate::agent::harness::traits::{DenyAllApprover, NullSink, ToolLimits};
-    use crate::config::types::{McpEnvVar, McpPermission};
+    use crate::config::types::{AppConfig, McpEnvVar, McpPermission};
     use std::io::Write;
+
+    /// 构造一个持有指定 MCP 服务器的实时配置句柄
+    fn config_with_servers(servers: Vec<McpServerConfig>) -> Arc<Mutex<AppConfig>> {
+        let mut config = AppConfig::default();
+        config.tools.mcp.servers = servers;
+        Arc::new(Mutex::new(config))
+    }
 
     /// 一个用 node 实现的假 MCP 服务器（node 是本仓库的构建依赖，必然存在）
     const FAKE_SERVER: &str = r#"
@@ -399,9 +466,7 @@ rl.on("line", (line) => {
         let services = test_services(&fx.dir);
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let tools = connect_configured(&McpConfig {
-            servers: vec![fx.config(McpPermission::Read)],
-        });
+        let tools = connect_configured(&config_with_servers(vec![fx.config(McpPermission::Read)]));
         assert_eq!(tools.len(), 2, "两个工具都应当被注册");
 
         let names: Vec<String> = tools.iter().map(|t| t.descriptor().name.to_string()).collect();
@@ -444,9 +509,7 @@ rl.on("line", (line) => {
             (McpPermission::Write, Permission::WriteFs),
             (McpPermission::Execute, Permission::Execute),
         ] {
-            let tools = connect_configured(&McpConfig {
-                servers: vec![fx.config(mapped)],
-            });
+            let tools = connect_configured(&config_with_servers(vec![fx.config(mapped)]));
             assert!(!tools.is_empty());
             assert_eq!(
                 tools[0].descriptor().permission,
@@ -466,11 +529,11 @@ rl.on("line", (line) => {
         let fx = FakeFixture::new("gate");
         let mut config = fx.config(McpPermission::Read);
         config.enabled = false;
-        assert!(connect_configured(&McpConfig { servers: vec![config.clone()] }).is_empty());
+        assert!(connect_configured(&config_with_servers(vec![config.clone()])).is_empty());
 
         config.enabled = true;
         config.trusted = false;
-        assert!(connect_configured(&McpConfig { servers: vec![config.clone()] }).is_empty());
+        assert!(connect_configured(&config_with_servers(vec![config.clone()])).is_empty());
 
         // probe 也要给出人能看懂的原因
         let status = block_on(probe(&config));
@@ -478,12 +541,66 @@ rl.on("line", (line) => {
         assert!(status.error.unwrap_or_default().contains("可信"));
     }
 
+    /// 运行中撤销信任/停用/改权限必须立即生效，而不是"看起来关了实际还能跑"
+    #[test]
+    fn revoking_or_downgrading_a_server_takes_effect_immediately() {
+        if !node_available() {
+            eprintln!("未安装 node，跳过 MCP 集成测试");
+            return;
+        }
+        let fx = FakeFixture::new("revoke");
+        let handle = config_with_servers(vec![fx.config(McpPermission::Read)]);
+        let tools = connect_configured(&handle);
+        let echo = tools
+            .iter()
+            .find(|t| t.descriptor().name == "mcp:fake:echo")
+            .expect("工具应当已注册")
+            .clone();
+        assert!(echo.enabled());
+
+        {
+            let mut config = handle.lock().unwrap();
+            config.tools.mcp.servers[0].trusted = false;
+        }
+        assert!(!echo.enabled(), "取消信任后必须立即不可用");
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t.enabled() && t.descriptor().name.starts_with("mcp:fake:")),
+            "所有来自该服务器的工具都必须消失"
+        );
+
+        {
+            let mut config = handle.lock().unwrap();
+            config.tools.mcp.servers[0].trusted = true;
+            config.tools.mcp.servers[0].permission = McpPermission::Write;
+        }
+        assert!(echo.enabled());
+        assert_eq!(
+            echo.descriptor().permission,
+            Permission::WriteFs,
+            "权限下调必须立即反映到审批映射上"
+        );
+
+        {
+            let mut config = handle.lock().unwrap();
+            config.tools.mcp.servers.clear();
+        }
+        assert!(!echo.enabled(), "服务器被删除后工具不能继续存在");
+
+        // 撤销后直接调用也必须被拒绝（防御性复查，不依赖注册表）
+        let services = test_services(&fx.dir);
+        let cx = ctx_with(&services, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let err = block_on(echo.call(json!({"text": "hi"}), &cx)).unwrap_err();
+        assert!(err.to_string().contains("停用或取消信任"), "{err}");
+    }
+
     #[test]
     fn broken_server_is_skipped_without_panicking() {
         let fx = FakeFixture::new("broken");
         let mut config = fx.config(McpPermission::Read);
         config.command = "/nonexistent/definitely-not-a-command".to_string();
-        let tools = connect_configured(&McpConfig { servers: vec![config.clone()] });
+        let tools = connect_configured(&config_with_servers(vec![config.clone()]));
         assert!(tools.is_empty(), "连不上就不能注册任何工具");
         let status = block_on(probe(&config));
         assert!(!status.connected);
@@ -498,9 +615,7 @@ rl.on("line", (line) => {
         }
         let fx = FakeFixture::new("summary");
         let services = test_services(&fx.dir);
-        let tools = connect_configured(&McpConfig {
-            servers: vec![fx.config(McpPermission::Write)],
-        });
+        let tools = connect_configured(&config_with_servers(vec![fx.config(McpPermission::Write)]));
         let tool = tools
             .iter()
             .find(|t| t.descriptor().name == "mcp:fake:echo")

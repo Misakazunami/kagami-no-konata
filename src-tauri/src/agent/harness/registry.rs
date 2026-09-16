@@ -80,7 +80,7 @@ impl ToolRegistry {
     pub fn visible(&self, mode: ToolMode) -> Vec<&Arc<dyn Tool>> {
         self.tools
             .iter()
-            .filter(|t| t.descriptor().permission.visible_in(mode))
+            .filter(|t| t.enabled() && t.descriptor().permission.visible_in(mode))
             .collect()
     }
 
@@ -116,7 +116,7 @@ impl ToolRegistry {
                     description: d.description.clone(),
                     permission: d.permission,
                     read_only: d.permission.is_read_only(),
-                    enabled: d.permission.visible_in(mode),
+                    enabled: tool.enabled() && d.permission.visible_in(mode),
                 }
             })
             .collect();
@@ -124,10 +124,10 @@ impl ToolRegistry {
         list
     }
 
-    /// 查找可调用的工具（同时执行模式可见性检查）
+    /// 查找可调用的工具（同时执行"工具可用"与"模式可见性"检查）
     pub fn find(&self, name: &str, mode: ToolMode) -> Option<Arc<dyn Tool>> {
         let tool = self.by_name.get(name)?;
-        if !tool.descriptor().permission.visible_in(mode) {
+        if !tool.enabled() || !tool.descriptor().permission.visible_in(mode) {
             return None;
         }
         Some(tool.clone())
@@ -237,5 +237,40 @@ mod tests {
     fn unknown_tool_is_not_found() {
         let reg = registry();
         assert!(reg.find("does_not_exist", ToolMode::Full).is_none());
+    }
+
+    /// 动态来源（MCP）可以在运行中被撤销：`enabled()` 为 false 的工具
+    /// 必须立刻从可见集合与可调用集合中消失
+    #[test]
+    fn disabled_tool_is_invisible_and_uncallable() {
+        struct Switchable {
+            on: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for Switchable {
+            fn descriptor(&self) -> ToolDescriptor {
+                ToolDescriptor::new(
+                    "switchable",
+                    "可撤销工具",
+                    "测试用",
+                    Permission::Read,
+                    json!({"type": "object", "properties": {}}),
+                )
+            }
+            fn enabled(&self) -> bool {
+                self.on
+            }
+            async fn call(&self, _args: Value, _cx: &ToolCtx<'_>) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        let reg = ToolRegistry::new(vec![Arc::new(Switchable { on: false })]);
+        assert!(reg.visible_names(ToolMode::Full).is_empty());
+        assert!(reg.visible(ToolMode::Full).is_empty());
+        assert!(reg.schemas(ToolMode::Full).is_empty());
+        assert!(reg.find("switchable", ToolMode::Full).is_none());
+        assert!(!reg.infos(ToolMode::Full)[0].enabled);
     }
 }

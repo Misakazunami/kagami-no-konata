@@ -426,6 +426,14 @@ impl Approver for AllowAllApprover {
 pub trait Tool: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
 
+    /// 工具当前是否可用（注册表据此从"可见/可调用"集合中剔除）
+    ///
+    /// 绝大多数工具是静态的，默认恒为 true；动态来源（MCP 服务器）需要覆写它，
+    /// 让用户在设置里取消信任/停用服务器后**立即**生效，而不是等到重启。
+    fn enabled(&self) -> bool {
+        true
+    }
+
     /// `args` 已由 runner 解析为 JSON 对象；工具内部仍需自行校验每个字段
     async fn call(&self, args: Value, cx: &ToolCtx<'_>) -> Result<ToolOutput>;
 

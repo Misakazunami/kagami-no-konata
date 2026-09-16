@@ -35,7 +35,9 @@ pub struct ActiveStream {
 
 /// 全局应用状态
 pub struct AppState {
-    pub config: Mutex<AppConfig>,
+    /// 用 `Arc` 共享：MCP 工具需要在每次调用前对照**实时配置**检查
+    /// 服务器是否仍被信任/启用（用户在设置里撤销信任必须立即生效）
+    pub config: Arc<Mutex<AppConfig>>,
     /// 共享 Agent 调度器（内部状态热更新，无需外层锁）
     pub dispatcher: Arc<AgentDispatcher>,
     /// 存储句柄用 `Arc` 包装：工具运行时需要在 `send_message` 的 async 流程里
@@ -162,14 +164,28 @@ pub fn run() {
             // 走阻塞实现（每次握手最多等 HANDSHAKE_TIMEOUT），因此不需要在这里
             // 造一个临时 runtime——子进程的管道也就不会跟着 runtime 一起失效。
             // 任何一台起不来都只影响它自己，不拖垮应用启动。
-            let mcp_tools = mcp::connect_configured(&app_config.tools.mcp);
+            //
+            // 配置句柄以 `Arc` 交给每个 McpTool：descriptor()/call() 每次都对照
+            // 实时配置，取消信任/停用/删除服务器立即生效（见 mcp::McpTool::enabled）。
+            // 工具总开关关闭时不再拉起任何外部进程。
+            let active_provider = app_config.llm.active_provider().clone();
+            let config_handle = Arc::new(Mutex::new(app_config));
+            let mcp_tools = if config_handle
+                .lock()
+                .map(|config| config.tools.enabled)
+                .unwrap_or(false)
+            {
+                mcp::connect_configured(&config_handle)
+            } else {
+                Vec::new()
+            };
             let tool_registry = Arc::new(builtin_registry().with_extra(mcp_tools));
-            let llm_proxy = LlmProxy::new(app_config.llm.active_provider());
+            let llm_proxy = LlmProxy::new(&active_provider);
             let chat_agent = ChatAgent::new(llm_proxy, personas.clone(), tool_registry);
             let dispatcher = Arc::new(AgentDispatcher::new(chat_agent));
 
             app.manage(AppState {
-                config: Mutex::new(app_config),
+                config: config_handle.clone(),
                 dispatcher,
                 chat_store: chat_store.clone(),
                 memory_store: Arc::new(Mutex::new(memory_store)),
