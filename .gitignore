@@ -44,8 +44,7 @@ lerna-debug.log*
 CLAUDE.local.md
 
 # 编辑器与操作系统
-.vscode/*
-!.vscode/extensions.json
+.vscode/
 .idea/
 .DS_Store
 Thumbs.db
