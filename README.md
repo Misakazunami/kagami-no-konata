@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="public/pet/default.png" width="140" alt="Konata_Mirror 桌面宠物" />
+  <img src="public/pet/default.png" width="140" alt="Kagami no Konata 桌面宠物" />
 </p>
 
-<h1 align="center">镜中此方 · Konata_Mirror</h1>
+<h1 align="center">Kagami no Konata（镜中此方）</h1>
 
 <p align="center">
   <a href="https://v2.tauri.app/"><img src="https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri&logoColor=white" alt="Tauri v2" /></a>
@@ -71,6 +71,14 @@ CLAUDE.md            面向 AI 辅助开发的仓库约定
 ## 🤝 参与贡献
 
 欢迎提交 Issue 与 Pull Request。提交前请确保 `cargo clippy`、`cargo test` 与 `pnpm build` 均通过。
+
+## 🎨 素材与第三方许可
+
+- **Live2D Cubism 运行时**（`public/live2dcubismcore.min.js`、`public/live2d.min.js`）：© Live2D Inc.，属于其许可协议中的 "Redistributable Code"，随本应用按 [Live2D Proprietary Software License Agreement](https://www.live2d.com/eula/live2d-proprietary-software-license-agreement_en.html) 分发。
+- **pixi.js**（`public/pixi.min.js`，v7.3.2）与 **pixi-live2d-display**（`public/cubism4.min.js`）：MIT License。
+- **角色与模型素材**（`public/live2d/konata/`、`public/pet/`）：仅供学习与个人使用，版权归原作者及权利人所有；如权利人提出要求，我们会立即移除相关内容。
+
+> 本项目是非官方粉丝作品，与《幸运星》版权方及 Live2D Inc. 均无关联。
 
 ## 📄 许可证
 

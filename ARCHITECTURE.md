@@ -1,4 +1,4 @@
-# Konata_Mirror（镜中此方）— 前期开发框架与技术栈方案
+# Kagami no Konata（镜中此方）— 前期开发框架与技术栈方案
 
 > 版本：v0.1-draft | 日期：2026-06-05
 
@@ -8,7 +8,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Konata_Mirror 桌面应用                        │
+│                     Kagami no Konata 桌面应用                        │
 │                                                                     │
 │  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────────┐ │
 │  │  ChatWindow   │   │ FloatWidget  │   │   Onboarding / Settings  │ │
@@ -729,7 +729,7 @@ fn build_context(messages: &[Message], max_tokens: usize) -> Vec<Message> {
 ## 六、项目目录结构建议
 
 ```
-Konata_Mirror/
+kagami-no-konata/
 ├── src-tauri/                 # Rust 后端
 │   ├── src/
 │   │   ├── main.rs           # 入口

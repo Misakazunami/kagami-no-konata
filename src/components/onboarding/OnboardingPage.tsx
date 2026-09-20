@@ -113,7 +113,7 @@ export function OnboardingPage() {
         {step === 0 && (
           <div className="onboarding-step">
             <div className="onboarding-icon">✦</div>
-            <h2>欢迎使用 镜中此方</h2>
+            <h2>欢迎使用 Kagami no Konata</h2>
             <p className="onboarding-desc">一个基于 LLM 的桌面 AI 聊天助手，支持角色扮演和记忆系统。</p>
             <p className="onboarding-hint">让我们花一分钟完成基础设置。</p>
             <label>

@@ -287,7 +287,7 @@ export function ChatWindow() {
       {/* 侧边栏 */}
       <div className="sidebar">
         <div className="sidebar-header">
-          <h2>✦ 镜中此方</h2>
+          <h2>✦ Kagami no Konata</h2>
           {/* 第一行：新建入口（两个按钮等宽，各自占一半，避免被侧边栏宽度挤破） */}
           <div className="new-session-controls">
             <button
@@ -469,7 +469,7 @@ export function ChatWindow() {
         ) : (
           <div className="no-session">
             <div className="no-session-icon">✦</div>
-            <h2>镜中此方</h2>
+            <h2>Kagami no Konata</h2>
             <p>正在准备今日会话...</p>
           </div>
         )}

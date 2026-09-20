@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Konata_Mirror",
+  "productName": "Kagami no Konata",
   "version": "0.1.0-beta.1",
   "identifier": "com.konata-mirror.main",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Konata_Mirror - 镜中此方",
+        "title": "Kagami no Konata - 镜中此方",
         "width": 900,
         "height": 680,
         "center": true,

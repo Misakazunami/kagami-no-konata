@@ -167,7 +167,7 @@ impl McpClient {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "KonataMirror", "version": env!("CARGO_PKG_VERSION")}
+                "clientInfo": {"name": "kagami-no-konata", "version": env!("CARGO_PKG_VERSION")}
             }),
             HANDSHAKE_TIMEOUT,
         )?;

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    konata_mirror_lib::run()
+    kagami_no_konata_lib::run()
 }

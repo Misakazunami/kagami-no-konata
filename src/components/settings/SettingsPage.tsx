@@ -682,7 +682,7 @@ export function SettingsPage() {
   const handleExportMemories = async () => {
     try {
       const json = await invoke<string>("export_memories");
-      downloadJson(json, `konata_memories_${new Date().toISOString().split("T")[0]}.json`);
+      downloadJson(json, `kagami_no_konata_memories_${new Date().toISOString().split("T")[0]}.json`);
       setTestResult("✅ 记忆已导出");
     } catch (e) {
       setTestResult(`❌ 导出失败: ${e}`);
@@ -720,7 +720,7 @@ export function SettingsPage() {
   const handleExportPersonas = async () => {
     try {
       const json = await invoke<string>("export_personas");
-      downloadJson(json, `konata_personas_${new Date().toISOString().split("T")[0]}.json`);
+      downloadJson(json, `kagami_no_konata_personas_${new Date().toISOString().split("T")[0]}.json`);
       setTestResult("✅ 人格已导出");
     } catch (e) {
       setTestResult(`❌ 导出失败: ${e}`);

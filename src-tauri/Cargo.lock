@@ -2082,18 +2082,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "keyboard-types"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b750dcadc39a09dbadd74e118f6dd6598df77fa01df0cfcdc52c28dece74528a"
-dependencies = [
- "bitflags 2.12.1",
- "serde",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "konata_mirror"
+name = "kagami-no-konata"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2115,6 +2104,17 @@ dependencies = [
  "tokio",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "keyboard-types"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b750dcadc39a09dbadd74e118f6dd6598df77fa01df0cfcdc52c28dece74528a"
+dependencies = [
+ "bitflags 2.12.1",
+ "serde",
+ "unicode-segmentation",
 ]
 
 [[package]]

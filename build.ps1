@@ -1,10 +1,10 @@
-# Konata_Mirror Build Script
+# Kagami no Konata Build Script
 # Usage: .\build.ps1
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Konata_Mirror Build Script" -ForegroundColor Cyan
+Write-Host "  Kagami no Konata Build Script" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 

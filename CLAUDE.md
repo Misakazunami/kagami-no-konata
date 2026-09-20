@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Konata_Mirror (镜中此方) is a Tauri v2 desktop AI chat assistant with role-play personas, a long-term memory system, and a floating desktop pet widget. Rust backend + React 19/TypeScript frontend.
+Kagami no Konata (镜中此方) is a Tauri v2 desktop AI chat assistant with role-play personas, a long-term memory system, and a floating desktop pet widget. Rust backend + React 19/TypeScript frontend.
 
 ## Commands
 

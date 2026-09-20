@@ -30,7 +30,7 @@ fn http_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
-            .user_agent("KonataMirror/0.1 (+tool-harness)")
+            .user_agent("kagami-no-konata/0.1 (+tool-harness)")
             // **不自动跟随重定向**：自动跟随会绕过域名白名单与"禁止本机/内网"
             // 检查（允许域名 302 到 127.0.0.1 就是一条 SSRF 通道）。
             // web_fetch 逐跳手动跟随并重新校验；检索 API 不需要重定向。

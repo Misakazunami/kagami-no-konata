@@ -1,12 +1,12 @@
 [package]
-name = "konata_mirror"
+name = "kagami-no-konata"
 version = "0.1.0"
-description = "Konata_Mirror - AI Chat Assistant"
-authors = ["you"]
+description = "Kagami no Konata — a local-first desktop AI companion"
+authors = ["Kagami no Konata Contributors"]
 edition = "2021"
 
 [lib]
-name = "konata_mirror_lib"
+name = "kagami_no_konata_lib"
 crate-type = ["staticlib", "rlib"]
 
 [build-dependencies]

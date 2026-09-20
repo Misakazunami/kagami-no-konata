@@ -1,6 +1,6 @@
-# Konata_Mirror - Dev Mode 启动脚本
+# Kagami no Konata - Dev Mode 启动脚本
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Konata_Mirror (镜中此方) - Dev Mode" -ForegroundColor Cyan
+Write-Host "  Kagami no Konata (镜中此方) - Dev Mode" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
