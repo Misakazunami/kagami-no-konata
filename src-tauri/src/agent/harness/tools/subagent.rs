@@ -1,9 +1,12 @@
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::agent::harness::subagent::{ChildOutcome, MAX_SUMMARY_BYTES, MAX_TASKS_PER_CALL};
 use crate::agent::harness::traits::{
-    truncate_text, Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput,
+    truncate_text, Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput, ToolServices, ToolStatus,
 };
 
 /// 派发只读子代理去并行调查
@@ -15,6 +18,18 @@ use crate::agent::harness::traits::{
 /// 权限是 `Read`（子代理只能读，不产生任何副作用），但**仍然有预算与取消**：
 /// 每轮生成默认只允许 2 个子代理任务，且共享用户的"停止"。
 pub struct SpawnSubagents;
+
+/// 时间预算看门狗的 RAII 守卫
+///
+/// 正常路径会显式 abort；但若整个工具 future 被外层超时 drop（极端卡顿），
+/// Drop 也要把看门狗一起带走，否则它会空转到 deadline。
+struct WatchdogTask(tokio::task::JoinHandle<()>);
+
+impl Drop for WatchdogTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[async_trait::async_trait]
 impl Tool for SpawnSubagents {
@@ -55,6 +70,12 @@ impl Tool for SpawnSubagents {
         )
     }
 
+    /// 子代理批次用自己的时间预算：整批可能跨十几次工具调用与多次 LLM 往返，
+    /// 父级的 `call_timeout`（默认 60 秒）会把它直接掐死
+    fn timeout_budget(&self, services: &ToolServices) -> Option<Duration> {
+        Some(services.subagent_timeout)
+    }
+
     async fn call(&self, args: Value, cx: &ToolCtx<'_>) -> Result<ToolOutput> {
         cx.ensure_not_cancelled()?;
 
@@ -70,8 +91,11 @@ impl Tool for SpawnSubagents {
         if tasks.is_empty() {
             anyhow::bail!("tasks 不能为空");
         }
-        if tasks.len() > MAX_TASKS_PER_CALL {
-            anyhow::bail!("任务过多（上限 {} 个）", MAX_TASKS_PER_CALL);
+        if tasks.len() > runtime.max_tasks_per_call() {
+            anyhow::bail!(
+                "任务过多（上限 {} 个）",
+                runtime.max_tasks_per_call()
+            );
         }
 
         // 先把任务解析干净，再决定要不要花预算
@@ -94,15 +118,49 @@ impl Tool for SpawnSubagents {
             parsed.push((goal, paths));
         }
 
-        // 预算：有多少跑多少，但**在发请求之前**就要告诉模型"少了几个"
-        let mut outcomes: Vec<(String, std::result::Result<ChildOutcome, String>)> = Vec::new();
-        let mut skipped: Vec<String> = Vec::new();
-        let mut extra_tokens = 0usize;
+        // 整批的时间预算：到点前必须带着已完成的部分返回，而不是被父级外层超时掐断。
+        // 历史故障：一次子代理批次跑到 70 秒被强制终止，已完成的结论与统计全部丢失。
+        let started = std::time::Instant::now();
+        let budget = cx.services.subagent_timeout;
+        let deadline = started + budget;
 
-        // 初始向 UI 广播所有子任务已就绪（粗粒度预览）
-        for (idx, (goal, _)) in parsed.iter().enumerate() {
+        // 批次共享的取消标志：用户停止或时间预算用尽都会置位。
+        // 子代理的 `HarnessRun` 在块间/分片间检查取消，因此能收手并带回部分结论。
+        let batch_cancel = Arc::new(AtomicBool::new(false));
+        let watchdog = WatchdogTask(tokio::spawn({
+            let flag = batch_cancel.clone();
+            let parent_cancel = cx.cancel.clone();
+            async move {
+                loop {
+                    if parent_cancel.load(Ordering::Relaxed)
+                        || std::time::Instant::now() >= deadline
+                    {
+                        flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }));
+
+        // 第一步：一次性判定名额与时间（必须在**发请求之前**决定跳过谁），
+        // 并向 UI 广播 queued / running / skipped 的粗粒度进度
+        struct Prepared {
+            task_id: String,
+            goal_preview: String,
+            goal: String,
+            paths: Option<String>,
+            slot: usize,
+            model: String,
+        }
+        let mut prepared: Vec<Prepared> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        let mut out_of_time: Vec<String> = Vec::new();
+
+        for (idx, (goal, paths)) in parsed.into_iter().enumerate() {
             let task_id = format!("{}-sub-{}", cx.call_id, idx);
-            let goal_preview = truncate_text(goal, 40).0;
+            let goal_preview = truncate_text(&goal, 40).0;
+
             cx.emit.emit(
                 crate::agent::harness::traits::EVENT_SUBAGENT_STATUS,
                 json!({
@@ -114,11 +172,6 @@ impl Tool for SpawnSubagents {
                     "status": "queued",
                 }),
             );
-        }
-
-        for (idx, (goal, paths)) in parsed.into_iter().enumerate() {
-            let task_id = format!("{}-sub-{}", cx.call_id, idx);
-            let goal_preview = truncate_text(&goal, 40).0;
 
             if cx.cancelled() {
                 cx.emit.emit(
@@ -134,6 +187,24 @@ impl Tool for SpawnSubagents {
                 );
                 break;
             }
+
+            if std::time::Instant::now() >= deadline {
+                cx.emit.emit(
+                    crate::agent::harness::traits::EVENT_SUBAGENT_STATUS,
+                    json!({
+                        "session_id": cx.session_id,
+                        "stream_id": cx.stream_id,
+                        "parent_call_id": cx.call_id,
+                        "task_id": task_id,
+                        "goal_preview": goal_preview,
+                        "status": "skipped",
+                        "reason": "时间预算不足",
+                    }),
+                );
+                out_of_time.push(goal);
+                continue;
+            }
+
             // 名额序号决定用哪个子模型（自动选择：子模型池按序号轮转）。
             // 手动模式 / 未配置子模型时池里只有一个条目，取到的就是主轮次模型。
             let Some(slot) = runtime.take_slot() else {
@@ -146,6 +217,7 @@ impl Tool for SpawnSubagents {
                         "task_id": task_id,
                         "goal_preview": goal_preview,
                         "status": "skipped",
+                        "reason": "本轮名额已用完",
                     }),
                 );
                 skipped.push(goal);
@@ -153,7 +225,6 @@ impl Tool for SpawnSubagents {
             };
             let model_label = runtime.model_hint(slot).unwrap_or_default();
 
-            // 发射开始运行事件
             cx.emit.emit(
                 crate::agent::harness::traits::EVENT_SUBAGENT_STATUS,
                 json!({
@@ -167,35 +238,66 @@ impl Tool for SpawnSubagents {
                 }),
             );
 
-            let start_time = std::time::Instant::now();
-            let result = runtime.run_child(cx, &goal, paths.as_deref(), slot).await;
-            let duration_ms = start_time.elapsed().as_millis() as i64;
+            prepared.push(Prepared {
+                task_id,
+                goal_preview,
+                goal,
+                paths,
+                slot,
+                model: model_label,
+            });
+        }
 
+        // 第二步：并行执行（同一批共享时间预算与取消标志）。
+        // 串行会把两个子代理的墙钟时间叠加，正是超时的主要来源。
+        let futures = prepared.into_iter().map(|task| {
+            let cancel = batch_cancel.clone();
+            async move {
+                let start = std::time::Instant::now();
+                let result = runtime
+                    .run_child(cx, &task.goal, task.paths.as_deref(), task.slot, cancel)
+                    .await;
+                (task, start.elapsed().as_millis() as i64, result)
+            }
+        });
+        let results = futures::future::join_all(futures).await;
+        // 批次已结束，看门狗立即停掉（Drop 是兜底：外层超时 drop 掉本 future 时也生效）
+        watchdog.0.abort();
+
+        let hit_deadline = !cx.cancelled() && batch_cancel.load(Ordering::Relaxed);
+
+        // 第三步：收拢结果并广播完成状态
+        let mut outcomes: Vec<(String, std::result::Result<ChildOutcome, String>)> = Vec::new();
+        let mut extra_tokens = 0usize;
+        for (task, duration_ms, result) in results {
             let (status_str, tokens) = match &result {
                 Ok(child) => ("done", child.tokens),
                 Err(_) => ("error", 0),
             };
-
-            // 发射完成事件（仅带状态与耗时，不泄露详细敏感中间日志）
             cx.emit.emit(
                 crate::agent::harness::traits::EVENT_SUBAGENT_STATUS,
                 json!({
                     "session_id": cx.session_id,
                     "stream_id": cx.stream_id,
                     "parent_call_id": cx.call_id,
-                    "task_id": task_id,
-                    "goal_preview": goal_preview,
+                    "task_id": task.task_id,
+                    "goal_preview": task.goal_preview,
                     "status": status_str,
                     "duration_ms": duration_ms,
-                    "model": model_label,
+                    "model": task.model,
                 }),
             );
-
             extra_tokens += tokens;
-            outcomes.push((goal, result));
+            outcomes.push((task.goal, result));
         }
 
         if outcomes.is_empty() {
+            if !out_of_time.is_empty() {
+                anyhow::bail!(
+                    "子代理时间预算（{} 秒）已用尽，本轮未能启动任何子任务；请缩小调查范围或调大 tools.subagent_timeout_secs",
+                    budget.as_secs()
+                );
+            }
             anyhow::bail!(
                 "本轮子代理预算已用完（剩 {} 个），请自己按顺序调查或等下一轮再派",
                 runtime.children_left()
@@ -226,19 +328,33 @@ impl Tool for SpawnSubagents {
         }
         if !skipped.is_empty() {
             body.push_str(&format!(
-                "（本轮子代理预算已用完，以下 {} 个任务未执行：{}）\n",
+                "（本轮子代理名额已用完，以下 {} 个任务未执行：{}）\n",
                 skipped.len(),
                 skipped.join("；")
+            ));
+        }
+        if !out_of_time.is_empty() {
+            body.push_str(&format!(
+                "（时间预算不足，以下 {} 个任务未启动：{}）\n",
+                out_of_time.len(),
+                out_of_time.join("；")
+            ));
+        }
+        if hit_deadline {
+            body.push_str(&format!(
+                "（本批子代理时间预算（{} 秒）已用尽：以上为**已完成的部分结论**，请基于它们继续，不要重复调查；如需完整调查可调大 tools.subagent_timeout_secs 或缩小任务范围）\n",
+                budget.as_secs()
             ));
         }
 
         let preview = truncate_text(
             &format!(
-                "子代理 {} 个任务 · 成功 {} · {} 次工具调用 · 约 {} tokens",
+                "子代理 {} 个任务 · 成功 {} · {} 次工具调用 · 约 {} tokens{}",
                 outcomes.len(),
                 ok_count,
                 tool_calls,
-                extra_tokens
+                extra_tokens,
+                if hit_deadline { " · 超时收尾" } else { "" }
             ),
             300,
         )
@@ -247,9 +363,12 @@ impl Tool for SpawnSubagents {
         let mut output = ToolOutput::text(body)
             .with_preview(preview)
             .with_extra_tokens(extra_tokens);
-        // 全部失败时明确标成失败：不要让界面显示"完成"
-        if ok_count == 0 {
-            output = output.with_status(crate::agent::harness::ToolStatus::Error);
+        // 超时收尾优先标记：内容仍是已完成的部分结论，不能被界面显示成"完成"；
+        // 全部失败时则标成失败
+        if hit_deadline {
+            output = output.with_status(ToolStatus::Timeout);
+        } else if ok_count == 0 {
+            output = output.with_status(ToolStatus::Error);
         }
         Ok(output)
     }
@@ -472,7 +591,7 @@ mod tests {
         assert!(out.content.contains("任务 A"), "{}", out.content);
         assert!(!out.content.contains("任务 B\n"), "第二个任务不该被执行");
         assert!(
-            out.content.contains("预算已用完") && out.content.contains("任务 B"),
+            out.content.contains("名额已用完") && out.content.contains("任务 B"),
             "必须明确告知哪些任务被跳过：{}",
             out.content
         );
@@ -572,6 +691,86 @@ mod tests {
         assert!(
             backend.seen_messages.lock().unwrap().is_empty(),
             "取消后不得再发起子代理请求"
+        );
+    }
+
+    /// 时间预算用尽时必须带部分结论收尾，而不是被父级外层超时掐断
+    #[test]
+    fn deadline_returns_partial_result_with_timeout_status() {
+        /// 永远慢一拍的提供商：用来把子代理拖过时间预算
+        struct SlowBackend {
+            delay: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl ChatBackend for SlowBackend {
+            async fn chat(&self, _messages: Vec<LlmMessage>) -> AnyResult<String> {
+                Ok(String::new())
+            }
+
+            async fn chat_stream(
+                &self,
+                _messages: Vec<LlmMessage>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> AnyResult<Pin<Box<dyn Stream<Item = AnyResult<StreamChunk>> + Send>>> {
+                tokio::time::sleep(self.delay).await;
+                Ok(Box::pin(futures::stream::iter(vec![Ok(
+                    StreamChunk::Content("迟到的结论".to_string()),
+                )])))
+            }
+        }
+
+        let mut fx = Fixture::new(
+            "deadline",
+            Arc::new(SlowBackend {
+                delay: Duration::from_millis(400),
+            }),
+            2,
+        );
+        fx.services.subagent_timeout = Duration::from_millis(100);
+        let cx = fx.ctx();
+        let out = block_on(SpawnSubagents.call(
+            json!({"tasks": [{"goal": "慢任务"}]}),
+            &cx,
+        ))
+        .unwrap();
+
+        // 工具自己收尾：状态是超时、内容说明预算用尽、部分结果仍被带回
+        assert_eq!(out.status, ToolStatus::Timeout);
+        assert!(out.content.contains("时间预算"), "{}", out.content);
+        // 进度事件必须如实展示任务跑过（而不是什么都没发生）
+        let events = fx.sink.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(event, payload)| event == "subagent-status" && payload["status"] == "running"),
+            "缺少 running 事件"
+        );
+    }
+
+    /// 时间预算已耗尽时不再启动新任务，并明确告知模型
+    #[test]
+    fn expired_deadline_skips_all_tasks_with_clear_error() {
+        let backend = ScriptBackend::new(vec!["不会被执行"]);
+        let mut fx = Fixture::new("expired", backend.clone(), 2);
+        // 预算为 0：deadline 在调用开始的那一刻就已过去
+        fx.services.subagent_timeout = Duration::ZERO;
+        let cx = fx.ctx();
+        let err = block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "A"}]}), &cx)).unwrap_err();
+        assert!(err.to_string().contains("时间预算"), "{err}");
+        assert!(
+            backend.seen_messages.lock().unwrap().is_empty(),
+            "过期后不得再发起子代理请求"
+        );
+    }
+
+    /// 工具声明的时间预算必须等于服务里的子代理预算（runner 靠它放宽外层窗口）
+    #[test]
+    fn timeout_budget_is_the_subagent_budget() {
+        let fx = Fixture::new("timeout-budget", ScriptBackend::new(vec!["x"]), 2);
+        assert_eq!(
+            SpawnSubagents.timeout_budget(&fx.services),
+            Some(fx.services.subagent_timeout)
         );
     }
 }

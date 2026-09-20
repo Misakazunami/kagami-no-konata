@@ -26,6 +26,34 @@ fn shared_http_client() -> &'static Client {
     })
 }
 
+/// 发送阶段的尝试次数（含首次）
+///
+/// `error sending request` 属于传输层故障（DNS / TLS / 连接重置 / 连接超时）：
+/// 请求根本还没到达对端，重发是安全的。提供商网关抖动时，
+/// 一次重试就能救回整轮对话，而不是给用户一个"发送失败"。
+const SEND_MAX_ATTEMPTS: usize = 3;
+
+/// 重试退避（第 n 次失败后等 `n * 400ms`，总等待 1.2 秒以内）
+const SEND_RETRY_BACKOFF_MS: u64 = 400;
+
+/// 把 reqwest 错误的完整来源链拼成一句话
+///
+/// reqwest 的 `Display` 只有顶层 `error sending request for url (...)`，
+/// 真正的连接原因（超时 / 被重置 / TLS 失败）藏在 `source()` 链里。
+/// 不把它带出来，用户看到的就只是一句无从下手的报错。
+fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+    while let Some(err) = source {
+        let text = err.to_string();
+        if !parts.contains(&text) {
+            parts.push(text);
+        }
+        source = err.source();
+    }
+    parts.join("：")
+}
+
 /// OpenAI 兼容 API 客户端（可廉价克隆，内部共享连接池）
 #[derive(Clone)]
 pub struct OpenAiClient {
@@ -40,6 +68,48 @@ impl OpenAiClient {
             client: shared_http_client().clone(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
+        }
+    }
+
+    /// POST JSON 并在**发送阶段**失败时自动重试
+    ///
+    /// 只覆盖 `.send()` 失败（请求未到达对端，重发安全）；响应开始后的错误
+    /// 由调用方处理，绝不在这里重试——流式重发会产生重复内容。
+    async fn post_json_with_retry<T: serde::Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<reqwest::Response> {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match self
+                .client
+                .post(url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let described = describe_reqwest_error(&error);
+                    if attempt >= SEND_MAX_ATTEMPTS {
+                        return Err(anyhow!(
+                            "请求发送失败（已重试 {} 次）：{}",
+                            attempt - 1,
+                            described
+                        ));
+                    }
+                    let wait_ms = SEND_RETRY_BACKOFF_MS * attempt as u64;
+                    eprintln!(
+                        "[llm] 请求发送失败（第 {} 次，{}ms 后重试）：{}",
+                        attempt, wait_ms, described
+                    );
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                }
+            }
         }
     }
 
@@ -76,14 +146,7 @@ impl OpenAiClient {
             input: texts,
         };
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+        let response = self.post_json_with_retry(&url, &request).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -102,14 +165,7 @@ impl OpenAiClient {
     pub async fn chat(&self, request: &ChatRequest) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(request)
-            .send()
-            .await?;
+        let response = self.post_json_with_retry(&url, request).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -143,14 +199,7 @@ impl OpenAiClient {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(request)
-            .send()
-            .await?;
+        let response = self.post_json_with_retry(&url, request).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -201,7 +250,7 @@ impl OpenAiClient {
                         Some(Err(e)) => {
                             state.finished = true;
                             return Some((
-                                Err(anyhow!("Stream error: {}", e)),
+                                Err(anyhow!("流读取失败：{}", describe_reqwest_error(&e))),
                                 (byte_stream, state),
                             ));
                         }
@@ -792,5 +841,66 @@ mod tests {
         ]);
         assert!(matches!(&chunks[0], StreamChunk::Thinking(t) if t == "推理"));
         assert!(matches!(&chunks[1], StreamChunk::Content(t) if t == "答案"));
+    }
+
+    /// 传输层发送失败必须自动重试，并在最终报错里带出真实原因
+    ///
+    /// 真实故障：提供商网关抖动时 `.send()` 失败，用户只看到裸的
+    /// `error sending request for url (...)`，整轮对话直接失败。
+    #[test]
+    fn send_failures_are_retried_and_report_the_cause() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // 本地 TCP 服务：接受连接后立刻关闭，模拟网关把连接重置掉
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        {
+            let accepted = accepted.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while accepted.load(Ordering::Relaxed) < SEND_MAX_ATTEMPTS
+                    && std::time::Instant::now() < deadline
+                {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            drop(stream);
+                            accepted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            });
+        }
+
+        let client = OpenAiClient::new(&format!("http://{addr}"), "sk-test");
+        let request = ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![crate::llm::types::LlmMessage::user("hi")],
+            max_tokens: None,
+            temperature: 0.0,
+            stream: true,
+            enable_thinking: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(client.chat_stream(&request))
+            .err()
+            .expect("连接被重置时必须报错");
+        let text = err.to_string();
+        assert!(text.contains("已重试"), "必须说明重试过：{text}");
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            SEND_MAX_ATTEMPTS,
+            "实际尝试次数必须与常量一致：{text}"
+        );
     }
 }

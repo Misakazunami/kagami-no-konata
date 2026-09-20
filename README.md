@@ -1,114 +1,77 @@
-# Konata_Mirror (镜中此方)
+<p align="center">
+  <img src="public/pet/default.png" width="140" alt="Konata_Mirror 桌面宠物" />
+</p>
 
-Konata_Mirror 是一个基于 **Tauri v2 + Rust** 后端与 **React 19 + TypeScript** 前端构建的桌面伴侣型 AI 助理。它结合了个性化角色扮演（Persona）、长期记忆提取检索系统（Long-term Memory）、悬浮窗桌面宠物（Live2D / 戳一戳互动）以及**多智能体协作与意图路由系统（Multi-Agent Routing Pipeline）**。
+<h1 align="center">镜中此方 · Konata_Mirror</h1>
 
----
+<p align="center">
+  <a href="https://v2.tauri.app/"><img src="https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri&logoColor=white" alt="Tauri v2" /></a>
+  <a href="https://react.dev/"><img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white" alt="React 19" /></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white" alt="Rust" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License" /></a>
+</p>
 
-## 🌟 核心特性
-
-- **🎭 角色扮演与人格系统（Persona Engine）**：内置并支持用户自定义 YAML 人格配置，支持变量插值、人设注入与动态热重载。
-- **🧠 长期记忆系统（Memory System）**：
-  - 基于语义向量嵌入（Embedding）的 Cosine 相似度检索，结合重要性权重评分（`similarity * 0.7 + importance * 0.3`）。
-  - 对话异步提取与去重更新机制（事实、偏好、经历、情感四维标签）。
-- **🤖 多智能体意图路由系统（Multi-Agent Router & Dispatcher）**：
-  - **四级意图决策流水线**：
-    - Level 1: 确定性斜杠前缀指令（如 `/sys`、`/system`），具备词边界安全保护与 0ms 零延迟分发。
-    - Level 2: 预编译高置信正则表达式匹配（如 `^查看\s*(系统信息|系统状态|内存|cpu)`）。
-    - Level 3: 启发式多关键词加权打分（饱和阈值与相关率综合评分）。
-    - Level 4: 默认无缝回退到主对话智能体 `ChatAgent`。
-  - **人设包裹模式（Persona Wrapping）**：支持将工具型智能体的输出以特定角色的语气进行转述，兼顾实用性与角色扮演沉浸感。
-  - **思考流状态感知**：后台智能体执行时即时向思考流输出进度通知，杜绝界面白屏等待。
-  - `SystemAgent` 现在**真的调用工具**（`get_current_time` / `get_system_info`），不再返回"已收到指令"这类假装执行的模板文本。
-- **🛠 工具运行时（Tool Harness）**：让模型在生成过程中调用真实工具，而不是靠提示词假装。
-  - **16 个内置工具**：文件读取/列目录/glob/内容搜索、时间与系统信息、应用状态、记忆检索与写入、人格查看、文件写入与精确编辑、命令执行、网页抓取、用系统程序打开文件。
-  - **三档模式**：只读 / 标准（默认）/ 完整。只读模式直接移除写入类工具，命令执行只在完整模式下可见。
-  - **工作区沙箱**：默认工作区固定在应用数据目录下的 `workspace/`，设置页可添加多个自定义根目录（新增根默认只读）；支持 `工作区id:相对路径` 多根寻址。
-  - **敏感命令拦截**：命令不经 shell 执行；`cmd`、`powershell`、`curl`、`rm`、`reg`、`schtasks`、`certutil` 等由**内置黑名单硬拦截**（写进允许列表也无效），解释器求值参数（`python -c` / `node -e`）一律拒绝，参数中的路径必须落在工作区内，子进程不继承 API Key。
-  - **审批与可见性**：写文件、执行命令、联网都要在**主窗口**弹窗批准（支持"仅本次 / 本会话允许 / 拒绝"，超时即拒绝）；结果不做跨轮保留，工具返回内容被标记为不可信数据以防提示注入。
-  - **桌面宠物只有聊天**：悬浮窗完全不接入工具，也收不到任何工具事件。
-- **🐱 桌面宠物悬浮窗（Floating Widget）**：
-  - 透明置顶悬浮窗，内置时钟、Live2D 渲染与悬浮对话气泡。
-  - 戳一戳互动机制：连续点击情绪反应，支持预置台词与实时 LLM 反应智能切换（一次性反应，不写入聊天记录）。
-- **⚡ 双模式窗口设计**：
-  - **主窗口（Main Window，900×680）**：全功能聊天界面、会话管理、模型提供商配置、人格编辑与记忆库查看。
-  - **悬浮窗（Float Window，220×340）**：轻量透明桌宠伴侣。
+<p align="center">本地优先的桌面 AI 伴侣：角色扮演对话、长期记忆、可审批的工具执行，以及一只住在悬浮窗里的桌宠。</p>
 
 ---
 
-## 🛠️ 技术栈
+## ✨ 功能
 
-- **前端**：React 19、TypeScript、Vite、Zustand、Pixi.js / Live2D
-- **后端**：Tauri v2、Rust、Tokio（异步运行时）、Rusqlite（SQLite 存储，WAL 模式）、Reqwest（SSE 流式）
-- **数据持久化**：应用数据统一存放于 `%APPDATA%/com.konata-mirror.main/`（`data.db`、`config.json`、`personas/`、`workspace/`）
-  - 首次启动若检测到旧的 `com.konata-mirror.app` 数据目录，会自动**只复制不删除**地迁移一次聊天记录、配置、人格与工作区文件（旧目录原样保留）
+- **🎭 角色扮演** — 内置与自定义 YAML 人格，支持变量插值、人设注入与热重载。
+- **🧠 长期记忆** — 向量检索（`相似度 × 0.7 + 重要性 × 0.3`），对话异步提取事实与偏好并去重更新。
+- **🛠 工具执行** — 16 个内置工具（文件读写、内容搜索、命令执行、网页抓取等）：三档权限、工作区沙箱、敏感命令硬拦截、写操作逐次审批并可回滚。
+- **🤖 多智能体路由** — 斜杠指令 / 正则 / 关键词四级意图流水线；工具型智能体的输出可按人设语气转述。
+- **💬 对话管理** — 任意消息的回退、重试与编辑，单条 / 整会话一键复制（Markdown），右侧消息时间轴快速跳转。
+- **🐱 桌面宠物** — 透明置顶悬浮窗，Live2D 渲染、时钟与「戳一戳」互动（一次性反应，不写入聊天记录）。
+- **🪟 双窗口** — 主窗口（900×680）负责完整聊天与设置；悬浮窗（220×340）是轻量伴侣。
 
----
+## 🧱 技术栈
+
+| 层 | 技术 |
+| --- | --- |
+| 前端 | React 19 · TypeScript · Vite · Zustand · Pixi.js / Live2D |
+| 后端 | Tauri v2 · Rust · Tokio · rusqlite（SQLite WAL）· reqwest（SSE 流式） |
+| 数据 | 应用数据目录下的 `data.db` / `config.json` / `personas/` / `workspace/` |
 
 ## 🚀 快速开始
 
-### 依赖环境
-
-- [Node.js](https://nodejs.org/) (建议 LTS) & [pnpm](https://pnpm.io/)
-- [Rust](https://rustup.rs/) (1.87+，代码使用了 `usize::is_multiple_of` 等较新的稳定 API)
-
-### 安装依赖
+**环境要求**：Node.js（LTS）+ pnpm、Rust 1.87+。Linux 还需安装 [Tauri 系统依赖](https://v2.tauri.app/start/prerequisites/)（WebKitGTK 等）。
 
 ```bash
-pnpm install
+pnpm install        # 安装前端依赖
+pnpm tauri dev      # 开发模式（首次编译 Rust 约 3–5 分钟）
+pnpm tauri build    # 发布构建（Windows 生成 NSIS / MSI）
 ```
 
-### 开发模式启动
-
-启动 Vite 开发服务器及 Tauri 编译后端：
+Rust 侧检查与测试：
 
 ```bash
-pnpm tauri dev
+cd src-tauri
+cargo clippy
+cargo test
 ```
 
-> **提示**：首次编译 Rust 依赖约需 3-5 分钟，后续热重载启动仅需数秒。
+首次启动会引导填写 OpenAI 兼容的 API 端点与模型，随后即可开始对话。
 
-### 项目构建与打包
+## 🔐 数据与隐私
 
-编译前端代码与生成发行包（Windows 下生成 NSIS 安装包与 MSI）：
-
-```bash
-# 仅构建前端（类型检查 + Vite 打包）
-pnpm build
-
-# 全量构建发布包
-pnpm tauri build
-```
-
----
+- 数据全部保存在本机应用数据目录（Windows：`%APPDATA%/com.konata-mirror.main/`，Linux：`~/.local/share/com.konata-mirror.main/`），不会上传到任何第三方；唯一的外部请求来自你自己配置的 LLM / Embedding 端点。
+- API Key 以明文存放在本地 `config.json`，请勿将其提交到版本库。
+- 命令工具不经 shell 执行，参数必须落在工作区内；文件改动会先快照，可随时回滚。
 
 ## 📂 项目结构
 
 ```text
-Konata_Mirror/
-├── src/                      # 前端 React 源代码
-│   ├── components/
-│   │   ├── chat/             # 消息列表、输入框、流式文本
-│   │   ├── float/            # 悬浮窗、Live2D、戳一戳、时钟
-│   │   ├── persona/          # 人格编辑器
-│   │   ├── settings/         # 模型与应用配置界面
-│   │   └── onboarding/       # 引导初始化界面
-│   ├── stores/               # Zustand 全局状态管理
-│   └── App.tsx               # 根组件与窗口识别路由
-├── src-tauri/                # 后端 Rust 源代码
-│   ├── src/
-│   │   ├── agent/            # Agent 抽象、Router 意图路由、Dispatcher 与各智能体实现
-│   │   ├── commands/         # Tauri IPC 命令注册（chat、settings、persona、memory 等）
-│   │   ├── llm/              # LLM 客户端与 SSE 流式代理
-│   │   ├── memory/           # 记忆提取与向量检索
-│   │   ├── persona/          # 人格配置解析与提示词组装
-│   │   └── store/            # SQLite 数据库管理与迁移
-│   └── Cargo.toml            # Rust 依赖配置
-├── ARCHITECTURE.md           # 架构设计演进文档
-└── CLAUDE.md                 # 辅助开发规范指南
+src/                 前端：components（chat / float / settings / persona）、stores、utils、types
+src-tauri/           后端：agent（工具运行时与路由）、commands、llm、memory、persona、store
+ARCHITECTURE.md      架构设计与关键取舍
+CLAUDE.md            面向 AI 辅助开发的仓库约定
 ```
 
----
+## 🤝 参与贡献
 
-## 📄 开源许可证
+欢迎提交 Issue 与 Pull Request。提交前请确保 `cargo clippy`、`cargo test` 与 `pnpm build` 均通过。
 
-本项目采用 [MIT License](LICENSE) 开源。
+## 📄 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。

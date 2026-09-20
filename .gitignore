@@ -1,5 +1,23 @@
-# Logs
-logs
+# 依赖与包管理器
+node_modules/
+.pnpm-store/
+
+# 前端构建产物与缓存
+dist/
+dist-ssr/
+*.local
+*.tsbuildinfo
+
+# Rust / Tauri 构建产物
+src-tauri/target/
+src-tauri/gen/schemas/
+**/*.rs.bk
+
+# 第三方参考项目（不参与本项目构建）
+tauri-live2d-main/
+
+# 日志
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -7,33 +25,28 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-# Dependencies
-node_modules
-
-# Frontend build output
-dist
-dist-ssr
-*.local
-*.tsbuildinfo
-
-# Rust / Tauri 构建产物
-src-tauri/target/
-src-tauri/gen/schemas/
-
-# tauri-live2d-main/ 为第三方参考项目，不参与本项目构建
-tauri-live2d-main/
-
-# 本地临时文件
+# 本地数据与临时文件
 *.tmp
 *.bak
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 
-# Claude / AI 本地配置
+# 环境变量与密钥（示例文件可提交）
+.env
+.env.*
+!.env.example
+
+# AI 辅助开发本地配置
 .claude/settings.local.json
+CLAUDE.local.md
 
-# Editor directories and files
+# 编辑器与操作系统
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
 .DS_Store
 Thumbs.db
 Desktop.ini

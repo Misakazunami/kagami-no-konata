@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::stream::Stream;
 use std::pin::Pin;
 use std::sync::RwLock;
@@ -81,14 +81,19 @@ impl LlmProxy {
 
     /// 非流式调用
     pub async fn chat(&self, messages: Vec<LlmMessage>) -> Result<String> {
-        let (client, request) = {
+        let (client, request, label) = {
             let (client, provider, overrides) = self.snapshot();
+            let label = provider_label(&provider);
             (
                 client,
                 build_chat_request(&provider, overrides, messages, false, None),
+                label,
             )
         };
-        client.chat(&request).await
+        client
+            .chat(&request)
+            .await
+            .map_err(|e| anyhow!("LLM 请求失败 · {label}：{e}"))
     }
 
     /// 流式调用
@@ -105,14 +110,29 @@ impl LlmProxy {
         messages: Vec<LlmMessage>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        let (client, request) = {
+        let (client, request, label) = {
             let (client, provider, overrides) = self.snapshot();
+            let label = provider_label(&provider);
             (
                 client,
                 build_chat_request(&provider, overrides, messages, true, tools),
+                label,
             )
         };
-        client.chat_stream(&request).await
+        client
+            .chat_stream(&request)
+            .await
+            .map_err(|e| anyhow!("LLM 请求失败 · {label}：{e}"))
+    }
+}
+
+/// 报错时用来定位"是哪家、哪个模型"的短标签（不包含密钥）
+fn provider_label(provider: &LlmProvider) -> String {
+    let name = provider.name.trim();
+    if name.is_empty() {
+        provider.model.clone()
+    } else {
+        format!("{}（{}）", provider.model, name)
     }
 }
 
@@ -243,6 +263,24 @@ mod tests {
             json.get("enable_thinking").is_none(),
             "不支持时不下发；绝不能变成 true：{json}"
         );
+    }
+
+    /// 未指定 max_tokens（None）⇒ 请求体里**没有**该字段，由服务商决定上限
+    #[test]
+    fn max_tokens_absent_when_unset() {
+        let p = provider();
+        assert_eq!(p.max_tokens, None);
+        let json = request_json(&p, ProviderOverrides::default());
+        assert!(json.get("max_tokens").is_none(), "{json}");
+    }
+
+    /// 显式设置 max_tokens ⇒ 原样下发
+    #[test]
+    fn max_tokens_is_sent_when_set() {
+        let mut p = provider();
+        p.max_tokens = Some(4096);
+        let json = request_json(&p, ProviderOverrides::default());
+        assert_eq!(json["max_tokens"], serde_json::json!(4096));
     }
 
     /// 覆盖项属于"这一轮"：热更新提供商配置不得把它冲掉

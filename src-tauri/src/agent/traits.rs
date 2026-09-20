@@ -87,6 +87,12 @@ pub struct AgentResponse {
     /// 工具额外消耗的 token 估算（目前来自只读子代理），累加进本轮统计
     #[serde(default)]
     pub extra_tokens: usize,
+    /// 工具步数用尽、模型被强制收尾（界面据此提示"中断，可继续"）
+    #[serde(default)]
+    pub hit_step_limit: bool,
+    /// 本次生成实际执行的工具轮数（供界面展示"中断于第 N 步"）
+    #[serde(default)]
+    pub tool_steps: usize,
 }
 
 impl AgentResponse {
@@ -96,6 +102,8 @@ impl AgentResponse {
             response_type: ResponseType::Text,
             tool_invocations: Vec::new(),
             extra_tokens: 0,
+            hit_step_limit: false,
+            tool_steps: 0,
         }
     }
 
@@ -110,6 +118,13 @@ impl AgentResponse {
         invocations: Vec<crate::agent::harness::InvocationRecord>,
     ) -> Self {
         self.tool_invocations = invocations;
+        self
+    }
+
+    /// 记下工具循环的收尾状态（步数用尽 / 实际轮数）
+    pub fn with_step_limit(mut self, hit: bool, steps: usize) -> Self {
+        self.hit_step_limit = hit;
+        self.tool_steps = steps;
         self
     }
 }

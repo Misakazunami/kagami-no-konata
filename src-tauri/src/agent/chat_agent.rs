@@ -325,8 +325,9 @@ impl ChatAgent {
         services.subagent = Some(Arc::new(
             crate::agent::harness::subagent::AgentRuntime::with_models(
                 child_models,
-                crate::agent::harness::subagent::DEFAULT_MAX_CHILDREN,
-            ),
+                runtime.subagent_max_children,
+            )
+            .with_budgets(runtime.subagent_steps, runtime.subagent_max_tasks),
         ));
 
         HarnessRun {
@@ -340,6 +341,7 @@ impl ChatAgent {
             approver: runtime.approver.clone(),
             tools_enabled: runtime.enabled,
             auto_approve: runtime.auto_approve.clone(),
+            auto_approve_all: runtime.auto_approve_all,
             limits: runtime.limits,
             max_steps: runtime.max_steps,
         }
@@ -381,7 +383,8 @@ impl Agent for ChatAgent {
                     log_step_limit(&outcome);
                     return Ok(AgentResponse::text(outcome.content)
                         .with_invocations(outcome.invocations)
-                        .with_extra_tokens(outcome.extra_tokens));
+                        .with_extra_tokens(outcome.extra_tokens)
+                        .with_step_limit(outcome.hit_step_limit, outcome.steps));
                 }
                 Err(e) if is_tools_unsupported(&e) => {
                     eprintln!("[harness] 提供商不支持工具调用，降级为纯对话：{}", e);
@@ -429,7 +432,8 @@ impl Agent for ChatAgent {
                     log_step_limit(&outcome);
                     return Ok(AgentResponse::text(outcome.content)
                         .with_invocations(outcome.invocations)
-                        .with_extra_tokens(outcome.extra_tokens));
+                        .with_extra_tokens(outcome.extra_tokens)
+                        .with_step_limit(outcome.hit_step_limit, outcome.steps));
                 }
                 Err(e) if is_tools_unsupported(&e) => {
                     // 已经外发过一部分正文的极端情况下也不重复输出：
@@ -661,12 +665,16 @@ mod tests {
             approver: Arc::new(DenyAllApprover),
             enabled: true,
             auto_approve: Vec::new(),
+            auto_approve_all: false,
             limits: ToolLimits {
                 max_output_bytes: 64 * 1024,
                 call_timeout: std::time::Duration::from_secs(30),
                 approval_timeout: std::time::Duration::from_secs(120),
             },
             max_steps: 8,
+            subagent_max_children: 2,
+            subagent_steps: 32,
+            subagent_max_tasks: 3,
         }
     }
 

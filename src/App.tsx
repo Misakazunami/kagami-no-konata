@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { register } from "@tauri-apps/plugin-global-shortcut";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emptyGenerationState, getLastLocalStreamId, useChatStore } from "./stores/chatStore";
+import type { SessionUpdatedData } from "./types/events";
 import { ChatWindow } from "./components/chat/ChatWindow";
 import { SettingsPage } from "./components/settings/SettingsPage";
 import { PersonaEditor } from "./components/persona/PersonaEditor";
@@ -152,14 +153,25 @@ function App() {
           useChatStore.getState().updateSessionTitle(sid, title);
         }),
         // 监听跨窗口会话更新（悬浮窗发送了消息时同步到主窗口）
-        listen<{ session_id: string; stream_id: string }>("session-updated", (event) => {
-          const { currentSessionId, refreshCurrentSession } = useChatStore.getState();
+        listen<SessionUpdatedData>("session-updated", (event) => {
+          const { currentSessionId, refreshCurrentSession, adoptLocalMessageIds } =
+            useChatStore.getState();
           const { session_id, stream_id } = event.payload ?? {};
           if (session_id !== currentSessionId) return;
-          // 自己发起的那一轮不回读：本地消息已带统计/模型标签，回读只会闪一下
-          // （历史实现每次发送都触发全量刷新，把模型标签当场抹掉）。
-          // 其它窗口（含悬浮窗）的生成仍要通过回读同步。
-          if (stream_id && stream_id === getLastLocalStreamId()) return;
+          /*
+           * 自己发起的那一轮：把本地乐观消息的 id 换成数据库 id，而不是整表回读。
+           *
+           * 本地 id（crypto.randomUUID）与数据库 id 不同源，不换的话紧接着点
+           * 「重试 / 编辑 / 回退」时后端按本地 id 查不到消息。回读虽然也能对齐，
+           * 但会重建所有消息对象、让整列表的 Markdown 重新解析（长会话会卡）。
+           *
+           * 这次广播由后端在本轮落库之后发出，因此载荷里的 id 一定已经存在；
+           * 其它窗口（含悬浮窗）的生成仍通过回读同步。
+           */
+          if (stream_id && stream_id === getLastLocalStreamId()) {
+            adoptLocalMessageIds(event.payload);
+            return;
+          }
           refreshCurrentSession();
         }),
         // 监听会话删除事件（确保主窗口状态同步）

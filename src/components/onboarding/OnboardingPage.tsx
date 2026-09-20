@@ -10,7 +10,8 @@ interface LlmProvider {
   model: string;
   enabled_models: string[];
   embedding_model: string;
-  max_tokens: number;
+  /** 缺省 / null = 不指定（请求体不带 max_tokens） */
+  max_tokens?: number | null;
   temperature: number;
 }
 

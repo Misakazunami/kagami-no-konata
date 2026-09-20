@@ -31,8 +31,9 @@ pub struct LlmProvider {
     pub enabled_models: Vec<String>,
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
+    /// 单次回复的最大输出 tokens；`None` = 不指定（请求体不带该字段，由服务商决定上限）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     /// 是否启用思考模式（需要模型支持，如 DeepSeek-R1、QwQ 等）
@@ -49,10 +50,6 @@ pub struct LlmProvider {
     pub thinking_models: Vec<String>,
 }
 
-fn default_max_tokens() -> u32 {
-    2048
-}
-
 fn default_temperature() -> f32 {
     0.8
 }
@@ -67,7 +64,7 @@ impl LlmProvider {
             model: String::new(),
             enabled_models: Vec::new(),
             embedding_model: "text-embedding-3-small".to_string(),
-            max_tokens: 2048,
+            max_tokens: None,
             temperature: 0.8,
             enable_thinking: false,
             thinking_models: Vec::new(),
@@ -181,7 +178,9 @@ struct LegacyLlmConfig {
     model: String,
     #[serde(default)]
     enabled_models: Vec<String>,
-    max_tokens: u32,
+    /// 旧配置可能缺该字段（历史版本之外手写的 JSON），缺省按"不指定"处理
+    #[serde(default)]
+    max_tokens: Option<u32>,
     temperature: f32,
     #[serde(default = "default_embedding_model")]
     embedding_model: String,
@@ -400,8 +399,13 @@ impl AppConfig {
             if !(p.api_base_url.starts_with("http://") || p.api_base_url.starts_with("https://")) {
                 return Err(format!("提供商「{}」的 API 地址必须以 http:// 或 https:// 开头", name));
             }
-            if p.max_tokens == 0 || p.max_tokens > 1_000_000 {
-                return Err(format!("提供商「{}」的 max_tokens 必须在 1 ~ 1000000 之间", name));
+            if let Some(max_tokens) = p.max_tokens {
+                if max_tokens == 0 || max_tokens > 1_000_000 {
+                    return Err(format!(
+                        "提供商「{}」的 max_tokens 必须在 1 ~ 1000000 之间（留空 = 使用服务商默认上限）",
+                        name
+                    ));
+                }
             }
             if !p.temperature.is_finite() || !(0.0..=2.0).contains(&p.temperature) {
                 return Err(format!("提供商「{}」的 temperature 必须在 0.0 ~ 2.0 之间", name));
@@ -687,10 +691,30 @@ pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     "perl", "ruby", "php", "lua",
     "tsc", "eslint", "prettier", "pytest", "make", "cmake", "ls", "cat", "head", "tail", "wc",
     "grep", "find", "echo", "pwd", "whoami",
+    // 搜索 / 文本处理（补足代码检索与编辑辅助）
+    // 注意：sed / awk / xargs 属"代码执行通道"（e 命令、system()、代执行任意程序），
+    // 永远不进默认列表；rg / fd / sort 的代执行参数由 command_guard 程序级拒绝。
+    "rg", "fd", "jq", "yq", "diff", "sort", "uniq", "cut", "tr", "stat", "file", "which", "tree",
+    // 构建 / 检查工具链（格式化、lint、编译器与构建系统）
+    "gofmt", "goimports", "staticcheck", "golangci-lint",
+    "clang", "clang++", "clang-format", "clang-tidy", "gcc", "g++", "cc", "c++",
+    "ninja", "meson", "just", "shellcheck",
+    "ruff", "black", "mypy", "flake8", "isort", "poetry", "pdm",
+    "swift", "swiftc", "xcodebuild",
+    // 前端项目本地二进制（`./node_modules/.bin/xxx` 的方式调用）
+    "vitest", "jest", "vite", "next", "esbuild", "rollup", "webpack",
 ];
 
 fn default_max_steps() -> usize {
-    8
+    32
+}
+
+/// 子代理批次的时间预算：默认 10 分钟
+///
+/// 真实案例：一次两任务的子代理调查耗时 52 秒（12 次工具调用），
+/// 用普通工具的 60 秒上限会把它直接掐死并把结论全部丢掉。
+fn default_subagent_timeout_secs() -> u64 {
+    crate::agent::harness::subagent::DEFAULT_SUBAGENT_TIMEOUT_SECS
 }
 
 fn default_max_output_bytes() -> usize {
@@ -704,9 +728,11 @@ fn default_approval_timeout_secs() -> u64 {
 /// 单次工具调用的超时（秒）
 ///
 /// 这个值曾经写死为 60 秒，导致 `cargo build` 这类首次编译要几分钟的命令必然超时；
-/// 现在可配，默认仍是 60 秒以免改变既有行为。
+/// 现在默认 180 秒：首次编译/完整测试套件经常超过 1 分钟，而 60 秒会把
+/// "还在编译"误判成"超时收手"。旧配置里的 60 由 `config::load_config` 的
+/// 一次性迁移改成 180（用户显式设置的其他值不动），因此可直接改默认值。
 fn default_call_timeout_secs() -> u64 {
-    60
+    180
 }
 
 /// 工具运行时配置（只作用于主窗口；悬浮窗恒不使用工具）
@@ -729,6 +755,18 @@ pub struct ToolConfig {
     pub call_timeout_secs: u64,
     /// 工作记忆：模型主动记下的跨轮结论（默认开；关闭后相关工具明确报错且不再注入提示词）
     pub working_memory: bool,
+    /// 每轮生成允许派出的只读子代理任务数（默认 2）
+    pub subagent_max_children: usize,
+    /// 每个只读子代理的最大工具轮数（默认 32，与主循环一致）
+    pub subagent_steps: usize,
+    /// 单次 `spawn_subagents` 最多提交几个任务（默认 3）
+    pub subagent_max_tasks: usize,
+    /// 一次 `spawn_subagents` 的整体时间预算（秒）
+    ///
+    /// 子代理在自己的循环里跑多个工具轮次，普通工具的 `call_timeout_secs`
+    /// （默认 60 秒）根本不够；到点前工具会把已完成的部分结论带回来，
+    /// 而不是被父级强制掐断、所有结果一起丢失
+    pub subagent_timeout_secs: u64,
     /// 额外允许执行的程序（不能覆盖内置黑名单）
     pub command_allowlist: Vec<String>,
     /// `web_fetch` 允许访问的域名（为空表示禁用联网工具）
@@ -911,6 +949,11 @@ impl Default for ToolConfig {
             approval_timeout_secs: default_approval_timeout_secs(),
             call_timeout_secs: default_call_timeout_secs(),
             working_memory: true,
+            // 与子代理运行时的默认值同源，避免两处漂移
+            subagent_max_children: crate::agent::harness::subagent::DEFAULT_MAX_CHILDREN,
+            subagent_steps: crate::agent::harness::subagent::DEFAULT_CHILD_STEPS,
+            subagent_max_tasks: crate::agent::harness::subagent::MAX_TASKS_PER_CALL,
+            subagent_timeout_secs: default_subagent_timeout_secs(),
             command_allowlist: DEFAULT_COMMAND_ALLOWLIST
                 .iter()
                 .map(|s| s.to_string())
@@ -947,8 +990,8 @@ fn lexical_starts_with(child: &std::path::Path, parent: &std::path::Path) -> boo
 impl ToolConfig {
     /// 校验工具配置（在落盘前调用）
     pub fn validate(&self) -> Result<(), String> {
-        if !(1..=32).contains(&self.max_steps) {
-            return Err("工具步数上限必须在 1 ~ 32 之间".to_string());
+        if !(1..=128).contains(&self.max_steps) {
+            return Err("工具步数上限必须在 1 ~ 128 之间".to_string());
         }
         if !(8 * 1024..=1024 * 1024).contains(&self.max_output_bytes) {
             return Err("工具输出上限必须在 8 KB ~ 1 MB 之间".to_string());
@@ -962,6 +1005,24 @@ impl ToolConfig {
         }
         if self.workspaces.len() > MAX_WORKSPACE_ROOTS {
             return Err(format!("工作区数量不能超过 {} 个", MAX_WORKSPACE_ROOTS));
+        }
+        if !(1..=4).contains(&self.subagent_max_children) {
+            return Err("每轮子代理名额必须在 1 ~ 4 之间".to_string());
+        }
+        if !(1..=64).contains(&self.subagent_steps) {
+            return Err("单个子代理的工具轮数必须在 1 ~ 64 之间".to_string());
+        }
+        // 上限与工具 schema 里的 maxItems 一致（见 `subagent::MAX_TASKS_PER_CALL`）：
+        // 配置只能收紧，不能放宽到模型看不到的额度
+        if !(1..=crate::agent::harness::subagent::MAX_TASKS_PER_CALL).contains(&self.subagent_max_tasks)
+        {
+            return Err(format!(
+                "单次提交的子代理任务数必须在 1 ~ {} 之间",
+                crate::agent::harness::subagent::MAX_TASKS_PER_CALL
+            ));
+        }
+        if !(30..=3600).contains(&self.subagent_timeout_secs) {
+            return Err("子代理时间预算必须在 30 ~ 3600 秒之间".to_string());
         }
 
         let mut seen_ids: HashSet<&str> = HashSet::new();
@@ -1275,8 +1336,13 @@ mod tests {
         let id = base.llm.providers[0].id.clone();
 
         let mut cfg = base.clone();
-        cfg.llm.providers[0].max_tokens = 0;
+        cfg.llm.providers[0].max_tokens = Some(0);
         assert!(cfg.validate().is_err());
+
+        // "不指定"是合法默认值（请求体不带 max_tokens）
+        let mut cfg = base.clone();
+        cfg.llm.providers[0].max_tokens = None;
+        assert!(cfg.validate().is_ok());
 
         let mut cfg = base.clone();
         cfg.llm.providers[0].temperature = 99.0;
@@ -1294,6 +1360,46 @@ mod tests {
         cfg.ui.font_size = 0;
         assert!(cfg.validate().is_err());
 
+        // 工具步数上限：0 与超过 128 必须被拒，128 本身合法（长任务需要更大预算）
+        let mut cfg = base.clone();
+        cfg.tools.max_steps = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = base.clone();
+        cfg.tools.max_steps = 129;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = base.clone();
+        cfg.tools.max_steps = 128;
+        assert!(cfg.validate().is_ok());
+
+        // 子代理预算越界必须被拒（0 会让 spawn_subagents 永远拿不到名额）
+        let mut cfg = base.clone();
+        cfg.tools.subagent_max_children = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = base.clone();
+        cfg.tools.subagent_steps = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = base.clone();
+        cfg.tools.subagent_max_tasks = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = base.clone();
+        cfg.tools.subagent_timeout_secs = 10;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = base.clone();
+        cfg.tools.subagent_timeout_secs = 4000;
+        assert!(cfg.validate().is_err());
+
+        // 合法预算（默认值）必须通过
+        let mut cfg = base.clone();
+        cfg.tools.subagent_max_children = 4;
+        cfg.tools.subagent_steps = 64;
+        assert!(cfg.validate().is_ok());
+
         // 活跃 id 悬空
         let mut cfg = base.clone();
         cfg.llm.active_provider_id = "ghost".to_string();
@@ -1305,10 +1411,10 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
-    /// 单次工具超时可配：默认 60 秒，越界必须被拒（否则会写出"永远挂着"的配置）
+    /// 单次工具超时可配：默认 180 秒，越界必须被拒（否则会写出"永远挂着"的配置）
     #[test]
     fn tool_call_timeout_is_configurable_with_bounds() {
-        assert_eq!(ToolConfig::default().call_timeout_secs, 60);
+        assert_eq!(ToolConfig::default().call_timeout_secs, 180);
 
         let mut cfg = AppConfig::default();
         cfg.tools.call_timeout_secs = 1800;
@@ -1322,7 +1428,7 @@ mod tests {
 
         // 旧配置里没有这个字段时必须落到默认值，而不是 0（0 会导致每次调用立即超时）
         let legacy: ToolConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(legacy.call_timeout_secs, 60);
+        assert_eq!(legacy.call_timeout_secs, 180);
     }
 
     // ─── 模型路由（自动选择） ───────────────────────
@@ -1393,5 +1499,17 @@ mod tests {
         .unwrap();
         assert!(legacy.thinking_models.is_empty());
         assert!(!legacy.enable_thinking);
+        assert_eq!(legacy.max_tokens, Some(100));
+
+        // 缺 max_tokens 的旧 JSON → 不指定（None），而不是解析失败
+        let missing: LlmProvider = serde_json::from_str(
+            r#"{"id":"p","name":"n","api_base_url":"https://a/v1","api_key":"k","model":"m","temperature":0.5}"#,
+        )
+        .unwrap();
+        assert_eq!(missing.max_tokens, None);
+
+        // None 不落盘（config.json 里不出现该键）
+        let json = serde_json::to_string(&LlmProvider::new("A", "https://a/v1", "sk")).unwrap();
+        assert!(!json.contains("max_tokens"), "{json}");
     }
 }

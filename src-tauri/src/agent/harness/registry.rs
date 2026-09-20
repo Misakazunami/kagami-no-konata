@@ -6,6 +6,11 @@ use crate::llm::types::ToolSchema;
 
 use super::traits::{Permission, Tool, ToolDescriptor, ToolInfo};
 
+/// 可见性判定：模式规则 ∨ 规划模式的联网例外
+fn permission_visible(permission: &Permission, mode: ToolMode, plan_network: bool) -> bool {
+    permission.visible_in(mode) || (plan_network && *permission == Permission::Network)
+}
+
 /// 工具注册表
 ///
 /// 唯一负责"哪些工具在当前模式下可见"的地方：不可见的工具既不出现在
@@ -78,9 +83,19 @@ impl ToolRegistry {
 
     /// 按模式过滤后的可见工具描述
     pub fn visible(&self, mode: ToolMode) -> Vec<&Arc<dyn Tool>> {
+        self.visible_with(mode, false)
+    }
+
+    /// 按模式 + 规划模式联网开关过滤可见工具
+    ///
+    /// `plan_network` 为真时，网络类工具在只读模式下也可见（仍逐次审批）：
+    /// 任务 Plan 阶段需要查外部资料，但文件写入与命令执行照旧不可见。
+    pub fn visible_with(&self, mode: ToolMode, plan_network: bool) -> Vec<&Arc<dyn Tool>> {
         self.tools
             .iter()
-            .filter(|t| t.enabled() && t.descriptor().permission.visible_in(mode))
+            .filter(|t| {
+                t.enabled() && permission_visible(&t.descriptor().permission, mode, plan_network)
+            })
             .collect()
     }
 
@@ -92,9 +107,20 @@ impl ToolRegistry {
             .collect()
     }
 
+    pub fn visible_names_with(&self, mode: ToolMode, plan_network: bool) -> Vec<String> {
+        self.visible_with(mode, plan_network)
+            .iter()
+            .map(|t| t.descriptor().name.to_string())
+            .collect()
+    }
+
     /// 生成给模型的工具声明
     pub fn schemas(&self, mode: ToolMode) -> Vec<ToolSchema> {
-        self.visible(mode)
+        self.schemas_with(mode, false)
+    }
+
+    pub fn schemas_with(&self, mode: ToolMode, plan_network: bool) -> Vec<ToolSchema> {
+        self.visible_with(mode, plan_network)
             .iter()
             .map(|tool| {
                 let d = tool.descriptor();
@@ -126,8 +152,17 @@ impl ToolRegistry {
 
     /// 查找可调用的工具（同时执行"工具可用"与"模式可见性"检查）
     pub fn find(&self, name: &str, mode: ToolMode) -> Option<Arc<dyn Tool>> {
+        self.find_with(name, mode, false)
+    }
+
+    pub fn find_with(
+        &self,
+        name: &str,
+        mode: ToolMode,
+        plan_network: bool,
+    ) -> Option<Arc<dyn Tool>> {
         let tool = self.by_name.get(name)?;
-        if !tool.enabled() || !tool.descriptor().permission.visible_in(mode) {
+        if !tool.enabled() || !permission_visible(&tool.descriptor().permission, mode, plan_network) {
             return None;
         }
         Some(tool.clone())
@@ -186,7 +221,24 @@ mod tests {
                 name: "run_thing",
                 permission: Permission::Execute,
             }),
+            Arc::new(Dummy {
+                name: "net_thing",
+                permission: Permission::Network,
+            }),
         ])
+    }
+
+    /// 规划模式（只读 + 联网例外）：网络工具可见，文件/命令仍不可见
+    #[test]
+    fn plan_network_exception_only_opens_network_tools() {
+        let reg = registry();
+        assert!(reg.find("net_thing", ToolMode::ReadOnly).is_none());
+        assert!(reg.find_with("net_thing", ToolMode::ReadOnly, true).is_some());
+        assert!(reg.find_with("write_thing", ToolMode::ReadOnly, true).is_none());
+        assert!(reg.find_with("run_thing", ToolMode::ReadOnly, true).is_none());
+        let names = reg.visible_names_with(ToolMode::ReadOnly, true);
+        assert!(names.contains(&"net_thing".to_string()));
+        assert!(names.contains(&"read_thing".to_string()));
     }
 
     #[test]
@@ -209,7 +261,7 @@ mod tests {
     #[test]
     fn full_mode_shows_everything() {
         let reg = registry();
-        assert_eq!(reg.visible_names(ToolMode::Full).len(), 3);
+        assert_eq!(reg.visible_names(ToolMode::Full).len(), 4);
         assert!(reg.find("run_thing", ToolMode::Full).is_some());
     }
 

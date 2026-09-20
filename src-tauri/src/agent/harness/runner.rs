@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::llm::backend::ChatBackend;
 use crate::llm::types::{LlmMessage, StreamChunk, ToolCall, ToolSchema};
@@ -135,8 +135,24 @@ pub struct HarnessRun<'a> {
     pub tools_enabled: bool,
     /// 配置里免审批的工具名
     pub auto_approve: Vec<String>,
+    /// 会话级 AUTO：所有需要审批的调用直接放行（仅任务会话可开）
+    ///
+    /// 独立于 `auto_approve` 的布尔字段而不是往列表里塞通配符：
+    /// 用户配置永远无法通过写入 `"*"` 意外获得全局放行。
+    pub auto_approve_all: bool,
     pub limits: ToolLimits,
     pub max_steps: usize,
+}
+
+/// 单次工具调用的外层兜底窗口
+///
+/// 工具可以自带预算（目前只有 `spawn_subagents`：它的调用包住整个子代理批次），
+/// 未提供时用 `ToolLimits.call_timeout`。外层统一留一段宽限，让工具在自己的
+/// 软截止之后还有时间把部分结果收拢返回。
+fn call_timeout_window(tool_budget: Option<Duration>, limits: &ToolLimits) -> Duration {
+    tool_budget
+        .unwrap_or(limits.call_timeout)
+        .saturating_add(CALL_TIMEOUT_GRACE)
 }
 
 impl HarnessRun<'_> {
@@ -159,7 +175,8 @@ impl HarnessRun<'_> {
         G: Fn(&str) + Send + Sync,
     {
         let schemas: Vec<ToolSchema> = if self.tools_enabled && !self.registry.is_empty() {
-            self.registry.schemas(self.services.mode)
+            self.registry
+                .schemas_with(self.services.mode, self.services.plan_network)
         } else {
             Vec::new()
         };
@@ -322,6 +339,21 @@ impl HarnessRun<'_> {
                     // 「本次会话允许」在后续同类调用中生效
                     if record.approval.as_deref() == Some("allow_session") {
                         session_grants.insert(record.tool.clone());
+                        // 同时落库：按钮承诺的是"本会话"，只在本次生成的内存里
+                        // 生效会让用户下一轮又被同一个工具弹窗（界面与语义不符）
+                        if let Some(store) = self.services.chat_store.as_ref() {
+                            let saved = store
+                                .lock()
+                                .map_err(|e| e.to_string())
+                                .and_then(|store| {
+                                    store
+                                        .grant_session_tool(self.session_id, &record.tool)
+                                        .map_err(|e| e.to_string())
+                                });
+                            if let Err(e) = saved {
+                                eprintln!("[harness] 保存会话授权失败：{}", e);
+                            }
+                        }
                     }
                     extra_tokens += record.extra_tokens;
                     invocations.push(record);
@@ -381,8 +413,15 @@ impl HarnessRun<'_> {
         }
 
         // ─── 工具不存在或当前模式不可见 ───
-        let Some(tool) = self.registry.find(&call.name, self.services.mode) else {
-            let available = self.registry.visible_names(self.services.mode).join(", ");
+        let Some(tool) = self.registry.find_with(
+            &call.name,
+            self.services.mode,
+            self.services.plan_network,
+        ) else {
+            let available = self
+                .registry
+                .visible_names_with(self.services.mode, self.services.plan_network)
+                .join(", ");
             let hint = if self.registry.descriptor_of(&call.name).is_some() {
                 format!(
                     "工具「{}」在当前模式下不可用（当前模式：{:?}）",
@@ -429,13 +468,15 @@ impl HarnessRun<'_> {
                 "permission": permission.as_str(),
                 "risk": permission.risk_label(),
                 "step": step,
+                "max_steps": self.max_steps,
                 "status": "running",
             }),
         );
 
         // ─── 审批 ───
         if permission.requires_approval() {
-            let pre_granted = grants.map(|g| g.contains(&call.name)).unwrap_or(false)
+            let pre_granted = self.auto_approve_all
+                || grants.map(|g| g.contains(&call.name)).unwrap_or(false)
                 || self.auto_approve.iter().any(|name| name == &call.name);
 
             if pre_granted {
@@ -471,8 +512,11 @@ impl HarnessRun<'_> {
         }
 
         // ─── 执行（超时 + 取消） ───
+        // 预算按工具选择：普通工具用 `call_timeout`（默认 60 秒），
+        // `spawn_subagents` 用整批子代理自己的预算（默认 600 秒）
+        let window = call_timeout_window(tool.timeout_budget(&self.services), &self.limits);
         let outcome = tokio::time::timeout(
-            self.limits.call_timeout + CALL_TIMEOUT_GRACE,
+            window,
             tool.call(call.arguments.clone(), &cx),
         )
         .await;
@@ -513,7 +557,7 @@ impl HarnessRun<'_> {
             }
             Err(_) => {
                 // 走到这里说明工具连自己的截止时间都没守住（外层兜底超时）
-                let timeout = (self.limits.call_timeout + CALL_TIMEOUT_GRACE).as_secs();
+                let timeout = window.as_secs();
                 self.finish_error(
                     record,
                     started,
@@ -815,6 +859,7 @@ mod tests {
             approver,
             tools_enabled,
             auto_approve: Vec::new(),
+            auto_approve_all: false,
             limits: fx.limits,
             max_steps,
         };
@@ -1343,6 +1388,7 @@ mod tests {
             approver: Arc::new(AllowAllApprover),
             tools_enabled: true,
             auto_approve: Vec::new(),
+            auto_approve_all: false,
             limits: fx.limits,
             max_steps: 8,
         };
@@ -1380,6 +1426,7 @@ mod tests {
             approver: Arc::new(DenyAllApprover),
             tools_enabled: true,
             auto_approve: vec!["danger".to_string()],
+            auto_approve_all: false,
             limits: fx.limits,
             max_steps: 8,
         };
@@ -1392,6 +1439,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(*calls.lock().unwrap(), 1, "免审批工具应当直接执行");
+        assert_eq!(outcome.invocations[0].approval.as_deref(), Some("auto"));
+    }
+
+    /// 会话级 AUTO：即使审批者一律拒绝（无弹窗场景），工具也必须直接执行
+    #[test]
+    fn auto_approve_all_skips_prompt_even_for_execute() {
+        let (tool, calls) = MockTool::new("run_command", Permission::Execute);
+        let fx = fixture(vec![tool], ToolMode::Full);
+        let backend = MockBackend::new(vec![
+            vec![tool_call_chunk(0, "c1", "run_command", "{}")],
+            vec![StreamChunk::Content("完成".to_string())],
+        ]);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let run = HarnessRun {
+            backend: backend.as_ref(),
+            registry: &fx.registry,
+            services: fx.services.clone(),
+            session_id: "s1",
+            stream_id: "stream-1",
+            cancel,
+            emit: fx.sink.clone(),
+            approver: Arc::new(DenyAllApprover),
+            tools_enabled: true,
+            auto_approve: Vec::new(),
+            auto_approve_all: true,
+            limits: fx.limits,
+            max_steps: 8,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime
+            .block_on(run.execute(messages(), |_| {}, |_| {}))
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 1, "AUTO 下执行类工具也直接执行");
         assert_eq!(outcome.invocations[0].approval.as_deref(), Some("auto"));
     }
 
@@ -1451,6 +1536,7 @@ mod tests {
             approver: Arc::new(AllowAllApprover),
             tools_enabled: true,
             auto_approve: Vec::new(),
+            auto_approve_all: false,
             limits: fx.limits,
             max_steps: 8,
         };
@@ -1487,5 +1573,29 @@ mod tests {
         let backend = BrokenStreamBackend::new(vec![Err(anyhow!("broken pipe"))]);
         let result = run_broken(&fx, &backend);
         assert!(result.is_err(), "没有任何内容时应当报错");
+    }
+
+    /// 外层窗口 = 工具自带预算 ∨ call_timeout，再统一加宽限
+    ///
+    /// 子代理批次正是靠它摆脱 70 秒被杀：`SpawnSubagents::timeout_budget`
+    /// 返回配置里的批次预算（默认 600 秒）。
+    #[test]
+    fn timeout_window_prefers_tool_budget_and_keeps_grace() {
+        let limits = ToolLimits {
+            max_output_bytes: 1024,
+            call_timeout: Duration::from_secs(60),
+            approval_timeout: Duration::from_secs(5),
+        };
+
+        assert_eq!(call_timeout_window(None, &limits), Duration::from_secs(70));
+        assert_eq!(
+            call_timeout_window(Some(Duration::from_secs(600)), &limits),
+            Duration::from_secs(610)
+        );
+        // 极端值不能溢出 panic（工具预算来自配置，理论上界 3600 秒，但要兜底）
+        assert_eq!(
+            call_timeout_window(Some(Duration::MAX), &limits),
+            Duration::MAX
+        );
     }
 }

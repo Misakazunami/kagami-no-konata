@@ -11,12 +11,12 @@ use crate::agent::harness::{
     ToolLimits, ToolRuntime, ToolServices, WorkspaceSet,
 };
 use crate::agent::traits::AgentContext;
-use crate::commands::tools::{TauriEventSink, TauriOpener};
+use crate::commands::tools::{ensure_main_window, TauriEventSink, TauriOpener};
 use crate::config::types::LlmProvider;
 use crate::llm::proxy::LlmProxy;
 use crate::llm::types::LlmMessage;
 use crate::memory::extractor::MemoryExtractor;
-use crate::store::chat_store::{ChatStore, ToolInvocationRow};
+use crate::store::chat_store::{ChatStore, RewindOutcome, ToolInvocationRow};
 use crate::AppState;
 
 /// 交给 LLM 的历史消息条数上限（对应文档中的"保留最近 10 条"）
@@ -291,6 +291,43 @@ fn tool_limits(cfg: &crate::config::types::ToolConfig) -> ToolLimits {
     }
 }
 
+/// 会话类型 × 任务模式 → `(工具可见性, 步数预算)`
+///
+/// 任务会话的 Plan 与 Work 共用配置里的步数预算（下限 20）：只读调查同样可能
+/// 横跨十几次工具调用（真实案例：代码审查读到第 8 轮还没读完核心文件），
+/// 写死小数字只会让模型被强制收尾、计划面板永远空白。
+/// 普通聊天仍限制为 3 轮，避免闲聊陷入多轮复杂思考。
+///
+/// 可见性：Plan 恒为只读（联网只读另由 `plan_network` 打开）；Work 恒为
+/// `Full`（执行类工具必须可见，否则"任务模式"没有编码能力），审批与硬黑名单
+/// 都不因可见性放宽而失效。
+pub(crate) fn effective_tool_limits(
+    session_type: &str,
+    task_mode: &str,
+    tools_cfg: &crate::config::types::ToolConfig,
+) -> (crate::config::types::ToolMode, usize) {
+    if session_type == "task" {
+        // Work 与 Plan 同预算；Plan 的权限由调用方额外锁成只读。
+        //
+        // Work 恒为 Full：任务会话是用户显式创建的执行上下文，编码任务需要
+        // run_command 可见；每一次命令/写入仍要审批（除非会话级 AUTO），
+        // 敏感命令也仍被 command_guard 硬拦截——可见性不等于放行。
+        let mode = if task_mode == "plan" {
+            crate::config::types::ToolMode::ReadOnly
+        } else {
+            crate::config::types::ToolMode::Full
+        };
+        (mode, tools_cfg.max_steps.max(20))
+    } else {
+        (
+            crate::config::types::ToolMode::ReadOnly,
+            3.min(tools_cfg.max_steps),
+        )
+    }
+}
+
+// 参数逐个来自会话上下文；拆结构体只会把调用点变啰嗦（与 send_message 同一约定）
+#[allow(clippy::too_many_arguments)]
 fn build_tool_runtime(
     app: &AppHandle,
     window: &WebviewWindow,
@@ -299,6 +336,8 @@ fn build_tool_runtime(
     session_type: &str,
     task_mode: &str,
     target_workspace_id: Option<&str>,
+    session_id: &str,
+    auto_approve_all: bool,
 ) -> Option<ToolRuntime> {
     if window.label() == "float" {
         return None;
@@ -325,18 +364,13 @@ fn build_tool_runtime(
 
     // 根据会话类型与模式动态决定工具权限与步数限制：
     // - 普通会话 (chat)：锁定为轻量只读，步数较小（如 3 轮），防止闲聊陷入多轮复杂思考
-    // - 任务会话 (task) - Plan 模式：严格锁定只读 (ToolMode::ReadOnly)，杜绝写文件与命令，步数 8
-    // - 任务会话 (task) - Work 模式：使用配置的权限 (Standard 或 Full)，步数增加（如 20 轮）
-    let (effective_mode, effective_max_steps) = if session_type == "task" {
-        if task_mode == "plan" {
-            (crate::config::types::ToolMode::ReadOnly, 8.min(tools_cfg.max_steps))
-        } else {
-            (tools_cfg.mode, tools_cfg.max_steps.max(20))
-        }
-    } else {
-        // 普通聊天会话
-        (crate::config::types::ToolMode::ReadOnly, 3.min(tools_cfg.max_steps))
-    };
+    // - 任务会话 (task)：Plan 与 Work 共用同一份步数预算（`max_steps`，下限 20）——
+    //   只读调查同样可能跨十几次工具调用，写死小数字会让模型读不完就被强制收尾
+    // - Plan 模式额外允许联网只读（每次仍需审批）与会话级写入（update_plan / save_note）
+    let (effective_mode, effective_max_steps) =
+        effective_tool_limits(session_type, task_mode, &tools_cfg);
+    // 只有任务 Plan 模式放开"联网只读"：调查阶段需要查版本/报错资料
+    let plan_network = session_type == "task" && task_mode == "plan";
 
     let workspaces = WorkspaceSet::from_config(&tools_cfg, &app_data_dir);
     // 写类工具改动前的快照：让"模型动过的文件"可以一键回滚
@@ -361,7 +395,21 @@ fn build_tool_runtime(
         working_memory: tools_cfg.working_memory,
         // 未启用/未配好时为 None：工具会给出"请去设置里填端点"的明确指引
         search: tools_cfg.search.resolved(),
+        plan_network,
+        // 子代理批次的整体预算（普通工具的 call_timeout 不够它用）
+        subagent_timeout: Duration::from_secs(tools_cfg.subagent_timeout_secs),
     };
+
+    // 持久化的会话授权与全局免审批清单合并：用户在审批弹窗点过
+    // 「本会话允许」的工具，后续每次生成都不再弹窗
+    let mut auto_approve = tools_cfg.auto_approve.clone();
+    if let Ok(store) = state.chat_store.lock() {
+        for tool in store.list_session_grants(session_id).unwrap_or_default() {
+            if !auto_approve.contains(&tool) {
+                auto_approve.push(tool);
+            }
+        }
+    }
 
     Some(ToolRuntime {
         services,
@@ -371,10 +419,89 @@ fn build_tool_runtime(
             state.pending_approvals.clone(),
         )),
         enabled: true,
-        auto_approve: tools_cfg.auto_approve.clone(),
+        auto_approve,
+        // 只有任务会话会持久化开启 AUTO；这里再按会话类型兜一道，
+        // 防止历史脏数据让普通聊天静默放行（AUTO 的语义只在任务模式成立）
+        auto_approve_all: auto_approve_all && session_type == "task",
         limits: tool_limits(&tools_cfg),
         max_steps: effective_max_steps,
+        subagent_max_children: tools_cfg.subagent_max_children,
+        subagent_steps: tools_cfg.subagent_steps,
+        subagent_max_tasks: tools_cfg.subagent_max_tasks,
     })
+}
+
+/// 一次生成的输入参数
+///
+/// `send_message`（新提问）与 `regenerate_message` / `edit_message`（重试、编辑）
+/// 共用同一条生成流水线，差异全部收敛在这里：
+/// - `persist_user`：重试/编辑复用历史里的用户行，绝不新插一条（否则每点一次重试
+///   历史里就多一条一样的提问）；
+/// - `billed_user_tokens`：重试/编辑时 prompt 上轮已经计过费，传 0 只记 completion。
+struct GenerationOptions {
+    session_id: String,
+    content: String,
+    system_hint: Option<String>,
+    stream_id: String,
+    /// 是否把本轮写入数据库（悬浮窗"戳一戳"等一次性交互为 false）
+    persist: bool,
+    /// 是否把用户消息写入数据库（false = 复用已有用户消息行）
+    persist_user: bool,
+    /// 记入全局用量的 prompt token
+    billed_user_tokens: i64,
+}
+
+/// 注册取消标志（不做空闲检查：两个窗口同会话并发生成是既有设计）
+fn register_stream(
+    state: &AppState,
+    session_id: &str,
+    stream_id: &str,
+) -> Result<Arc<AtomicBool>, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut flags = state.cancel_flags.lock().map_err(|e| e.to_string())?;
+    flags.insert(
+        stream_id.to_string(),
+        crate::ActiveStream {
+            session_id: session_id.to_string(),
+            cancel: cancel.clone(),
+        },
+    );
+    Ok(cancel)
+}
+
+/// 回收取消标志（无论成功、失败还是被取消都必须执行，否则 map 会持续泄漏）
+fn remove_stream(state: &AppState, stream_id: &str) {
+    if let Ok(mut flags) = state.cancel_flags.lock() {
+        flags.remove(stream_id);
+    }
+}
+
+/// 为"改写历史"类操作（回退 / 重试 / 编辑）预占会话
+///
+/// 检查与注册在同一把锁内完成，避免"检查通过 → 另一个窗口恰好开始生成"的竞态。
+/// 生成结束时 assistant 消息会追加到消息表末尾，若与截断并发，落点会错乱，
+/// 因此这类操作必须等到该会话没有在飞生成。
+fn reserve_session(
+    state: &AppState,
+    session_id: &str,
+    stream_id: &str,
+) -> Result<Arc<AtomicBool>, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut flags = state.cancel_flags.lock().map_err(|e| e.to_string())?;
+    if flags
+        .values()
+        .any(|active| active.session_id == session_id)
+    {
+        return Err("该会话正在生成中，请先停止或等待完成".to_string());
+    }
+    flags.insert(
+        stream_id.to_string(),
+        crate::ActiveStream {
+            session_id: session_id.to_string(),
+            cancel: cancel.clone(),
+        },
+    );
+    Ok(cancel)
 }
 
 /// 发送消息并获取流式响应
@@ -408,22 +535,83 @@ pub async fn send_message(
             .map_err(|_| format!("会话不存在：{}", session_id))?;
     }
 
-    // 存储用户消息（一次性交互不落库）
     let user_tokens = estimate_tokens(&content);
-    if persist {
+    // 取消标志在生成开始前注册，由 wrapper 统一回收（任何早期错误也不会泄漏）
+    let cancel = register_stream(&state, &session_id, &stream_id)?;
+    let result = run_generation(
+        &app,
+        &window,
+        &state,
+        GenerationOptions {
+            session_id: session_id.clone(),
+            content,
+            system_hint,
+            stream_id: stream_id.clone(),
+            persist,
+            persist_user: true,
+            billed_user_tokens: user_tokens,
+        },
+        cancel,
+    )
+    .await;
+    remove_stream(&state, &stream_id);
+    result
+}
+
+/// 生成主流程：调用方负责会话存在性校验与取消标志的注册 / 回收
+async fn run_generation(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    state: &State<'_, AppState>,
+    opts: GenerationOptions,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let GenerationOptions {
+        session_id,
+        content,
+        system_hint,
+        stream_id,
+        persist,
+        persist_user,
+        billed_user_tokens,
+    } = opts;
+
+    // 存储用户消息（一次性交互不落库；重试/编辑复用已有用户行，不插新行）
+    let user_tokens = estimate_tokens(&content);
+    let mut user_message_id: Option<String> = None;
+    if persist && persist_user {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-        if let Err(e) = store.add_message(&session_id, Role::User, &content, user_tokens, 0, None, None) {
-            return Err(persist_failure(&store, &session_id, e));
+        match store.add_message(&session_id, Role::User, &content, user_tokens, 0, None, None) {
+            Ok(message) => user_message_id = Some(message.id),
+            Err(e) => return Err(persist_failure(&store, &session_id, e)),
         }
     }
 
-    // 获取会话的人格 ID、会话类型、任务模式、指定的工作区 ID 与会话级模型偏好
-    let (persona_id, session_type, task_mode, workspace_id, model_pref) = {
+    // 获取会话的人格 ID、会话类型、任务模式、工作区、模型偏好与 AUTO 开关
+    let (persona_id, session_type, task_mode, workspace_id, model_pref, auto_approve_all) = {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
         store
             .get_session(&session_id)
-            .map(|s| (s.persona_id, s.session_type, s.task_mode, s.workspace_id, s.model_pref))
-            .unwrap_or_else(|_| ("konata-default".to_string(), "chat".to_string(), "plan".to_string(), None, None))
+            .map(|s| {
+                (
+                    s.persona_id,
+                    s.session_type,
+                    s.task_mode,
+                    s.workspace_id,
+                    s.model_pref,
+                    s.auto_approve_all,
+                )
+            })
+            .unwrap_or_else(|_| {
+                (
+                    "konata-default".to_string(),
+                    "chat".to_string(),
+                    "plan".to_string(),
+                    None,
+                    None,
+                    false,
+                )
+            })
     };
 
     // 获取配置（使用活跃提供商）
@@ -450,7 +638,7 @@ pub async fn send_message(
 
     // 构建上下文（必要时增量压缩早期历史）
     let (conversation, context_summary) =
-        load_context(&state, &session_id, &llm_provider, persist).await?;
+        load_context(state, &session_id, &llm_provider, persist).await?;
 
     // 记忆检索：增强查询（用户输入 + 最近对话）→ embed → 检索
     // 一次性交互不做检索，省掉一次 embedding 调用
@@ -477,13 +665,15 @@ pub async fn send_message(
     // 构建 AgentContext（含记忆 + 用户信息 + 工具运行时）
     // 工具运行时只对主窗口构建；悬浮窗得到 None，走与接入工具前完全一致的纯对话链路
     let tools = build_tool_runtime(
-        &app,
-        &window,
-        &state,
+        app,
+        window,
+        state,
         &llm_provider,
         &session_type,
         &task_mode,
         workspace_id.as_deref(),
+        &session_id,
+        auto_approve_all,
     );
     // 任务计划只服务于"有工具的链路"：悬浮窗不注入，保持纯对话行为不变
     let plan = if tools.is_some() {
@@ -529,18 +719,8 @@ pub async fn send_message(
         stream_id: stream_id.clone(),
     };
 
-    // 注册取消标志（供 stop_generation 使用）
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let mut flags = state.cancel_flags.lock().map_err(|e| e.to_string())?;
-        flags.insert(
-            stream_id.clone(),
-            crate::ActiveStream {
-                session_id: session_id.clone(),
-                cancel: cancel.clone(),
-            },
-        );
-    }
+    // 取消标志由调用方（send_message / regenerate_message / edit_message）预先注册，
+    // 这里直接使用 `cancel`；生成结束统一由调用方回收。
 
     // 流式调用（计时）—— 通过 AgentDispatcher 进行智能体路由分发
     let start_time = std::time::Instant::now();
@@ -576,13 +756,6 @@ pub async fn send_message(
             },
         )
         .await;
-
-    // 无论成功、失败还是被取消，都要回收取消标志（否则 map 会持续泄漏）
-    {
-        if let Ok(mut flags) = state.cancel_flags.lock() {
-            flags.remove(&stream_id);
-        }
-    }
 
     let response = match result {
         Ok(response) => response,
@@ -630,6 +803,10 @@ pub async fn send_message(
             "thinking_ms": thinking_ms,
             // 本轮实际用的模型（自动选择下主/子模型不同，必须让用户看得见）
             "model": models.label(),
+            // 工具步数用尽被迫收尾时如实告知：界面提示"中断，可继续"，
+            // 不再让用户以为模型已经答完了（长任务被静默截断是真实报障）
+            "step_limit_hit": response.hit_step_limit,
+            "tool_steps": response.tool_steps,
         }),
     );
     let _ = app.emit(
@@ -646,7 +823,7 @@ pub async fn send_message(
     let invocations = response.tool_invocations.clone();
     // 本轮实际使用的模型：随消息落库，历史消息也能显示"这条是谁答的"
     let model_label = models.label();
-    let full_conversation = {
+    let (full_conversation, assistant_message_id) = {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
         let assistant_message = match store.add_message(
             &session_id,
@@ -673,8 +850,8 @@ pub async fn send_message(
                 return Err(format!("保存回复失败：{}", e));
             }
         };
-        // 记录使用统计
-        let _ = store.record_usage(user_tokens, assistant_tokens, thinking_ms);
+        // 记录使用统计（重试/编辑不重复计 prompt token）
+        let _ = store.record_usage(billed_user_tokens, assistant_tokens, thinking_ms);
 
         // 工具轨迹：只保存预览，供 UI 回放；永不回灌模型，也不进摘要/记忆
         if !invocations.is_empty() {
@@ -696,6 +873,7 @@ pub async fn send_message(
                     truncated: record.truncated,
                     duration_ms: record.duration_ms,
                     approval: record.approval.clone(),
+                    extra_tokens: record.extra_tokens as i64,
                     created_at: now.clone(),
                 })
                 .collect();
@@ -708,19 +886,22 @@ pub async fn send_message(
             }
         }
 
-        store.get_messages(&session_id).map_err(|e| e.to_string())?
+        let full = store.get_messages(&session_id).map_err(|e| e.to_string())?;
+        (full, assistant_message.id)
     };
 
     // 通知所有窗口会话已更新（用于跨窗口同步）
     //
-    // 载荷必须带 `stream_id`：主窗口据此跳过"自己发起的生成"的回读
-    // （本地消息已经带着 stats/模型标签落位，回读只会造成闪烁；其它窗口
-    // 以及悬浮窗的生成仍然要靠它同步）。
+    // 载荷带 `stream_id` 与本轮落库的消息 id：主窗口据此把本地乐观消息
+    // （`crypto.randomUUID`，与数据库 id 不同源）换成数据库 id——重试/编辑/回退
+    // 都要凭 id 找到消息；其它窗口以及悬浮窗的生成仍然靠它触发回读同步。
     let _ = app.emit(
         "session-updated",
         json!({
             "session_id": &session_id,
             "stream_id": &stream_id,
+            "message_id": &assistant_message_id,
+            "user_message_id": &user_message_id,
         }),
     );
 
@@ -795,12 +976,241 @@ pub async fn send_message(
     Ok(())
 }
 
+// ─── 历史回退 / 重试 / 编辑 ─────────────────────────────
+
+/// 回退预览中的一个受影响轮次（界面据此展示"可一并撤销的文件改动"）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RewindAffectedStreamView {
+    pub stream_id: String,
+    pub files: usize,
+    pub bytes: i64,
+}
+
+/// 回退预览（只读，不写库）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RewindPreviewView {
+    pub removed: usize,
+    pub affected_streams: Vec<RewindAffectedStreamView>,
+}
+
+/// 预览"回退到某条消息"会删除多少内容、涉及哪些可回滚的文件轮次
+#[tauri::command]
+pub async fn preview_rewind(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    message_id: String,
+    inclusive: bool,
+) -> Result<RewindPreviewView, String> {
+    ensure_main_window(&window)?;
+    let (outcome, snapshot_rows) = {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        let outcome = store
+            .preview_rewind(&session_id, &message_id, inclusive)
+            .map_err(|e| e.to_string())?;
+        // 快照清单失败只影响"文件数"展示，不阻断回退预览
+        let rows = store.list_session_snapshots(&session_id).unwrap_or_default();
+        (outcome, rows)
+    };
+
+    let mut affected: Vec<RewindAffectedStreamView> = Vec::new();
+    for row in snapshot_rows {
+        if !outcome.affected_streams.contains(&row.stream_id) {
+            continue;
+        }
+        match affected.iter_mut().find(|s| s.stream_id == row.stream_id) {
+            Some(stream) => {
+                stream.files += 1;
+                stream.bytes += row.bytes;
+            }
+            None => affected.push(RewindAffectedStreamView {
+                stream_id: row.stream_id,
+                files: 1,
+                bytes: row.bytes,
+            }),
+        }
+    }
+    // `list_session_snapshots` 按 created_at DESC 返回，首次出现顺序即"新 → 旧"：
+    // 保持这个顺序，界面撤销文件改动时也按同一顺序恢复（先撤最新一轮）
+    Ok(RewindPreviewView {
+        removed: outcome.removed,
+        affected_streams: affected,
+    })
+}
+
+/// 回退：删除某条消息及其之后的全部消息（不触发生成）
+///
+/// `inclusive=false` 时保留目标消息本身（重试用户提问用）。
+#[tauri::command]
+pub async fn delete_messages_from(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    message_id: String,
+    inclusive: Option<bool>,
+) -> Result<RewindOutcome, String> {
+    ensure_main_window(&window)?;
+
+    // 借用 cancel_flags 做一次"会话空闲"检查与占位，避免与在飞生成交错
+    let guard_id = format!("rewind-{}", uuid::Uuid::new_v4());
+    reserve_session(&state, &session_id, &guard_id)?;
+    let result = {
+        let store = state.chat_store.lock();
+        match store {
+            Ok(store) => store
+                .rewind_messages(&session_id, &message_id, inclusive.unwrap_or(true))
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    remove_stream(&state, &guard_id);
+
+    let outcome = result?;
+    // 空 stream_id：两个窗口都会回读（非空且等于本窗口 lastLocalStreamId 时才会被跳过）
+    let _ = app.emit(
+        "session-updated",
+        json!({ "session_id": &session_id, "stream_id": "" }),
+    );
+    Ok(outcome)
+}
+
+/// 重试：删除原回复及其后内容，用原提问重新生成
+///
+/// - 目标是 assistant：删除该回复及其后全部消息，用其前一条用户消息重新生成；
+/// - 目标是 user（上一轮生成失败/被取消）：保留该提问，删除其后内容后重新生成。
+#[tauri::command]
+pub async fn regenerate_message(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    message_id: String,
+    stream_id: Option<String>,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    let stream_id = stream_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // 先定位原提问与截断边界（不写库）
+    let (content, inclusive) = {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        let target = store
+            .get_message(&session_id, &message_id)
+            .map_err(|e| e.to_string())?;
+        match target.role {
+            Role::User => (target.content, false),
+            Role::Assistant => {
+                let parent = store
+                    .last_user_message_before(&session_id, &message_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "找不到该回复对应的用户提问，无法重试".to_string())?;
+                (parent.content, true)
+            }
+            Role::System => return Err("系统消息不支持重试".to_string()),
+        }
+    };
+
+    let cancel = reserve_session(&state, &session_id, &stream_id)?;
+    // 截断必须先于生成完成：上下文读取的是截断后的历史
+    let prepared = {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        store
+            .rewind_messages(&session_id, &message_id, inclusive)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+
+    let result = match prepared {
+        Ok(()) => {
+            run_generation(
+                &app,
+                &window,
+                &state,
+                GenerationOptions {
+                    session_id: session_id.clone(),
+                    content,
+                    system_hint: None,
+                    stream_id: stream_id.clone(),
+                    persist: true,
+                    persist_user: false,
+                    // prompt 已在上一次生成计过费，重试只记 completion
+                    billed_user_tokens: 0,
+                },
+                cancel,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    remove_stream(&state, &stream_id);
+    result
+}
+
+/// 编辑用户消息：更新正文并删除其后全部消息，然后立即重新生成
+#[tauri::command]
+pub async fn edit_message(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    message_id: String,
+    content: String,
+    stream_id: Option<String>,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err("消息内容不能为空".to_string());
+    }
+    let stream_id = stream_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let cancel = reserve_session(&state, &session_id, &stream_id)?;
+    let token_count = estimate_tokens(&content);
+    let prepared = {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        store
+            .edit_user_message(&session_id, &message_id, &content, token_count)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+
+    let result = match prepared {
+        Ok(()) => {
+            run_generation(
+                &app,
+                &window,
+                &state,
+                GenerationOptions {
+                    session_id: session_id.clone(),
+                    content,
+                    system_hint: None,
+                    stream_id: stream_id.clone(),
+                    persist: true,
+                    persist_user: false,
+                    // prompt 已在上一次生成计过费，编辑重发只记 completion
+                    billed_user_tokens: 0,
+                },
+                cancel,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    remove_stream(&state, &stream_id);
+    result
+}
+
 /// 停止生成
 ///
 /// 优先按 `stream_id` 精确取消；未提供时退化为取消该会话下的全部生成。
 /// 返回是否真的取消到了任务。
 #[tauri::command]
 pub async fn stop_generation(
+    app: AppHandle,
     state: State<'_, AppState>,
     stream_id: Option<String>,
     session_id: Option<String>,
@@ -830,7 +1240,53 @@ pub async fn stop_generation(
         }
     }
 
+    if !hit_streams.is_empty() {
+        if let Some(session) = session_id.as_deref() {
+            mark_plan_blocked_on_stop(&app, &state, session);
+        }
+    }
+
     Ok(!hit_streams.is_empty())
+}
+
+/// 生成被用户停止后，把计划里"进行中"的条目改成"受阻"并广播
+///
+/// 提示词要求模型"用户中途停止时把做不下去的项标成 blocked"，但模型在
+/// 取消后没有任何执行机会；不代它更新的话计划会永远停在"进行中"，
+/// 用户也无从判断任务其实已经停了。
+fn mark_plan_blocked_on_stop(app: &AppHandle, state: &State<'_, AppState>, session_id: &str) {
+    let updated = {
+        let Ok(store) = state.chat_store.lock() else {
+            return;
+        };
+        let Ok(Some(mut plan)) = store.get_plan(session_id) else {
+            return;
+        };
+        let mut changed = false;
+        for item in &mut plan.items {
+            if item.status == crate::agent::plan::PlanStatus::Doing {
+                item.status = crate::agent::plan::PlanStatus::Blocked;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        plan.updated_at = Utc::now().to_rfc3339();
+        if store.save_plan(session_id, &plan).is_err() {
+            return;
+        }
+        plan
+    };
+    let _ = app.emit_to(
+        tauri::EventTarget::webview_window("main"),
+        crate::agent::harness::EVENT_PLAN_UPDATED,
+        json!({
+            "session_id": session_id,
+            "items": updated.items,
+            "note": updated.note,
+        }),
+    );
 }
 
 /// 创建新会话
@@ -842,6 +1298,7 @@ pub async fn create_session(
     session_type: Option<String>,
     workspace_id: Option<String>,
     model_pref: Option<crate::llm::router::SessionModelPref>,
+    task_mode: Option<String>,
 ) -> Result<String, String> {
     let is_task = session_type.as_deref() == Some("task");
     let title = title
@@ -855,6 +1312,15 @@ pub async fn create_session(
             }
         });
     let persona_id = persona_id.unwrap_or_else(|| "konata-default".to_string());
+    // 任务模式在创建时即可选择（默认 plan）；非任务会话按 chat 忽略该字段
+    let task_mode = if is_task {
+        match task_mode.as_deref() {
+            Some("work") => "work",
+            _ => "plan",
+        }
+    } else {
+        "plan"
+    };
 
     // 新的任务会话可以按配置默认开启"自动选择"（只对任务会话有意义）
     let model_pref = match model_pref {
@@ -875,7 +1341,7 @@ pub async fn create_session(
             &persona_id,
             &title,
             session_type.as_deref(),
-            Some("plan"),
+            Some(task_mode),
             workspace_id.as_deref(),
             model_pref.as_ref(),
         )
@@ -910,6 +1376,13 @@ pub async fn set_session_model(
 }
 
 /// 切换会话的任务模式 (plan | work)
+///
+/// 模式在**每轮发送时**从会话行解析（见 `build_tool_runtime`），因此本命令
+/// 不影响正在跑的生成；前端在生成中禁用切换按钮，避免界面显示的"新模式"
+/// 与在飞请求的旧模式不一致。
+///
+/// 不广播 `session-updated`：那个事件会让前端重读整个会话（含消息列表），
+/// 而主窗口已经本地同步；模式也不在悬浮窗的展示范围内。
 #[tauri::command]
 pub async fn set_task_mode(
     state: State<'_, AppState>,
@@ -921,8 +1394,62 @@ pub async fn set_task_mode(
         _ => "plan",
     };
     let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    // 会话必须存在：否则用户会以为"切过去了"，其实写进了一条不存在的会话
+    store
+        .get_session(&session_id)
+        .map_err(|_| format!("会话不存在：{}", session_id))?;
     store
         .set_task_mode(&session_id, mode)
+        .map_err(|e| e.to_string())
+}
+
+/// 开启/关闭会话级 AUTO（自动允许所有需要审批的工具调用）
+///
+/// 只对任务会话开放：普通聊天工具权限本就是只读轻量，AUTO 没有意义，
+/// 拒绝它还能避免"以为开了 AUTO 就能执行命令"的误解。
+///
+/// 与 `set_task_mode` 一样：只写数据库，不影响正在跑的生成
+/// （本轮生成用的是发送那一刻解析出的运行时快照）。
+#[tauri::command]
+pub async fn set_session_auto_approve(
+    state: State<'_, AppState>,
+    session_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    let session = store
+        .get_session(&session_id)
+        .map_err(|_| format!("会话不存在：{}", session_id))?;
+    if session.session_type != "task" {
+        return Err("AUTO 仅对任务会话可用".to_string());
+    }
+    store
+        .set_session_auto_approve(&session_id, enabled)
+        .map_err(|e| e.to_string())
+}
+
+/// 设置/清除会话绑定的工作区（`workspace_id` 为 `None` 表示回到默认沙箱）
+///
+/// 工作区必须已在 `tools.workspaces` 里配置：悬空 id 会让 `build_tool_runtime`
+/// 静默按默认沙箱执行，而用户以为任务跑在指定目录里。
+#[tauri::command]
+pub async fn set_session_workspace(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace_id: Option<String>,
+) -> Result<(), String> {
+    if let Some(id) = workspace_id.as_deref() {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        if !config.tools.workspaces.iter().any(|w| w.id == id) {
+            return Err(format!("工作区不存在：{}", id));
+        }
+    }
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    store
+        .get_session(&session_id)
+        .map_err(|_| format!("会话不存在：{}", session_id))?;
+    store
+        .set_session_workspace(&session_id, workspace_id.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -933,14 +1460,21 @@ pub async fn find_or_create_today_session(
 ) -> Result<Session, String> {
     let store = state.chat_store.lock().map_err(|e| e.to_string())?;
 
-    // 1. 优先查找最近的空会话（无消息），直接复用
-    if let Some(session) = store.find_latest_empty_session().map_err(|e| e.to_string())? {
+    // 1. 优先查找最近的空会话（无消息），直接复用。必须是普通会话：
+    //    任务会话有自己的工作区与模式，混用会让桌宠/聊天入口跑进任务工程
+    if let Some(session) = store
+        .find_latest_empty_session("chat")
+        .map_err(|e| e.to_string())?
+    {
         return Ok(session);
     }
 
     // 2. 查找今日已有会话（有消息的）
     let today = Local::now().format("%Y-%m-%d").to_string();
-    if let Some(session) = store.find_session_by_date(&today).map_err(|e| e.to_string())? {
+    if let Some(session) = store
+        .find_session_by_date(&today, "chat")
+        .map_err(|e| e.to_string())?
+    {
         return Ok(session);
     }
 
@@ -1025,10 +1559,26 @@ pub async fn delete_session(
     }
 
     let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    // 快照索引行会随会话级联删除，但磁盘上的备份目录不会：
+    // 必须在删行前把 stream 清单取出来，删完会话后清理目录
+    let snapshot_streams = store
+        .list_snapshot_streams(&session_id)
+        .unwrap_or_default();
     store
         .delete_session(&session_id)
         .map_err(|e| e.to_string())?;
     drop(store);
+    if !snapshot_streams.is_empty() {
+        let snapshots = crate::agent::harness::SnapshotStore::new(
+            &state.app_data_dir,
+            state.chat_store.clone(),
+        );
+        let removed = snapshots.forget_streams(&snapshot_streams);
+        eprintln!(
+            "[snapshot] 会话 {} 已删除，清理 {} 个备份目录",
+            session_id, removed
+        );
+    }
     // 通知所有窗口会话已被删除
     let _ = app.emit("session-deleted", &session_id);
     Ok(())
@@ -1046,7 +1596,7 @@ mod tests {
     #[test]
     fn tool_limits_follow_config() {
         let mut cfg = crate::config::types::ToolConfig::default();
-        assert_eq!(tool_limits(&cfg).call_timeout, Duration::from_secs(60));
+        assert_eq!(tool_limits(&cfg).call_timeout, Duration::from_secs(180));
 
         cfg.call_timeout_secs = 600;
         cfg.max_output_bytes = 128 * 1024;
@@ -1184,5 +1734,43 @@ mod tests {
         assert!(query.contains("旧问题"));
 
         assert_eq!(build_retrieval_query("孤立问题", &[]), "孤立问题");
+    }
+
+    /// 会话类型 × 模式 → 工具可见性与步数预算
+    #[test]
+    fn effective_tool_limits_follow_session_type() {
+        use crate::config::types::{ToolConfig, ToolMode};
+
+        let cfg = ToolConfig::default(); // max_steps = 32
+
+        // 任务会话：Plan 只读、Work 恒为 Full；两者共用同一预算
+        let (mode, steps) = effective_tool_limits("task", "plan", &cfg);
+        assert_eq!(mode, ToolMode::ReadOnly);
+        assert_eq!(steps, cfg.max_steps.max(20), "Plan 不应被写死成小预算");
+
+        let (mode, steps) = effective_tool_limits("task", "work", &cfg);
+        assert_eq!(mode, ToolMode::Full, "Work 不跟随全局配置");
+        assert_eq!(steps, cfg.max_steps.max(20));
+
+        // 即使全局配置收紧到只读/标准，Work 依然能看到执行类工具
+        for configured in [ToolMode::ReadOnly, ToolMode::Standard] {
+            let mut narrowed = cfg.clone();
+            narrowed.mode = configured;
+            assert_eq!(
+                effective_tool_limits("task", "work", &narrowed).0,
+                ToolMode::Full
+            );
+        }
+
+        // 配置值低于下限时任务会话仍保底 20 轮
+        let mut low = cfg.clone();
+        low.max_steps = 4;
+        assert_eq!(effective_tool_limits("task", "plan", &low).1, 20);
+        assert_eq!(effective_tool_limits("task", "work", &low).1, 20);
+
+        // 普通聊天：只读且轻量
+        let (mode, steps) = effective_tool_limits("chat", "plan", &low);
+        assert_eq!(mode, ToolMode::ReadOnly);
+        assert_eq!(steps, 3);
     }
 }

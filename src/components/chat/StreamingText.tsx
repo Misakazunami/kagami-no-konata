@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useChatStore } from "../../stores/chatStore";
 import { STREAM_EVENT, isSameStream, type StreamEventData } from "../../types/events";
+import { MarkdownContent } from "./MarkdownContent";
+import { splitStableBlocks } from "./streamBlocks";
 
 interface Props {
   /** 流式结束回调（可选） */
@@ -124,13 +126,10 @@ export function StreamingText({ onFinished }: Props) {
         {hasThinking && (
           <ThinkingSection thinking={display.thinking} />
         )}
-        {/* 正文内容：流式期间按纯文本保留换行（markdown 在落库后统一渲染），
-            否则换行会被 HTML 折叠、代码块符号裸露 */}
+        {/* 正文内容：实时渲染 Markdown（稳定块 memo、尾部每帧解析），
+            流式结束后由落库消息的完整气泡接管 */}
         {hasContent ? (
-          <div className="message-content streaming-plain">
-            {display.content}
-            <span className="cursor-blink">▊</span>
-          </div>
+          <StreamingMarkdown content={display.content} />
         ) : (
           // 有思考但尚无正文时，显示等待指示
           <div className="thinking-dots">
@@ -140,6 +139,31 @@ export function StreamingText({ onFinished }: Props) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 流式正文：稳定块逐块 memo 渲染 + 尾部每帧重解析
+ *
+ * - 稳定块（围栏闭合、以空行结束）内容不会再变，memo 命中后跳过重解析，
+ *   并开启代码高亮；
+ * - 尾部仍在追加，每帧解析一次且暂不高亮（半截代码高亮会每帧抖动），
+ *   光标作为文本附加在尾部末尾，跟随最后一个段落内联显示。
+ */
+function StreamingMarkdown({ content }: { content: string }) {
+  const { stable, tail } = useMemo(() => splitStableBlocks(content), [content]);
+
+  return (
+    <div className="message-content">
+      {stable.map((block, index) => (
+        <MarkdownContent key={index} content={block} />
+      ))}
+      {tail.length > 0 ? (
+        <MarkdownContent content={`${tail}▊`} highlight={false} />
+      ) : (
+        <span className="cursor-blink">▊</span>
+      )}
     </div>
   );
 }

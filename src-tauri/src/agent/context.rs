@@ -77,6 +77,11 @@ pub struct Session {
     /// `None` = 跟随全局活跃提供商（与未引入该功能时一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_pref: Option<crate::llm::router::SessionModelPref>,
+    /// 会话级 AUTO：自动允许所有需要审批的工具调用（仅任务会话可开启）
+    ///
+    /// 只跳过审批弹窗，不改变工具可见性与任何硬安全边界。
+    #[serde(default)]
+    pub auto_approve_all: bool,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -1,15 +1,31 @@
-import { useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import { ModelBar } from "./ModelBar";
 
 export function InputBox() {
   const [input, setInput] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const sendMessage = useChatStore((s) => s.sendMessage);
   const stopGeneration = useChatStore((s) => s.stopGeneration);
   const isStreaming = useChatStore((s) => s.isStreaming);
   const currentSessionId = useChatStore((s) => s.currentSessionId);
   const sessions = useChatStore((s) => s.sessions);
   const setTaskMode = useChatStore((s) => s.setTaskMode);
+  const composerPrefill = useChatStore((s) => s.composerPrefill);
+  const consumeComposerPrefill = useChatStore((s) => s.consumeComposerPrefill);
+
+  // 回退一条用户消息后：原文填回输入框并聚焦，方便修改后重发
+  useEffect(() => {
+    if (!composerPrefill) return;
+    setInput(composerPrefill.text);
+    consumeComposerPrefill();
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    });
+  }, [composerPrefill, consumeComposerPrefill]);
 
   const currentSession = sessions.find((s) => s.id === currentSessionId);
   const isTaskSession = currentSession?.session_type === "task";
@@ -46,8 +62,13 @@ export function InputBox() {
               type="button"
               className={`task-mode-btn${taskMode === "plan" ? " active plan" : ""}`}
               aria-pressed={taskMode === "plan"}
+              disabled={isStreaming}
               onClick={() => currentSessionId && setTaskMode(currentSessionId, "plan")}
-              title="规划模式：只读调查并产出计划，不会修改任何文件"
+              title={
+                isStreaming
+                  ? "当前生成进行中：模式只影响下一轮，停止或完成后再切换"
+                  : "规划模式：只读调查并产出计划，不会修改任何文件"
+              }
             >
               📋 规划 (Plan)
             </button>
@@ -55,8 +76,13 @@ export function InputBox() {
               type="button"
               className={`task-mode-btn${taskMode === "work" ? " active work" : ""}`}
               aria-pressed={taskMode === "work"}
+              disabled={isStreaming}
               onClick={() => currentSessionId && setTaskMode(currentSessionId, "work")}
-              title="执行模式：按计划闭环执行修改、运行与验证"
+              title={
+                isStreaming
+                  ? "当前生成进行中：模式只影响下一轮，停止或完成后再切换"
+                  : "执行模式：按计划闭环执行修改、运行与验证"
+              }
             >
               ⚡ 执行 (Work)
             </button>
@@ -69,6 +95,7 @@ export function InputBox() {
 
       <div className="input-box">
         <textarea
+          ref={textareaRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}

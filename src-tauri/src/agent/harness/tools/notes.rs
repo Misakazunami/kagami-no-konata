@@ -13,7 +13,8 @@ use crate::agent::notes::{
 /// 为什么值得做：工具结果刻意不跨轮保留，长任务因此每轮都要重读同样的文件；
 /// 计划（`update_plan`）解决"做到哪一步"，这里解决"已经查明了什么"。
 ///
-/// 权限是 `WriteApp`（只写应用自己的库），**不需要审批**——否则每记一条就弹窗。
+/// 权限是 `WriteSession`（只写应用自己的会话数据），**不需要审批**——否则每记一条就弹窗；
+/// 只读模式下同样可见（Plan 阶段调查出的结论要能跨轮保留）。
 /// 内容与条数都有硬上限，注入时统一带 `untrusted` 标记（见 `agent::notes`）。
 pub struct SaveNote;
 
@@ -29,7 +30,7 @@ impl Tool for SaveNote {
                 MAX_NOTES,
                 MAX_TOTAL_BYTES / 1024
             ),
-            Permission::WriteApp,
+            Permission::WriteSession,
             json!({
                 "type": "object",
                 "properties": {
@@ -96,7 +97,7 @@ impl Tool for ForgetNote {
             "forget_note",
             "忘掉结论",
             "从工作记忆里删除一条已经过时或错误的结论；不传 id 则清空本会话的全部工作记忆。",
-            Permission::WriteApp,
+            Permission::WriteSession,
             json!({
                 "type": "object",
                 "properties": {
@@ -345,11 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_need_no_approval_and_are_hidden_in_read_only() {
+    fn tools_need_no_approval_and_are_visible_in_read_only() {
         for descriptor in [SaveNote.descriptor(), ForgetNote.descriptor()] {
-            assert_eq!(descriptor.permission, Permission::WriteApp);
-            assert!(!descriptor.permission.requires_approval(), "写应用内数据不该弹窗");
-            assert!(!descriptor.permission.visible_in(ToolMode::ReadOnly));
+            assert_eq!(descriptor.permission, Permission::WriteSession);
+            assert!(!descriptor.permission.requires_approval(), "写会话内数据不该弹窗");
+            // Plan 模式（只读）要能把调查结论跨轮保留下来
+            assert!(descriptor.permission.visible_in(ToolMode::ReadOnly));
             assert!(descriptor.permission.visible_in(ToolMode::Standard));
         }
     }

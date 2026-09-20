@@ -334,6 +334,24 @@ impl SnapshotStore {
         report
     }
 
+    /// 删除若干 stream 的备份目录（索引行由数据库负责删除）
+    ///
+    /// 会话被删除时调用：`workspace_snapshots` 行会随会话级联删除，
+    /// 但磁盘目录不会；不清理的话这些文件永远回收不了（`prune` 依赖表里的
+    /// stream_id 反查目录）。
+    pub fn forget_streams(&self, stream_ids: &[String]) -> usize {
+        let mut removed = 0;
+        for stream in stream_ids {
+            let dir = self.stream_dir(stream);
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("[snapshot] 删除备份目录失败 {}：{}", dir.display(), e),
+            }
+        }
+        removed
+    }
+
     /// 清理过期备份（索引 + 磁盘文件）
     ///
     /// 返回被清理的 stream 数量。启动时调用一次即可。

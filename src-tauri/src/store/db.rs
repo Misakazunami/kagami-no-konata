@@ -16,6 +16,9 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (10, include_str!("migrations/010_session_types.sql")),
     (11, include_str!("migrations/011_session_model_pref.sql")),
     (12, include_str!("migrations/012_message_model.sql")),
+    (13, include_str!("migrations/013_session_grants.sql")),
+    (14, include_str!("migrations/014_tool_invocation_tokens.sql")),
+    (15, include_str!("migrations/015_session_auto_approve.sql")),
 ];
 
 /// 打开数据库连接（应用 WAL 等 PRAGMA，不执行迁移）
@@ -47,6 +50,7 @@ const CREATE_SCRIPTS: &[&str] = &[
     include_str!("migrations/007_plan.sql"),
     include_str!("migrations/008_snapshots.sql"),
     include_str!("migrations/009_notes.sql"),
+    include_str!("migrations/013_session_grants.sql"),
     STATS_DDL,
 ];
 
@@ -134,6 +138,18 @@ const REQUIRED_COLUMNS: &[(&str, &str, &str)] = &[
         "messages",
         "model",
         "ALTER TABLE messages ADD COLUMN model TEXT DEFAULT NULL",
+    ),
+    // 014_tool_invocation_tokens
+    (
+        "tool_invocations",
+        "extra_tokens",
+        "ALTER TABLE tool_invocations ADD COLUMN extra_tokens INTEGER NOT NULL DEFAULT 0",
+    ),
+    // 015_session_auto_approve
+    (
+        "sessions",
+        "auto_approve_all",
+        "ALTER TABLE sessions ADD COLUMN auto_approve_all INTEGER NOT NULL DEFAULT 0",
     ),
 ];
 
@@ -444,6 +460,7 @@ mod tests {
             "session_plans",
             "workspace_snapshots",
             "tool_notes",
+            "session_grants",
         ] {
             let fresh_cols = table_columns(&fresh, table);
             let repaired_cols = table_columns(&repaired, table);

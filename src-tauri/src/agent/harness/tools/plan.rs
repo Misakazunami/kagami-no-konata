@@ -15,8 +15,9 @@ pub const MAX_ITEMS: usize = crate::store::chat_store::MAX_PLAN_ITEMS;
 /// **会话级状态**里才不会丢。计划由模型自己写、每次都注入 system prompt，
 /// 同时通过 `plan-updated` 事件同步到界面，所以模型和用户看的是同一份进度。
 ///
-/// 权限是 `WriteApp`（只写应用自己的数据库，不外发、不碰工作区）：
-/// 因此**不需要审批**——否则每更新一次进度就弹一次窗，用户会被逼疯。
+/// 权限是 `WriteSession`（只写应用自己的会话数据，不外发、不碰工作区）：
+/// 因此**不需要审批**，且在只读的 Plan 模式下也可见——否则提示词要求
+/// "必须调用 update_plan" 就成了空话。每更新一次进度弹一次窗同样是灾难。
 pub struct UpdatePlan;
 
 #[async_trait::async_trait]
@@ -26,7 +27,7 @@ impl Tool for UpdatePlan {
             "update_plan",
             "更新任务计划",
             "把当前任务的执行计划写下来（用户也能看到同一份进度）。任务超过两步时先写下计划，每完成一步就更新对应项的状态；被卡住或用户中途停止时把剩余项标成 blocked。items 传空数组表示计划已全部结束、清空计划。整体覆盖式写入（每次提交完整列表）。",
-            Permission::WriteApp,
+            Permission::WriteSession,
             json!({
                 "type": "object",
                 "properties": {
@@ -311,11 +312,12 @@ mod tests {
     }
 
     #[test]
-    fn is_write_app_permission_and_needs_no_approval() {
+    fn write_session_permission_visible_in_readonly_without_approval() {
         let descriptor = UpdatePlan.descriptor();
-        assert_eq!(descriptor.permission, Permission::WriteApp);
+        assert_eq!(descriptor.permission, Permission::WriteSession);
         assert!(!descriptor.permission.requires_approval());
-        // 只读模式下不可见（只读模式本就不该有副作用）
-        assert!(!descriptor.permission.visible_in(ToolMode::ReadOnly));
+        // Plan 模式（只读）也必须能写计划：提示词强制要求调用它
+        assert!(descriptor.permission.visible_in(ToolMode::ReadOnly));
+        assert!(descriptor.permission.visible_in(ToolMode::Standard));
     }
 }

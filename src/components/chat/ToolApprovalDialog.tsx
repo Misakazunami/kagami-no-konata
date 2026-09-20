@@ -221,6 +221,7 @@ export function ToolApprovalDialog() {
           <button
             className="tool-approval-btn allow-session"
             onClick={() => decide("allow_session")}
+            title="本会话内该工具不再弹窗；可在会话头部的授权标签上随时撤销"
           >
             本会话允许
           </button>

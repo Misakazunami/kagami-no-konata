@@ -70,7 +70,7 @@ impl Tool for RunCommand {
         ToolDescriptor::new(
             "run_command",
             "执行命令",
-            "在工作区内执行受信任的开发命令（如 cargo / git / node / python）。不接受 shell 语法（没有管道、重定向、&&），需要连续执行多条时用 steps 数组；敏感命令（cmd、powershell、curl、rm、reg 等）会被强制拦截。执行前会请求用户批准。",
+            "在工作区内执行受信任的开发命令（如 cargo / git / node / python）。不接受 shell 语法（没有管道、重定向、&&），需要连续执行多条时用 steps 数组；敏感命令（cmd、powershell、curl、rm、reg 等）会被强制拦截。执行前会请求用户批准（会话开启 AUTO 时自动放行，硬拦截规则不变）。",
             Permission::Execute,
             json!({
                 "type": "object",

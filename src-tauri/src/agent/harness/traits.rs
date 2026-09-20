@@ -22,6 +22,13 @@ pub enum Permission {
     Read,
     /// 只写应用数据目录（记忆、人设），不需要审批
     WriteApp,
+    /// 只写**会话级状态**（任务计划、工作记忆），不需要审批；只读模式下也可用
+    ///
+    /// 单独一档的原因：Plan 模式要求模型调用 `update_plan` / `save_note` 维护进度，
+    /// 但它们写的是应用自己的会话数据、不碰工作区、不外发。若沿用 `WriteApp`
+    /// 会被只读模式过滤掉（提示词与工具可见性自相矛盾）；若放宽 `WriteApp`
+    /// 则连长期记忆写入也会在只读模式暴露。
+    WriteSession,
     /// 写工作区文件，需要审批
     WriteFs,
     /// 执行外部命令，需要审批（且只在 `Full` 模式下可见）
@@ -35,6 +42,7 @@ impl Permission {
         match self {
             Permission::Read => "read",
             Permission::WriteApp => "write_app",
+            Permission::WriteSession => "write_session",
             Permission::WriteFs => "write_fs",
             Permission::Execute => "execute",
             Permission::Network => "network",
@@ -46,6 +54,7 @@ impl Permission {
         match self {
             Permission::Read => "低风险（只读）",
             Permission::WriteApp => "低风险（仅应用数据）",
+            Permission::WriteSession => "低风险（仅会话数据）",
             Permission::WriteFs => "中风险（写入文件）",
             Permission::Execute => "高风险（执行命令）",
             Permission::Network => "高风险（访问网络）",
@@ -67,8 +76,9 @@ impl Permission {
     /// 该等级的工具在指定模式下是否可见
     pub fn visible_in(self, mode: ToolMode) -> bool {
         match mode {
-            // 只读模式：写入类与执行类工具直接从工具表移除
-            ToolMode::ReadOnly => matches!(self, Permission::Read),
+            // 只读模式：写入类与执行类工具直接从工具表移除；
+            // 会话级状态（计划/笔记）例外——它们是模型维护进度的载体
+            ToolMode::ReadOnly => matches!(self, Permission::Read | Permission::WriteSession),
             // 标准模式：文件写入与联网需要审批，命令执行不可见
             ToolMode::Standard => !matches!(self, Permission::Execute),
             // 完整模式：全部可见（敏感命令仍然被硬拦截）
@@ -251,6 +261,14 @@ pub struct ToolServices {
     pub working_memory: bool,
     /// 已解析的联网检索设置（`None` 表示未启用/未配好，`web_search` 会明确报错）
     pub search: Option<crate::config::types::ResolvedSearch>,
+    /// 规划模式（Plan）的文件只读、但允许**联网只读**（仍逐次审批）：
+    /// 调查阶段需要查版本/报错资料。子代理与普通只读会话恒为 false
+    pub plan_network: bool,
+    /// `spawn_subagents` 的单次整体时间预算
+    ///
+    /// 它把整个子代理批次包在一次工具调用里，普通工具的 `call_timeout`
+    /// 根本不够用；带软截止的批次会在到点前返回已完成的部分结论
+    pub subagent_timeout: Duration,
 }
 
 impl std::fmt::Debug for ToolServices {
@@ -284,6 +302,10 @@ impl ToolServices {
             subagent: None,
             working_memory: false,
             search: None,
+            plan_network: false,
+            subagent_timeout: Duration::from_secs(
+                super::subagent::DEFAULT_SUBAGENT_TIMEOUT_SECS,
+            ),
         }
     }
 
@@ -436,6 +458,14 @@ pub trait Tool: Send + Sync {
 
     /// `args` 已由 runner 解析为 JSON 对象；工具内部仍需自行校验每个字段
     async fn call(&self, args: Value, cx: &ToolCtx<'_>) -> Result<ToolOutput>;
+
+    /// 本次调用的时间预算（`None` = 沿用 `ToolLimits.call_timeout`）
+    ///
+    /// 只有"一次调用内部要跑完整段子流程"的工具需要覆盖它：目前只有
+    /// `spawn_subagents`（它包住整个子代理批次，普通工具的 60 秒会把批次掐死）。
+    fn timeout_budget(&self, _services: &ToolServices) -> Option<Duration> {
+        None
+    }
 
     /// 审批弹窗里展示的人类可读摘要（`None` 时前端只显示参数 JSON）
     ///
@@ -703,6 +733,9 @@ mod tests {
     #[test]
     fn permission_visibility_follows_mode() {
         assert!(Permission::Read.visible_in(ToolMode::ReadOnly));
+        // 会话级写入（计划/工作记忆）在只读模式下必须可用，否则 Plan 阶段的
+        // "必须调用 update_plan" 提示词与工具可见性互相矛盾
+        assert!(Permission::WriteSession.visible_in(ToolMode::ReadOnly));
         assert!(!Permission::WriteFs.visible_in(ToolMode::ReadOnly));
         assert!(!Permission::WriteApp.visible_in(ToolMode::ReadOnly));
 
@@ -716,6 +749,7 @@ mod tests {
     fn only_side_effecting_permissions_need_approval() {
         assert!(!Permission::Read.requires_approval());
         assert!(!Permission::WriteApp.requires_approval());
+        assert!(!Permission::WriteSession.requires_approval());
         assert!(Permission::WriteFs.requires_approval());
         assert!(Permission::Execute.requires_approval());
         assert!(Permission::Network.requires_approval());

@@ -144,7 +144,9 @@ impl ToolSchema {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<LlmMessage>,
-    pub max_tokens: u32,
+    /// 最大输出 tokens；为 None 时字段完全不进请求体（由服务商决定默认上限）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
     pub temperature: f32,
     pub stream: bool,
     /// 是否启用思考模式（需要模型支持）

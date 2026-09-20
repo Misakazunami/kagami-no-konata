@@ -203,10 +203,10 @@ pub async fn get_persona_summary(
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
             let store = state.chat_store.lock().map_err(|e| e.to_string())?;
             store
-                .find_session_by_date(&today)
+                .find_session_by_date(&today, "chat")
                 .ok()
                 .flatten()
-                .or_else(|| store.find_latest_empty_session().ok().flatten())
+                .or_else(|| store.find_latest_empty_session("chat").ok().flatten())
                 .map(|session| session.persona_id)
                 .unwrap_or_else(|| DEFAULT_PERSONA_ID.to_string())
         }

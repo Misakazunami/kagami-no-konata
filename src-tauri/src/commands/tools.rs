@@ -12,7 +12,7 @@ use crate::store::chat_store::ToolInvocationRow;
 use crate::AppState;
 
 /// 工具类命令只允许主窗口调用（悬浮窗是纯聊天 surface）
-fn ensure_main_window(window: &WebviewWindow) -> Result<(), String> {
+pub(crate) fn ensure_main_window(window: &WebviewWindow) -> Result<(), String> {
     if window.label() == "float" {
         return Err("悬浮窗不支持工具功能".to_string());
     }
@@ -173,6 +173,75 @@ pub async fn clear_plan(
     Ok(())
 }
 
+/// 用户手动编辑计划（勾选完成 / 改标题 / 增删条目）
+///
+/// 与模型的 `update_plan` 共用同一份校验与存储（整体覆盖式提交）；
+/// 写完广播 `plan-updated`，模型下一轮就会看到用户调整过的进度。
+#[tauri::command]
+pub async fn update_plan_items(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    items: serde_json::Value,
+    note: Option<String>,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    let items = crate::agent::plan::sanitize_items(&items)?;
+    let plan = crate::agent::plan::SessionPlan::new(
+        items,
+        note.map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty()),
+    );
+    {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        store
+            .save_plan(&session_id, &plan)
+            .map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit_to(
+        tauri::EventTarget::webview_window("main"),
+        crate::agent::harness::EVENT_PLAN_UPDATED,
+        serde_json::json!({
+            "session_id": session_id,
+            "items": plan.items,
+            "note": plan.note,
+        }),
+    );
+    Ok(())
+}
+
+// ─── 会话级持久授权（审批弹窗的「本会话允许」） ───
+
+/// 某个会话已授权的工具名（按字母序）
+#[tauri::command]
+pub async fn list_session_grants(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<String>, String> {
+    ensure_main_window(&window)?;
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    store
+        .list_session_grants(&session_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 撤销某个工具的会话授权（返回是否真的撤销了一条）
+#[tauri::command]
+pub async fn revoke_session_grant(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    tool: String,
+) -> Result<bool, String> {
+    ensure_main_window(&window)?;
+    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+    store
+        .revoke_session_tool(&session_id, &tool)
+        .map_err(|e| e.to_string())
+}
+
 // ─── MCP 服务器（诊断用） ───────────────────────────────
 
 /// 已配置的 MCP 服务器（只读视图，命令与参数不对外暴露完整环境变量）
@@ -284,6 +353,70 @@ pub async fn clear_notes(
 }
 
 // ─── 文件改动快照与回滚 ─────────────────────────────────
+
+/// 改动记录里的单个文件（不含内部备份名）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionSnapshotFile {
+    pub root_id: String,
+    pub rel_path: String,
+    pub bytes: i64,
+    pub created_at: String,
+}
+
+/// 改动记录按"轮次"（stream）分组
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionSnapshotStream {
+    pub stream_id: String,
+    /// 该轮最早一条备份的时间（列表排序用）
+    pub created_at: String,
+    pub total_bytes: i64,
+    pub files: Vec<SessionSnapshotFile>,
+}
+
+/// 某个会话的完整改动记录（历史轮次也能看到并回滚）
+///
+/// 快照行里刻意不返回 `backup_name`：界面只需要展示路径与大小，
+/// 内部文件名不构成有效信息。
+#[tauri::command]
+pub async fn list_session_snapshots(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<SessionSnapshotStream>, String> {
+    ensure_main_window(&window)?;
+    let rows = {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        store
+            .list_session_snapshots(&session_id)
+            .map_err(|e| e.to_string())?
+    };
+
+    // 行按 created_at DESC：首次出现的 stream 保留为分组顺序，
+    // 组内 created_at 取最早的一条
+    let mut streams: Vec<SessionSnapshotStream> = Vec::new();
+    for row in rows {
+        let file = SessionSnapshotFile {
+            root_id: row.root_id,
+            rel_path: row.rel_path,
+            bytes: row.bytes,
+            created_at: row.created_at.clone(),
+        };
+        match streams.iter_mut().find(|s| s.stream_id == row.stream_id) {
+            Some(stream) => {
+                stream.total_bytes += row.bytes;
+                stream.created_at = row.created_at;
+                stream.files.push(file);
+            }
+            None => streams.push(SessionSnapshotStream {
+                stream_id: row.stream_id,
+                created_at: row.created_at,
+                total_bytes: row.bytes,
+                files: vec![file],
+            }),
+        }
+    }
+    Ok(streams)
+}
 
 /// 某个 stream 的文件改动快照概况（界面据此决定要不要显示"回滚"）
 #[tauri::command]

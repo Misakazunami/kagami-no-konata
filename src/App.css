@@ -210,12 +210,18 @@ html, body, #root {
   font-weight: 600;
 }
 
+/* Work 模式用成功色区分，扫一眼列表就能分辨"还在规划"与"正在执行" */
+.session-type-badge.work {
+  color: var(--tool-ok, #9ece6a);
+}
+
 .chat-header {
   padding: 6px 16px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-secondary);
   display: flex;
   align-items: center;
+  gap: 8px;
   justify-content: space-between;
 }
 
@@ -248,6 +254,129 @@ html, body, #root {
   padding: 2px 10px;
   background: rgba(187, 154, 247, 0.1);
   border-radius: 12px;
+}
+
+/* ===== 任务状态条（会话头部，仅任务会话） ===== */
+.task-status-bar {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.task-status-mode {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+}
+
+.task-status-mode.plan {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(187, 154, 247, 0.1);
+}
+
+.task-status-mode.work {
+  color: var(--tool-ok, #9ece6a);
+  border-color: var(--tool-ok, #9ece6a);
+  background: rgba(158, 206, 106, 0.1);
+}
+
+.task-status-chip {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: var(--bg-tertiary, rgba(255, 255, 255, 0.06));
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.task-status-chip.warn {
+  color: var(--tool-warn, #e0af68);
+}
+
+/* 已授权的工具：可点击撤销，因此做成按钮样式但保留 chip 观感 */
+.task-status-chip.grant {
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.task-status-chip.grant:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* 会话级 AUTO：关闭时低调、开启后必须是高对比警示色（一眼可见的"火力全开"） */
+.task-status-chip.auto {
+  border: 1px solid var(--border);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.task-status-chip.auto:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.task-status-chip.auto:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.task-status-chip.auto.on {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--tool-error-bg, rgba(247, 118, 142, 0.12));
+  font-weight: 600;
+}
+
+/* 工作区下拉：保留 chip 观感，可直接在会话内切换执行目录 */
+.task-status-ws-select {
+  appearance: none;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  padding: 1px 6px;
+}
+
+.task-status-ws-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.task-status-action {
+  flex-shrink: 0;
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.task-status-action:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.task-status-action.approve {
+  color: var(--tool-ok, #9ece6a);
+  border-color: var(--tool-ok, #9ece6a);
+  font-weight: 600;
+}
+
+.task-status-action.approve:hover {
+  background: rgba(158, 206, 106, 0.12);
+  color: var(--tool-ok, #9ece6a);
 }
 
 .session-title-edit {
@@ -362,18 +491,30 @@ html, body, #root {
   color: var(--accent);
 }
 
+/* 任务会话的空状态引导：一句话示例 + 流程说明 */
+.empty-state-hint {
+  margin-top: 6px;
+  max-width: 360px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-muted);
+}
+
 /* ===== 消息气泡 ===== */
 .message-row {
   display: flex;
+  /* 竖排：气泡在上，操作按钮在下 */
+  flex-direction: column;
   margin-bottom: 16px;
 }
 
 .message-row.user {
-  justify-content: flex-end;
+  align-items: flex-end;
 }
 
 .message-row.assistant {
-  justify-content: flex-start;
+  align-items: flex-start;
 }
 
 .message-bubble {
@@ -412,12 +553,6 @@ html, body, #root {
 
 .session-delete:focus-visible {
   opacity: 1;
-}
-
-/* 流式期间按纯文本渲染：保留换行与空白，避免正文在落库前被 HTML 折叠 */
-.message-content.streaming-plain {
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
 /* ===== Markdown 渲染 ===== */
@@ -716,6 +851,17 @@ html, body, #root {
 .task-mode-btn:hover {
   border-color: var(--accent);
   color: var(--text-primary);
+}
+
+/* 生成进行中禁用：在飞的这一轮用的是发送时的模式，允许点击只会造成界面与后端不一致 */
+.task-mode-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.task-mode-btn:disabled:hover {
+  border-color: var(--border);
+  color: var(--text-secondary);
 }
 
 /* 选中态：实心底 + 主题安全的文字色，两种主题下都保持足够对比度 */
@@ -2119,6 +2265,43 @@ html, body, #root {
   cursor: not-allowed;
 }
 
+/* AUTO 开启确认：危险动作的确认按钮用警示色，避免"顺手点确认" */
+.modal-confirm-btn.danger {
+  background: var(--danger);
+  color: var(--on-accent);
+}
+
+.modal-confirm-btn.danger:hover:not(:disabled) {
+  background: var(--danger);
+  filter: brightness(1.1);
+}
+
+.modal-card.auto-approve-card {
+  width: 480px;
+}
+
+.auto-approve-card .auto-approve-lead {
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.auto-approve-card .auto-approve-list {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.7;
+}
+
+.auto-approve-card .auto-approve-note {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
 /* ===== 创建任务会话弹窗（工作区选择）===== */
 /*
  * 全部走主题变量：早先这里用的是行内硬编码颜色（深色底 + 浅灰字），
@@ -2201,6 +2384,45 @@ html, body, #root {
   font-size: 11px;
   line-height: 1.5;
   color: var(--text-secondary);
+}
+
+/* 创建弹窗里的运行模式选择 */
+.task-modal-mode-group {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.task-modal-mode-btn {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.task-modal-mode-btn:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.task-modal-mode-btn.active.plan {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.task-modal-mode-btn.active.work {
+  background: var(--success);
+  border-color: var(--success);
+  color: #1a1b26;
+  font-weight: 600;
 }
 
 .task-modal-error {
@@ -2788,6 +3010,17 @@ body[data-window="float"] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 本次生成里的步数（第 N 步 / N/M）：让长任务能看到工具预算消耗 */
+.tool-call-step {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-tertiary, rgba(255, 255, 255, 0.06));
+  color: var(--text-muted);
+  font-size: 10px;
+  font-family: var(--tool-mono);
 }
 
 .tool-call-duration {
@@ -3589,7 +3822,126 @@ body[data-window="float"] {
 .plan-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-top: 6px;
+}
+
+.plan-approve-btn {
+  padding: 3px 12px;
+  border: 1px solid var(--tool-ok, #9ece6a);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--tool-ok, #9ece6a);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.plan-approve-btn:hover:not(:disabled) {
+  background: rgba(158, 206, 106, 0.12);
+}
+
+.plan-approve-btn:disabled,
+.plan-clear-btn:disabled,
+.plan-add-btn:disabled,
+.plan-item-toggle:disabled,
+.plan-item-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 状态图标可点击后变成按钮：保留原视觉尺寸，只补可点击反馈 */
+.plan-item-toggle {
+  flex-shrink: 0;
+  width: 16px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.plan-item.done .plan-item-toggle {
+  color: var(--tool-ok, #9ece6a);
+}
+
+.plan-item.doing .plan-item-toggle {
+  color: var(--accent, #bb9af7);
+}
+
+.plan-item.blocked .plan-item-toggle {
+  color: var(--tool-warn);
+}
+
+.plan-item-title[title] {
+  cursor: text;
+}
+
+.plan-item-edit {
+  flex: 1;
+  min-width: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.plan-item-action {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.plan-item-action:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.plan-item-action.danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.plan-add-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.plan-add-input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 11.5px;
+}
+
+.plan-add-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.plan-add-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .plan-clear-btn {
@@ -3664,6 +4016,184 @@ body[data-window="float"] {
 
 .snapshot-dismiss-btn:hover {
   color: var(--text-primary);
+}
+
+/* ===== 改动与产物面板（回滚横幅 + 历史记录 + 任务报告） ===== */
+.changes-panel {
+  flex-shrink: 0;
+  margin: 0 16px 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+
+/* 横幅在面板内部时不再需要外边距/圆角（面板已提供） */
+.changes-panel .snapshot-banner {
+  margin: 0;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid var(--accent, #bb9af7);
+  border-radius: 0;
+}
+
+.changes-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+}
+
+.changes-toggle {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.changes-toggle:hover {
+  color: var(--text-primary);
+}
+
+.changes-report-btn {
+  flex-shrink: 0;
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.changes-report-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.changes-body {
+  padding: 2px 10px 8px;
+  border-top: 1px solid var(--border);
+}
+
+.changes-notice {
+  margin: 6px 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--tool-running-bg);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  word-break: break-word;
+}
+
+.changes-empty {
+  padding: 8px 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.changes-stream {
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border);
+}
+
+.changes-stream:last-child {
+  border-bottom: none;
+}
+
+.changes-stream-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.changes-round {
+  flex-shrink: 0;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.changes-time {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.changes-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.changes-files {
+  margin: 2px 0 4px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.changes-file {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.changes-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--tool-mono);
+}
+
+.changes-file-size {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.changes-stream-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.changes-restore-btn {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.changes-restore-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.changes-restore-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ===== 工作记忆面板 ===== */
@@ -3880,4 +4410,271 @@ body[data-window="float"] {
 
 .mcp-status.error {
   color: var(--tool-warn);
+}
+
+/* ===== 消息操作（复制 / 编辑 / 重试 / 回退）===== */
+.message-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  /* 位于气泡下方：默认低调常驻（不做 hover 显隐，避免鼠标扫过时布局跳动） */
+  margin: 4px 2px 0;
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+
+.message-row:hover .message-actions,
+.message-row:focus-within .message-actions {
+  opacity: 1;
+}
+
+.message-action-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary, #1f2335);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.message-action-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.message-action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.message-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+}
+
+.message-edit-textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg-secondary, #1f2335);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13.5px;
+  line-height: 1.6;
+  outline: none;
+}
+
+.message-edit-textarea:focus {
+  border-color: var(--accent);
+}
+
+.message-edit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.message-edit-hint {
+  margin-right: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.message-edit-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.message-edit-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.message-edit-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.message-edit-btn.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: #fff;
+}
+
+.message-edit-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ===== 右侧消息时间轴 ===== */
+.message-list-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.message-list-wrap .message-list {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  /* 给右侧轨道留出空间，避免轨道压住正文 */
+  padding-right: 40px;
+}
+
+.message-timeline {
+  position: absolute;
+  top: 16px;
+  bottom: 16px;
+  right: 10px;
+  width: 14px;
+  z-index: 5;
+  pointer-events: none; /* 只有刻度可点，其余区域不挡滚动条 */
+}
+
+.timeline-tick {
+  position: absolute;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+  display: block;
+}
+
+.timeline-tick::before {
+  content: "";
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  opacity: 0.45;
+  transition: opacity 0.15s, transform 0.15s, background 0.15s;
+}
+
+.timeline-tick.assistant::before {
+  width: 5px;
+  height: 5px;
+}
+
+.timeline-tick.user::before {
+  width: 8px;
+  height: 8px;
+  background: var(--accent);
+  opacity: 0.8;
+}
+
+.timeline-tick:hover::before {
+  opacity: 1;
+  transform: scale(1.5);
+}
+
+.timeline-tick.active::before {
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--bg-primary, #1a1b26), 0 0 0 3px var(--accent);
+}
+
+/* ===== 代码块复制按钮 ===== */
+.code-block {
+  position: relative;
+}
+
+.code-copy-btn {
+  position: absolute;
+  top: 14px;
+  right: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+  z-index: 1;
+}
+
+.code-block:hover .code-copy-btn,
+.code-copy-btn:focus-visible {
+  opacity: 1;
+}
+
+.code-copy-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ===== 回退确认弹窗 ===== */
+.rewind-modal {
+  max-width: 440px;
+}
+
+.rewind-desc {
+  margin: 8px 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+.rewind-desc strong {
+  color: var(--accent);
+}
+
+.rewind-error {
+  color: var(--tool-warn, #f7768e);
+}
+
+.rewind-quote {
+  margin: 6px 0 12px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--border);
+  border-radius: 0 6px 6px 0;
+  background: var(--bg-tertiary);
+  font-size: 12.5px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.rewind-restore {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.rewind-restore input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.rewind-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
 }

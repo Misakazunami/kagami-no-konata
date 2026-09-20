@@ -266,9 +266,10 @@ fn extension_of(program: &str) -> Option<String> {
 
 /// 解释器求值参数、敏感路径片段、危险开关的统一检查
 fn check_sensitive_args(base: &str, args: &[String]) -> Result<(), String> {
-    // 先做"整个命令级别"的检查：代执行参数、git 别名、包运行器子命令
+    // 先做"整个命令级别"的检查：代执行参数、git 逃逸、包运行器子命令
     if base == "git" {
-        check_git_alias_args(args)?;
+        check_git_config_escapes(args)?;
+        check_git_destructive_subcommands(args)?;
     }
     if PACKAGE_RUNNERS.contains(&base) {
         check_package_runner_args(base, args)?;
@@ -276,6 +277,8 @@ fn check_sensitive_args(base: &str, args: &[String]) -> Result<(), String> {
     if base == "deno" || base == "bun" {
         check_runtime_args(base, args)?;
     }
+    // 新增命令的代执行参数（fd -x、rg --pre、sort --compress-program …）
+    check_tool_specific_args(base, args)?;
 
     let is_interp = INTERPRETERS.contains(&base);
     let mut i = 0;
@@ -339,39 +342,169 @@ fn check_sensitive_args(base: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `git` 别名的两条"代码执行"路径
+/// `git` 上"配置即代执行"的逃逸面
 ///
-/// - `git -c alias.x='!shell command' x`：以 `!` 开头的别名会经过 shell，
-///   等于任意命令执行（程序黑名单完全失效）；
-/// - `git config alias.x '!shell command'`：先写别名、下一次再执行的"两步逃逸"。
-fn check_git_alias_args(args: &[String]) -> Result<(), String> {
+/// 两类通道，本质都是让 git 去执行任意程序：
+/// - `git -c alias.x='!shell command' x`：以 `!` 开头的别名会经过 shell；
+/// - `git -c core.sshCommand=…` / `core.hooksPath` / `credential.helper` 等
+///   危险配置键：一个 `-c` 就能把 git 变成任意命令执行器。
+///
+/// `git config` 写入同类键是"先落盘、下一次再执行"的两步逃逸，必须一起拦。
+/// 会话级 AUTO 打开后审批层不再逐次确认，这些规则是 run_command 的硬边界。
+fn check_git_config_escapes(args: &[String]) -> Result<(), String> {
+    /// 这些配置键会让 git 代执行外部程序（小写比较）
+    const DANGEROUS_CONFIG_KEYS: &[&str] = &[
+        "core.sshcommand",
+        "core.pager",
+        "core.editor",
+        "core.hookspath",
+        "core.fsmonitor",
+        "sequence.editor",
+        "diff.external",
+        "credential.helper",
+        "gpg.program",
+        "uploadpack.packobjectshook",
+        "protocol.ext.allow",
+    ];
+
+    fn dangerous_reason(key: &str, value: &str) -> Option<&'static str> {
+        let key = key.trim().to_ascii_lowercase();
+        if key.starts_with("alias.") {
+            return Some("别名可以执行任意 shell 命令");
+        }
+        if value.trim_start().starts_with('!') {
+            return Some("以 ! 开头的配置值会经过 shell 执行");
+        }
+        if DANGEROUS_CONFIG_KEYS.contains(&key.as_str()) {
+            return Some("该键会让 git 执行任意程序");
+        }
+        None
+    }
+
     let mut i = 0;
     while i < args.len() {
         let lower = args[i].to_ascii_lowercase();
         if lower == "-c" || lower == "--config-env" {
             if let Some(setting) = args.get(i + 1) {
                 if let Some((key, value)) = setting.split_once('=') {
-                    if key.trim().to_ascii_lowercase().starts_with("alias.")
-                        || value.trim_start().starts_with('!')
-                    {
+                    if let Some(reason) = dangerous_reason(key, value) {
                         return Err(format!(
-                            "已阻止 git 配置项「{}」：别名可以执行任意 shell 命令",
-                            setting
+                            "已阻止 git 配置项「{}」：{}",
+                            setting, reason
                         ));
                     }
                 }
             }
         }
-        if lower == "config"
-            && args[i + 1..]
-                .iter()
-                .any(|arg| arg.trim_start().to_ascii_lowercase().starts_with("alias."))
-        {
-            return Err(
-                "已阻止通过 git config 写入别名（别名可以执行任意 shell 命令）".to_string(),
-            );
+        if lower == "config" {
+            for arg in &args[i + 1..] {
+                let arg = arg.trim();
+                if arg.starts_with('-') {
+                    continue; // --local / --get 之类
+                }
+                let key = arg.split_once('=').map(|(k, _)| k).unwrap_or(arg);
+                let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                if let Some(reason) = dangerous_reason(key, value) {
+                    return Err(format!("已阻止通过 git config 写入「{}」：{}", arg, reason));
+                }
+            }
         }
         i += 1;
+    }
+    Ok(())
+}
+
+/// `git clean`：批量删除不经过回收站与快照，是唯一"静默清空工作区"的通道
+///
+/// 只放行 dry-run（`-n` / `--dry-run`），让模型先看清会删什么，再改用
+/// `delete_path`（有快照 + 回收站）或逐文件处理。
+fn check_git_destructive_subcommands(args: &[String]) -> Result<(), String> {
+    /// 这些开关带一个值，跳过时不能把它们后面的值当成子命令
+    const TAKE_VALUE: &[&str] = &[
+        "-c",
+        "-C",
+        "--config-env",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+    ];
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let lower = arg.to_ascii_lowercase();
+        if TAKE_VALUE.contains(&lower.as_str()) {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if lower == "clean" {
+            let dry_run = args[i + 1..]
+                .iter()
+                .any(|a| a == "-n" || a == "--dry-run");
+            if !dry_run {
+                return Err(
+                    "已阻止 git clean：批量删除不经过回收站与快照。请先用 `git clean -n` 预览，再用 delete_path 逐项删除（可回滚）".to_string(),
+                );
+            }
+        }
+        break;
+    }
+    Ok(())
+}
+
+/// 新增命令里"宿主代执行"参数的逐程序检查
+///
+/// 这些参数换成别的程序名就绕过了程序黑名单，必须在参数层拒绝：
+/// - `fd -x/-X/--exec/--exec-batch`：对每个结果执行任意命令；
+/// - `rg --pre/--hostname-bin/-z/--search-zip`：执行预处理器/解压器；
+/// - `sort --compress-program`：用任意程序作为临时压缩器。
+fn check_tool_specific_args(base: &str, args: &[String]) -> Result<(), String> {
+    let deny = |arg: &str, why: &str| -> Result<(), String> {
+        Err(format!(
+            "已阻止参数「{}」：{}（该参数会代执行其它程序）",
+            arg, why
+        ))
+    };
+    match base {
+        "fd" => {
+            for arg in args {
+                // 大小写统一后 `-X` 与 `-x` 都落到这里
+                let lower = arg.to_ascii_lowercase();
+                if matches!(lower.as_str(), "-x" | "--exec" | "--exec-batch")
+                    || lower.starts_with("--exec=")
+                    || lower.starts_with("-x=")
+                {
+                    return deny(arg, "fd 的 -x/-X/--exec 会执行任意命令");
+                }
+            }
+        }
+        "rg" => {
+            for arg in args {
+                let lower = arg.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "--pre" | "--hostname-bin" | "-z" | "--search-zip"
+                ) || lower.starts_with("--pre=")
+                    || lower.starts_with("--hostname-bin=")
+                {
+                    return deny(arg, "ripgrep 的该参数会运行外部程序/解压器");
+                }
+            }
+        }
+        "sort" => {
+            for arg in args {
+                let lower = arg.to_ascii_lowercase();
+                if lower == "--compress-program" || lower.starts_with("--compress-program=") {
+                    return deny(arg, "sort 会用该程序作为压缩器");
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -699,6 +832,84 @@ mod tests {
                 None,
                 &ws,
             )
+            .is_ok());
+    }
+
+    /// 新增的默认命令必须真的进了允许集合（黑名单剔除后仍然保留）
+    #[test]
+    fn default_allowlist_covers_coding_tools() {
+        let guard = CommandGuard::new(&ToolConfig::default());
+        let allowed = guard.allowed_programs();
+        for program in [
+            "rg", "fd", "jq", "yq", "diff", "sort", "uniq", "cut", "tr", "stat", "file", "which",
+            "tree", "gofmt", "golangci-lint", "clang", "clang++", "gcc", "g++", "ninja", "meson",
+            "just", "shellcheck", "ruff", "black", "mypy", "poetry", "pdm", "swift", "xcodebuild",
+            "vitest", "jest", "vite", "esbuild",
+        ] {
+            assert!(allowed.iter().any(|p| p == program), "{program} 应在允许列表中");
+        }
+    }
+
+    /// fd / rg / sort 的代执行参数必须被拒绝（程序白名单之外的代码执行通道）
+    #[test]
+    fn blocks_new_tools_exec_flags() {
+        let guard = guard();
+        let (ws, _tmp) = test_set();
+        for (program, args) in [
+            ("fd", vec!["-x", "sh", "-c", "rm -rf /"]),
+            ("fd", vec!["-X", "evil"]),
+            ("fd", vec!["--exec-batch", "evil"]),
+            ("rg", vec!["--pre", "evil", "pattern"]),
+            ("rg", vec!["--hostname-bin", "evil", "pattern"]),
+            ("rg", vec!["-z", "pattern"]),
+            ("sort", vec!["--compress-program", "evil", "file"]),
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            let err = guard.check(program, &args, None, &ws).unwrap_err();
+            assert!(err.contains("代执行"), "{program} {args:?} => {err}");
+        }
+        // 正常用法不受影响（rg 未安装时只会是"找不到程序"，绝不能是代执行拦截）
+        let normal = guard.check(
+            "rg",
+            &["pattern".to_string(), "src".to_string()],
+            None,
+            &ws,
+        );
+        if let Err(e) = normal {
+            assert!(!e.contains("代执行"), "普通 rg 调用被误伤：{e}");
+        }
+    }
+
+    /// git 的"配置即代执行"与 `git clean` 必须在 AUTO 打开前就拦住
+    #[test]
+    fn blocks_git_config_rce_and_destructive_clean() {
+        let guard = guard();
+        let (ws, _tmp) = test_set();
+        for args in [
+            vec!["-c", "core.sshCommand=evil", "push"],
+            vec!["-c", "core.hooksPath=/tmp/evil", "commit"],
+            vec!["-c", "credential.helper=evil", "pull"],
+            vec!["-c", "diff.external=evil", "diff"],
+            vec!["config", "core.pager", "evil"],
+            vec!["config", "core.sshCommand", "evil"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            let err = guard.check("git", &args, None, &ws).unwrap_err();
+            assert!(err.contains("已阻止"), "{args:?} => {err}");
+        }
+
+        // clean 只放行 dry-run
+        let err = guard
+            .check(
+                "git",
+                &["clean".to_string(), "-fdx".to_string()],
+                None,
+                &ws,
+            )
+            .unwrap_err();
+        assert!(err.contains("git clean"), "{err}");
+        assert!(guard
+            .check("git", &["clean".to_string(), "-n".to_string()], None, &ws)
             .is_ok());
     }
 

@@ -78,6 +78,18 @@ export function ToolCallCard({ call }: Props) {
           {toolIcon(call.tool)}
         </span>
         <span className="tool-call-label">{call.tool_label || call.tool}</span>
+        {call.step > 0 && (
+          <span
+            className="tool-call-step"
+            title={
+              call.maxSteps
+                ? `本次生成的第 ${call.step} 步（共 ${call.maxSteps} 步工具预算）`
+                : `本次生成的第 ${call.step} 步`
+            }
+          >
+            {call.maxSteps ? `${call.step}/${call.maxSteps}` : `#${call.step}`}
+          </span>
+        )}
         <span className={`tool-status-chip ${call.status}`}>
           {TOOL_STATUS_LABEL[call.status]}
         </span>
@@ -121,6 +133,9 @@ export function ToolCallCard({ call }: Props) {
                     skipped: { label: "超额跳过", color: "#6b7280" },
                   };
                   const meta = statusMap[task.status] ?? { label: task.status, color: "#888" };
+                  // 跳过原因（名额不足 / 时间预算不足）比笼统的"超额跳过"更准确
+                  const label =
+                    task.status === "skipped" && task.reason ? task.reason : meta.label;
                   return (
                     <div
                       key={task.taskId}
@@ -140,7 +155,7 @@ export function ToolCallCard({ call }: Props) {
                       <span style={{ color: meta.color, fontSize: "0.75rem", fontWeight: 500 }}>
                         {/* 自动选择时如实标注这条子任务用的子模型 */}
                         {task.model ? `${task.model} · ` : ""}
-                        {meta.label}
+                        {label}
                         {task.durationMs ? ` (${(task.durationMs / 1000).toFixed(1)}s)` : ""}
                       </span>
                     </div>

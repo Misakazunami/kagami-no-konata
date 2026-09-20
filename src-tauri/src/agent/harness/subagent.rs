@@ -1,7 +1,7 @@
 //! 只读子代理：把一个"分别看看 A/B/C 再汇总"的调查任务并行分发出去
 //!
 //! 为什么需要它：模型只能在一个上下文里顺序思考，而一轮生成又有步数上限
-//! （默认 8 轮）。要同时读 5 个模块再比较，顺序读很快就把预算烧完了。
+//! （默认 32 轮）。要同时读 5 个模块再比较，顺序读很快就把预算烧完了。
 //! 子代理让每个子任务在自己的上下文里跑一小段**只读**工具循环，只把结论带回来。
 //!
 //! 安全边界（按"即使模型被误导也不能造成副作用"设计）：
@@ -15,7 +15,7 @@
 //! - 每轮生成有子代理名额预算（默认 2 个任务），由调用方在启动前扣减；
 //! - 子代理的正文不回灌成主对话内容，只作为一条工具结果（`untrusted`）返回。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -30,10 +30,15 @@ use super::traits::{
     estimate_tokens, truncate_text, DenyAllApprover, EventSink, ToolCtx, ToolServices,
 };
 
-/// 子代理默认的最大工具轮数（比父级短得多：它只是一个"调查员"）
-pub const DEFAULT_CHILD_STEPS: usize = 3;
+/// 子代理默认的最大工具轮数（与主代理默认一致：调查任务同样可能多步）
+pub const DEFAULT_CHILD_STEPS: usize = 32;
 /// 每轮生成默认允许的子代理任务数
 pub const DEFAULT_MAX_CHILDREN: usize = 2;
+/// 单次 `spawn_subagents` 的默认时间预算（秒）
+///
+/// 一次调查可能跨十几次工具调用与多次 LLM 往返，普通工具的 60 秒上限
+/// 会把它直接掐死并把已完成结论一起丢掉。
+pub const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
 /// 单个子代理结论的长度上限
 pub const MAX_SUMMARY_BYTES: usize = 4 * 1024;
 /// 一次调用里最多提交多少个任务
@@ -55,6 +60,8 @@ pub struct AgentRuntime {
     /// 已启动的子代理数量（用于在 [`Self::models`] 上轮转）
     spawned: Arc<AtomicUsize>,
     max_child_steps: usize,
+    /// 单次调用最多提交几个任务（默认 = [`MAX_TASKS_PER_CALL`]，可由配置收紧）
+    max_tasks_per_call: usize,
 }
 
 impl AgentRuntime {
@@ -78,7 +85,22 @@ impl AgentRuntime {
             children_left: Arc::new(AtomicUsize::new(max_children)),
             spawned: Arc::new(AtomicUsize::new(0)),
             max_child_steps: DEFAULT_CHILD_STEPS,
+            max_tasks_per_call: MAX_TASKS_PER_CALL,
         }
+    }
+
+    /// 覆盖子代理预算（步数 / 单次任务数），来自 `ToolConfig`
+    ///
+    /// 任务数上限不能让 schema 撒谎：工具描述里的 `maxItems` 是编译期常量，
+    /// 因此这里夹到不超过它（配置只能收紧、不能放宽）。
+    pub fn with_budgets(mut self, child_steps: usize, max_tasks_per_call: usize) -> Self {
+        self.max_child_steps = child_steps.max(1);
+        self.max_tasks_per_call = max_tasks_per_call.clamp(1, MAX_TASKS_PER_CALL);
+        self
+    }
+
+    pub fn max_tasks_per_call(&self) -> usize {
+        self.max_tasks_per_call
     }
 
     /// 申请一个子代理名额
@@ -136,6 +158,8 @@ impl AgentRuntime {
     ///
     /// 名额由调用方先 `take_slot()` 扣减（拒绝要在发请求之前决定），
     /// `child_index` 就是它返回的序号（决定用哪个子模型）。
+    /// `cancel` 是**批次级**取消标志：父级停止与时间预算用尽都会置位，
+    /// 子代理会在下一个检查点收手并带回已生成的部分结论。
     /// 子代理从不向主流式回调送正文（`on_chunk` 为空闭包）：
     /// 它的中间过程只以事件形式出现在"子代理卡片"上。
     pub async fn run_child(
@@ -144,6 +168,7 @@ impl AgentRuntime {
         goal: &str,
         paths: Option<&str>,
         child_index: usize,
+        cancel: Arc<AtomicBool>,
     ) -> Result<ChildOutcome, String> {
         let model = self
             .model_for(child_index)
@@ -162,12 +187,14 @@ impl AgentRuntime {
             services,
             session_id: parent.session_id,
             stream_id: parent.stream_id,
-            cancel: parent.cancel.clone(),
+            cancel,
             emit,
-            // 只读子代理不该有任何需要审批的动作；万一有，一律拒绝
+            // 只读子代理不该有任何需要审批的动作；万一有，一律拒绝。
+            // AUTO 绝不向子代理传播：它们恒为只读服务，审批层也保持 fail-closed。
             approver: Arc::new(DenyAllApprover),
             tools_enabled: true,
             auto_approve: Vec::new(),
+            auto_approve_all: false,
             limits: parent.limits,
             max_steps: self.max_child_steps,
         };
@@ -237,6 +264,10 @@ fn child_services(parent: &ToolServices) -> ToolServices {
         working_memory: false,
         // 子代理不能联网检索（只读调查，不引入外部内容）
         search: None,
+        // 父级 Plan 模式可以联网，但子代理仍然不行
+        plan_network: false,
+        // 子代理自身不能再派子代理；原样保留父级预算，结构上不缺字段
+        subagent_timeout: parent.subagent_timeout,
     }
 }
 
@@ -468,8 +499,9 @@ mod tests {
 
     #[test]
     fn limits_are_conservative() {
-        // 编译期就把"子代理不能失控"钉死：改大常量会直接编译不过
-        const { assert!(DEFAULT_CHILD_STEPS <= 4, "子代理轮数不能失控") };
+        // 编译期钉死"子代理不能失控"：轮数放宽到与主代理默认一致（32），
+        // 但名额、结论大小、一次提交的任务数仍必须很小
+        const { assert!(DEFAULT_CHILD_STEPS <= 32, "子代理轮数不能超过主代理上限") };
         const { assert!(DEFAULT_MAX_CHILDREN <= 3, "每轮子代理数量必须很小") };
         const { assert!(MAX_SUMMARY_BYTES <= 8 * 1024, "结论必须压缩") };
         const { assert!(MAX_TASKS_PER_CALL <= 3, "一次调用提交的任务数必须很小") };

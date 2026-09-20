@@ -38,6 +38,8 @@ export interface ToolInvocation {
   truncated: boolean;
   duration_ms: number;
   approval: string | null;
+  /** 工具自算的额外 token 估算（子代理等隐藏开销；旧记录缺省为 0） */
+  extra_tokens?: number;
   created_at: string;
 }
 
@@ -67,6 +69,8 @@ export interface ToolCallView {
   args_preview: string;
   permission: ToolPermission;
   step: number;
+  /** 本次生成的工具轮数上限（后端 `tool-call-start` 下发） */
+  maxSteps?: number;
   status: ToolStatus;
   preview: string | null;
   duration_ms: number;
@@ -94,6 +98,8 @@ export interface ToolCallView {
     durationMs?: number;
     /** 自动选择时这条子任务实际用的子模型（未配置子模型时为空） */
     model?: string;
+    /** `skipped` 的原因（名额不足 / 时间预算不足） */
+    reason?: string;
   }>;
 }
 
@@ -111,6 +117,7 @@ export const TOOL_STATUS_LABEL: Record<ToolStatus, string> = {
 export const TOOL_PERMISSION_LABEL: Record<ToolPermission, string> = {
   read: "只读",
   write_app: "应用内写入",
+  write_session: "会话内写入",
   write_fs: "文件写入",
   execute: "执行命令",
   network: "网络访问",
@@ -123,6 +130,7 @@ export const TOOL_PERMISSION_RISK: Record<
 > = {
   read: { label: "低风险", level: "low" },
   write_app: { label: "中风险", level: "medium" },
+  write_session: { label: "低风险", level: "low" },
   write_fs: { label: "中风险", level: "medium" },
   execute: { label: "高风险", level: "high" },
   network: { label: "高风险", level: "high" },
@@ -175,6 +183,7 @@ export function normalizePermission(raw: string): ToolPermission {
   switch (raw) {
     case "read":
     case "write_app":
+    case "write_session":
     case "write_fs":
     case "execute":
     case "network":

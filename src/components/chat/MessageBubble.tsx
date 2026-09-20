@@ -1,12 +1,11 @@
 import { memo, useEffect, useState } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { useChatStore, type Message } from "../../stores/chatStore";
 import { toToolCallView, type ToolCallView } from "../../types/tools";
 import { ToolCallList } from "./ToolCallCard";
+import { MarkdownContent } from "./MarkdownContent";
+import { extractThinkTags, visibleAssistantContent } from "../../utils/messageText";
+import { copyText } from "../../utils/clipboard";
 
 interface Props {
   message: Message;
@@ -19,61 +18,111 @@ interface Props {
    * 回复上，保证工具记录不会在生成完成后突然消失。
    */
   liveToolCalls?: ToolCallView[];
+  /** 时间轴锚点 id（右侧轨道滚动跳转用） */
+  anchorId?: string;
+  /** 是否为本会话最后一条消息（决定用户消息上的"重试"入口） */
+  isLast?: boolean;
+  /** 点击"回退到此处"（由 MessageList 弹出确认框） */
+  onRewind?: (message: Message) => void;
 }
 
 /**
- * 外链渲染：交给系统默认浏览器打开
+ * 消息操作按钮（复制 / 编辑 / 重试 / 回退）
  *
- * 默认的 `<a>` 会让整个应用 webview 直接导航到外部页面（界面丢失，
- * 且外部页面会运行在注入了 IPC 的 webview 里）。这里拦截点击并调用
- * opener 插件，同时补上 rel="noreferrer"。
+ * 单独成组件并 memo：只有它订阅 `isStreaming`，生成开始/结束的重渲染
+ * 不会波及气泡本身（否则整列表的 Markdown 会跟着重新解析）。
  */
-function MarkdownLink({
-  href,
-  children,
-  ...rest
-}: React.AnchorHTMLAttributes<HTMLAnchorElement>) {
-  return (
-    <a
-      {...rest}
-      href={href}
-      rel="noreferrer noopener"
-      onClick={(event) => {
-        event.preventDefault();
-        if (!href) return;
-        if (!/^https?:\/\//i.test(href)) return; // 只放行 http(s)
-        openUrl(href).catch((e) => console.error("打开链接失败:", e));
-      }}
-    >
-      {children}
-    </a>
-  );
-}
+const MessageActions = memo(function MessageActions({
+  message,
+  isUser,
+  canRetry,
+  editing,
+  onEdit,
+  onRewind,
+}: {
+  message: Message;
+  isUser: boolean;
+  canRetry: boolean;
+  editing: boolean;
+  onEdit: () => void;
+  onRewind?: (message: Message) => void;
+}) {
+  const isStreaming = useChatStore((s) => s.isStreaming);
+  const disabled = isStreaming || editing;
+  const [copied, setCopied] = useState(false);
 
-const MARKDOWN_COMPONENTS = { a: MarkdownLink } as const;
-
-/** 从文本中提取 <think> 标签内容，返回 { thinking, content } */
-function extractThinkTags(text: string): { thinking: string | null; content: string } {
-  const thinkRegex = /<think>([\s\S]*?)<\/think>/g;
-  const thinkParts: string[] = [];
-  let cleaned = text;
-  let match;
-  while ((match = thinkRegex.exec(text)) !== null) {
-    thinkParts.push(match[1].trim());
-  }
-  if (thinkParts.length > 0) {
-    cleaned = text.replace(thinkRegex, "").trim();
-  }
-  return {
-    thinking: thinkParts.length > 0 ? thinkParts.join("\n\n") : null,
-    content: cleaned,
+  const handleCopy = async () => {
+    // 助手消息复制干净正文（有 thinking 字段时正文已剥离思考；旧数据降级解析）
+    const text = isUser ? message.content : visibleAssistantContent(message);
+    if (!text.trim()) return;
+    await copyText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
   };
-}
 
-function MessageBubbleImpl({ message, showStats, liveToolCalls }: Props) {
+  return (
+    <div className="message-actions" role="group" aria-label="消息操作">
+      <button
+        type="button"
+        className="message-action-btn"
+        disabled={editing}
+        onClick={handleCopy}
+        title={isUser ? "复制这条消息" : "复制回复正文（Markdown）"}
+        aria-label="复制消息"
+      >
+        {copied ? "✓" : "⧉"}
+      </button>
+      {isUser && (
+        <button
+          type="button"
+          className="message-action-btn"
+          disabled={disabled}
+          onClick={onEdit}
+          title="编辑并重新生成"
+          aria-label="编辑并重新生成"
+        >
+          ✎
+        </button>
+      )}
+      {canRetry && (
+        <button
+          type="button"
+          className="message-action-btn"
+          disabled={disabled}
+          onClick={() => void useChatStore.getState().retryMessage(message.id)}
+          title="重试：删除这条回复及其后内容，用原提问重新生成"
+          aria-label="重试"
+        >
+          ↻
+        </button>
+      )}
+      <button
+        type="button"
+        className="message-action-btn"
+        disabled={disabled}
+        onClick={() => onRewind?.(message)}
+        title="回退到此处：删除这条消息及其之后的全部消息"
+        aria-label="回退到此处"
+      >
+        ⤺
+      </button>
+    </div>
+  );
+});
+
+function MessageBubbleImpl({
+  message,
+  showStats,
+  liveToolCalls,
+  anchorId,
+  isLast,
+  onRewind,
+}: Props) {
   const isUser = message.role === "user";
   const [enabled, setEnabled] = useState(showStats ?? false);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
 
   // 历史工具记录：按 message_id 归组，未命中时为 undefined（引用稳定，不会引起额外重渲染）
   const persistedCalls = useChatStore((s) => s.toolsByMessage[message.id]);
@@ -111,8 +160,37 @@ function MessageBubbleImpl({ message, showStats, liveToolCalls }: Props) {
 
   const hasStats = !isUser && message.token_count > 0;
 
+  const startEdit = () => {
+    setDraft(message.content);
+    setEditing(true);
+  };
+
+  const commitEdit = () => {
+    const next = draft.trim();
+    setEditing(false);
+    if (!next || next === message.content.trim()) return;
+    // 事件回调里用 getState()：气泡本体不订阅 store，避免整列表跟着重渲染
+    void useChatStore.getState().editMessage(message.id, next);
+  };
+
+  const handleEditKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // 输入法组合期间的回车是"确认候选词"，不是保存（与 InputBox 同一套保护）
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      commitEdit();
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      setEditing(false);
+    }
+  };
+
+  // 重试入口：助手回复总是可以重试；用户消息只在"还没有回复"（最后一条）时出现
+  const canRetry = !isUser || isLast === true;
+
   return (
-    <div className={`message-row ${isUser ? "user" : "assistant"}`}>
+    <div className={`message-row ${isUser ? "user" : "assistant"}`} id={anchorId}>
       <div className="message-bubble">
         {/* 思考内容（可折叠） */}
         {!isUser && thinking && (
@@ -130,32 +208,54 @@ function MessageBubbleImpl({ message, showStats, liveToolCalls }: Props) {
             </button>
             {thinkingExpanded && (
               <div className="thinking-content">
-                <Markdown
-                  remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[rehypeHighlight]}
-                  components={MARKDOWN_COMPONENTS}
-                >
-                  {thinking}
-                </Markdown>
+                <MarkdownContent content={thinking} />
               </div>
             )}
           </div>
         )}
         {/* 工具调用记录（正文上方，点击卡片可展开参数与结果） */}
         {toolCalls.length > 0 && <ToolCallList calls={toolCalls} />}
-        <div className="message-content">
-          {isUser ? (
-            message.content
-          ) : (
-            <Markdown
-              remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeHighlight]}
-              components={MARKDOWN_COMPONENTS}
-            >
-              {cleanContent}
-            </Markdown>
-          )}
-        </div>
+        {editing ? (
+          <div className="message-edit">
+            <textarea
+              className="message-edit-textarea"
+              value={draft}
+              autoFocus
+              rows={Math.min(12, Math.max(2, draft.split("\n").length))}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={handleEditKeyDown}
+              aria-label="编辑消息内容"
+            />
+            <div className="message-edit-actions">
+              <span className="message-edit-hint">
+                Enter 保存并重新生成 · Esc 取消
+              </span>
+              <button
+                type="button"
+                className="message-edit-btn"
+                onClick={() => setEditing(false)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="message-edit-btn primary"
+                disabled={!draft.trim()}
+                onClick={commitEdit}
+              >
+                保存并重新生成
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="message-content">
+            {isUser ? (
+              message.content
+            ) : (
+              <MarkdownContent content={cleanContent} />
+            )}
+          </div>
+        )}
         <div className="message-meta">
           <span className="message-time">{time}</span>
           {/*
@@ -174,6 +274,15 @@ function MessageBubbleImpl({ message, showStats, liveToolCalls }: Props) {
           )}
         </div>
       </div>
+      {/* 操作按钮位于气泡下方（默认低调常驻，hover / 聚焦时点亮） */}
+      <MessageActions
+        message={message}
+        isUser={isUser}
+        canRetry={canRetry}
+        editing={editing}
+        onEdit={startEdit}
+        onRewind={onRewind}
+      />
     </div>
   );
 }

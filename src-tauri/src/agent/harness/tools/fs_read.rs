@@ -25,20 +25,31 @@ const BINARY_SNIFF_BYTES: usize = 8192;
 /// 读取文本文件
 pub struct ReadFile;
 
+/// 一次 `read_file(paths=[...])` 最多读几个文件
+///
+/// 批量读取共享本轮的输出上限；一次塞太多只会让每个文件都被截得看不懂。
+const MAX_BATCH_READ_FILES: usize = 10;
+
 #[async_trait::async_trait]
 impl Tool for ReadFile {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor::new(
             "read_file",
             "读取文件",
-            "读取工作区内文本文件的内容，带行号，可用 offset/limit 分页。路径可以是相对默认工作区的相对路径，或 `工作区id:相对路径`。",
+            "读取工作区内文本文件的内容，带行号，可用 offset/limit 分页。路径可以是相对默认工作区的相对路径，或 `工作区id:相对路径`。要一次读多个文件时用 `paths` 数组（最多 10 个），比逐个调用更省轮次；批量结果共享本轮的输出上限，超大文件请自行用 offset/limit 分片。",
             Permission::Read,
             json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "文件路径。相对路径基于默认工作区；也可写成 `notes:docs/a.md` 指定工作区"
+                        "description": "单个文件路径。相对路径基于默认工作区；也可写成 `notes:docs/a.md` 指定工作区"
+                    },
+                    "paths": {
+                        "type": "array",
+                        "maxItems": MAX_BATCH_READ_FILES,
+                        "items": { "type": "string" },
+                        "description": format!("一次读取多个文件（最多 {} 个，按顺序读取、结果依次拼接）；与 path 二选一", MAX_BATCH_READ_FILES)
                     },
                     "offset": {
                         "type": "integer",
@@ -49,7 +60,10 @@ impl Tool for ReadFile {
                         "description": "最多读取的行数（默认 400，最大 2000）"
                     }
                 },
-                "required": ["path"],
+                "anyOf": [
+                    { "required": ["path"] },
+                    { "required": ["paths"] }
+                ],
                 "additionalProperties": false
             }),
         )
@@ -57,62 +71,138 @@ impl Tool for ReadFile {
 
     async fn call(&self, args: Value, cx: &ToolCtx<'_>) -> Result<ToolOutput> {
         cx.ensure_not_cancelled()?;
-        let raw_path = args::required_str(&args, "path")?;
         let offset = args::bounded_usize(&args, "offset", 1, 1, 1_000_000);
         let limit = args::bounded_usize(&args, "limit", 400, 1, 2000);
 
-        let resolved = cx.services.workspaces.resolve_existing(&raw_path).map_err(anyhow::Error::msg)?;
-        if resolved.abs_path.is_dir() {
-            anyhow::bail!(
-                "{} 是目录，请改用 list_dir",
-                resolved.abs_path.display()
-            );
+        // 二选一：paths（批量）优先，否则取单个 path
+        let paths: Vec<String> = match args.get("paths") {
+            Some(Value::Array(items)) => {
+                let mut list = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let raw = item
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("paths[{}] 必须是非空字符串", index))?;
+                    list.push(raw.to_string());
+                }
+                if list.is_empty() {
+                    anyhow::bail!("paths 不能是空数组；只读一个文件时直接用 path");
+                }
+                if list.len() > MAX_BATCH_READ_FILES {
+                    anyhow::bail!(
+                        "一次最多读 {} 个文件（当前 {} 个），请分成多次读取",
+                        MAX_BATCH_READ_FILES,
+                        list.len()
+                    );
+                }
+                list
+            }
+            Some(_) => anyhow::bail!("paths 必须是字符串数组"),
+            None => vec![args::required_str(&args, "path")?],
+        };
+
+        // 批量时每个文件按均分预算截断：让每个文件都有可读的一段，
+        // 而不是让第一个大文件吃掉全部输出上限
+        let budget = (cx.limits.max_output_bytes / paths.len().max(1)).max(2 * 1024);
+
+        let mut sections = Vec::with_capacity(paths.len());
+        let mut preview: Option<String> = None;
+        let mut any_truncated = false;
+        for raw_path in &paths {
+            match read_one(cx, raw_path, offset, limit, budget) {
+                Ok((header, body, truncated)) => {
+                    if preview.is_none() {
+                        preview = Some(header.clone());
+                    }
+                    any_truncated |= truncated;
+                    sections.push(format!("{}{}", header, body));
+                }
+                // 单文件调用保持原有语义：失败直接报错（模型据此自我修正）
+                Err(e) if paths.len() == 1 => return Err(e),
+                // 批量调用里单个文件失败只影响该条，不拖垮整次读取
+                Err(e) => {
+                    let line = format!("文件：{} 读取失败：{}\n", raw_path, e);
+                    if preview.is_none() {
+                        preview = Some(line.clone());
+                    }
+                    sections.push(line);
+                }
+            }
         }
 
-        let metadata = std::fs::metadata(&resolved.abs_path)?;
-        if metadata.len() > MAX_TEXT_FILE_BYTES {
-            anyhow::bail!(
-                "文件过大（{} MB，上限 {} MB）：请用 grep_search 定位内容，或用 offset/limit 之外的工具分片查看",
-                metadata.len() / 1024 / 1024,
-                MAX_TEXT_FILE_BYTES / 1024 / 1024
-            );
+        let mut out = String::new();
+        if paths.len() > 1 {
+            out.push_str(&format!("批量读取 {} 个文件：\n\n", paths.len()));
         }
-        let bytes = std::fs::read(&resolved.abs_path)?;
-        if is_binary(&bytes) {
-            anyhow::bail!(
-                "{} 是二进制文件（{} 字节），无法作为文本读取",
-                resolved.abs_path.display(),
-                bytes.len()
-            );
-        }
-        let text = String::from_utf8_lossy(&bytes).to_string();
-
-        let all_lines: Vec<&str> = text.lines().collect();
-        let total = all_lines.len();
-        if offset > total && total > 0 {
-            anyhow::bail!("起始行 {} 超出文件总行数 {}", offset, total);
-        }
-        let start = (offset - 1).min(total);
-        let end = (start + limit).min(total);
-
-        let mut body = String::new();
-        for (index, line) in all_lines[start..end].iter().enumerate() {
-            body.push_str(&format!("{:>6}│{}\n", start + index + 1, line));
+        for section in sections {
+            out.push_str(&section);
+            out.push('\n');
         }
 
-        let header = format!(
-            "文件：{}（工作区 {}，共 {} 行，本次显示 {}-{} 行）\n",
-            resolved.abs_path.display(),
-            resolved.root_id,
-            total,
-            if total == 0 { 0 } else { start + 1 },
-            end
-        );
-        let (body, truncated) = truncate_text(&body, cx.limits.max_output_bytes);
-        let mut output = ToolOutput::text(format!("{}{}", header, body));
-        output.truncated = truncated;
-        Ok(output.with_preview(header))
+        let mut output = ToolOutput::text(out);
+        output.truncated = any_truncated;
+        Ok(output.with_preview(preview.unwrap_or_else(|| "读取文件".to_string())))
     }
+}
+
+/// 读取单个文件（`read_file` 的单文件与批量路径共用）
+///
+/// 返回 `(header, body, truncated)`；单文件的失败（不存在/目录/二进制/过大）
+/// 在批量模式下由调用方转成一条"读取失败"说明，不影响其它文件。
+fn read_one(
+    cx: &ToolCtx<'_>,
+    raw_path: &str,
+    offset: usize,
+    limit: usize,
+    budget_bytes: usize,
+) -> Result<(String, String, bool)> {
+    let resolved = cx.services.workspaces.resolve_existing(raw_path).map_err(anyhow::Error::msg)?;
+    if resolved.abs_path.is_dir() {
+        anyhow::bail!("{} 是目录，请改用 list_dir", resolved.abs_path.display());
+    }
+
+    let metadata = std::fs::metadata(&resolved.abs_path)?;
+    if metadata.len() > MAX_TEXT_FILE_BYTES {
+        anyhow::bail!(
+            "文件过大（{} MB，上限 {} MB）：请用 grep_search 定位内容，或分片查看",
+            metadata.len() / 1024 / 1024,
+            MAX_TEXT_FILE_BYTES / 1024 / 1024
+        );
+    }
+    let bytes = std::fs::read(&resolved.abs_path)?;
+    if is_binary(&bytes) {
+        anyhow::bail!(
+            "{} 是二进制文件（{} 字节），无法作为文本读取",
+            resolved.abs_path.display(),
+            bytes.len()
+        );
+    }
+    let text = String::from_utf8_lossy(&bytes).to_string();
+
+    let all_lines: Vec<&str> = text.lines().collect();
+    let total = all_lines.len();
+    if offset > total && total > 0 {
+        anyhow::bail!("起始行 {} 超出文件总行数 {}", offset, total);
+    }
+    let start = (offset - 1).min(total);
+    let end = (start + limit).min(total);
+
+    let mut body = String::new();
+    for (index, line) in all_lines[start..end].iter().enumerate() {
+        body.push_str(&format!("{:>6}│{}\n", start + index + 1, line));
+    }
+
+    let header = format!(
+        "文件：{}（工作区 {}，共 {} 行，本次显示 {}-{} 行）\n",
+        resolved.abs_path.display(),
+        resolved.root_id,
+        total,
+        if total == 0 { 0 } else { start + 1 },
+        end
+    );
+    let (body, truncated) = truncate_text(&body, budget_bytes);
+    Ok((header, body, truncated))
 }
 
 /// 列出目录内容
@@ -547,6 +637,52 @@ mod tests {
         assert!(out.content.contains("本次显示 2-2 行"));
         assert!(out.content.contains("第二行"));
         assert!(!out.content.contains("第三行"));
+    }
+
+    #[test]
+    fn read_file_batches_multiple_paths_in_one_call() {
+        let fx = Fixture::new("batch");
+        let cx = fx.ctx();
+        let out = block_on(ReadFile.call(
+            json!({"paths": ["README.md", "src/main.rs"]}),
+            &cx,
+        ))
+        .unwrap();
+        assert!(out.content.contains("批量读取 2 个文件"), "{}", out.content);
+        assert!(out.content.contains("# 标题"), "{}", out.content);
+        assert!(out.content.contains("fn main()"), "{}", out.content);
+    }
+
+    /// 批量里单个文件失败只影响该条，不拖垮整次调用
+    #[test]
+    fn batch_read_reports_per_file_failures() {
+        let fx = Fixture::new("batch-fail");
+        let cx = fx.ctx();
+        let out = block_on(ReadFile.call(
+            json!({"paths": ["README.md", "missing.rs"]}),
+            &cx,
+        ))
+        .unwrap();
+        assert!(out.content.contains("读取失败"), "{}", out.content);
+        assert!(out.content.contains("# 标题"), "{}", out.content);
+    }
+
+    #[test]
+    fn batch_read_rejects_empty_and_oversized_input() {
+        let fx = Fixture::new("batch-bad");
+        let cx = fx.ctx();
+
+        let err = block_on(ReadFile.call(json!({"paths": []}), &cx)).unwrap_err();
+        assert!(err.to_string().contains("不能是空数组"), "{err}");
+
+        let too_many: Vec<String> =
+            (0..=MAX_BATCH_READ_FILES).map(|i| format!("f{i}.rs")).collect();
+        let err = block_on(ReadFile.call(json!({"paths": too_many}), &cx)).unwrap_err();
+        assert!(err.to_string().contains("最多读"), "{err}");
+
+        // path 与 paths 都没给：错误信息必须指明该怎么传
+        let err = block_on(ReadFile.call(json!({}), &cx)).unwrap_err();
+        assert!(err.to_string().contains("path"), "{err}");
     }
 
     #[test]

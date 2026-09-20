@@ -68,9 +68,17 @@ must carry both ids; the frontend filters on them:
   live output box in `ToolCallCard`, never the LLM context (only `ToolOutput::content` is fed back).
 - `run_command` is the only `Execute` tool and never uses a shell: consecutive commands go through its `steps`
   array (≤5, each step re-checked by `CommandGuard` before *any* step runs), output trimming goes through
-  `max_output_lines`. `tools.call_timeout_secs` is the per-call budget; on timeout/cancel the command is killed
+  `max_output_lines`. `tools.call_timeout_secs` is the per-call budget (default 180 s since the v3 config
+  migration — first builds used to blow through the old 60 s default); on timeout/cancel the command is killed
   and the partial output is kept, with the tool reporting its own `ToolStatus` (`ok`/`error`/`timeout`/`cancelled`)
   instead of the runner turning it into a failed call.
+- **New default commands** (`DEFAULT_COMMAND_ALLOWLIST`): search/text (`rg`/`fd`/`jq`/`yq`/`diff`/`sort`/…) and
+  build/check toolchains (`gofmt`/`golangci-lint`/clang/gcc/ninja/just/ruff/…). Their host-side execution flags are
+  rejected per program in `command_guard::check_tool_specific_args` (`fd -x/-X`, `rg --pre/--hostname-bin/-z`,
+  `sort --compress-program`). `sed`/`awk`/`xargs` stay out of the defaults: they are code-execution channels that
+  cannot be reliably caught by argument inspection. `git` config escapes (`-c core.sshCommand/hooksPath/…`,
+  `git config` writing them) and non-dry-run `git clean` are hard-rejected too — the old alias-only check was not
+  enough once AUTO could silently approve commands.
 - `liveToolCalls` / `pendingApproval` describe "this turn's generation" only and are deliberately **kept**
   after `stream-end`, so every session change (create / switch / delete / current session disappeared) must
   reset them together — `chatStore.emptyGenerationState()` is the single place doing that. Forgetting it is
@@ -79,13 +87,38 @@ must carry both ids; the frontend filters on them:
 - `plan-updated` is **session-scoped** (no `stream_id`): the task plan is written by `update_plan`, injected
   into the system prompt of every tool-enabled turn (`agent/plan.rs::prompt_section`), and mirrored into the
   UI panel. It is model-authored structured data (titles + status), so it carries no untrusted payload.
+  Users may edit the same plan (`update_plan_items` → same table/validation/broadcast); a stopped generation
+  gets its `doing` items flipped to `blocked` by `stop_generation` because the model never gets a chance to.
+- **Task-mode tool visibility**: Plan is `ToolMode::ReadOnly` (`Permission::Read | WriteSession` — session-only
+  writes (`update_plan` / `save_note` / `forget_note`) are exactly what Plan needs, while `save_memory` stays
+  `WriteApp`), plus `ToolServices.plan_network` which makes `Network` tools visible in read-only mode (still
+  approved per call; subagents always get `false`). **Work is `ToolMode::Full` regardless of `tools.mode`**
+  (see `effective_tool_limits` in `commands/chat.rs`): a task session is an explicitly created execution
+  context and coding needs `run_command` visible; per-call approval and the command hard deny-list are the
+  actual gates, not visibility. Plan and Work share the same step budget (`tools.max_steps.max(20)`); only
+  casual chat stays capped at 3 — Plan investigations routinely need more than a handful of rounds before
+  `update_plan`.
+- **Session-scoped approvals** (`session_grants` table): `AllowSession` is persisted by the runner (via
+  `ToolServices.chat_store`) and merged into `auto_approve` in `build_tool_runtime`, so the "本会话允许"
+  button really lasts across turns; the task status bar lists/revokes grants. Verify the table is in both
+  `MIGRATIONS` and `CREATE_SCRIPTS` (see the schema reconciliation rules above).
+- **Session AUTO switch** (`sessions.auto_approve_all`, migration 015): when on, task-session tool calls that
+  `requires_approval()` are pre-granted through the separate `HarnessRun.auto_approve_all` bool (never a `"*"`
+  wildcard in the user-editable `tools.auto_approve` list). It *only* skips the approval prompt: tool
+  visibility, `CommandGuard`, the workspace jail, the deny-glob list, snapshots and the trash stay exactly the
+  same, and subagents always get `false` (their approver is still `DenyAllApprover`). It is snapshotted at
+  `send_message` time, so the status-bar chip is disabled while streaming; opening it asks for confirmation
+  (`AutoApproveConfirm`). `set_session_auto_approve` refuses non-task sessions.
 - **Read-only subagents** (`spawn_subagents`): each task runs its own `HarnessRun` with `ToolMode::ReadOnly`
   services, a `DenyAllApprover`, and `services.subagent = None` (depth is therefore exactly 1 by construction,
   not by argument checking). Children share the parent's `cancel` flag and their tool events reuse the parent
   `stream_id` with extra `parent_call_id` / `depth` fields, so the UI counts them on the spawn card instead of
   rendering dozens of unrelated cards. Per-generation budget is `DEFAULT_MAX_CHILDREN` (2), each child gets
-  `DEFAULT_CHILD_STEPS` (3) tool rounds, and its token usage is estimated back into `HarnessOutcome.extra_tokens`
-  → `message-stats` so the hidden cost stays visible.
+  `DEFAULT_CHILD_STEPS` (32, same as the main loop's default) tool rounds, and its token usage is estimated back
+  into `HarnessOutcome.extra_tokens` → `message-stats` so the hidden cost stays visible. Tasks in one call run
+  **in parallel**, and the whole batch uses `tools.subagent_timeout_secs` (600) through
+  `Tool::timeout_budget` instead of the 180 s `call_timeout`; a soft deadline cancels in-flight children and
+  returns the completed summaries as `ToolStatus::Timeout` rather than letting the outer timeout drop everything.
 - **Working memory** (`save_note` / `forget_note` → `tool_notes`, injected by `agent::notes::prompt_section`):
   the only cross-turn content, and deliberately narrow — model-authored summaries only (never raw tool output),
   ≤8 notes / 2 KB each / 16 KB total with oldest-first eviction, always wrapped in `<untrusted>` markers, never
@@ -139,7 +172,7 @@ Layer breakdown:
 - **memory/** + **store/memory_store.rs**: LLM-based fact extraction with dedup. Cosine similarity search in Rust over normalized f32 BLOBs. Scoring: `similarity * 0.7 + importance * 0.3`. Vectors whose dimension differs from the current embedding model are skipped, not silently truncated.
 - **store/**: Single SQLite database (`data.db`, WAL mode). Migrations in `store/migrations/`, each applied inside a transaction together with its `schema_version` row (never re-run partially). `ChatStore` for sessions/messages/stats, `MemoryStore` for memories, `tool_invocations` for UI-only tool traces, `session_plans` for the task plan (one JSON row per session) and `workspace_snapshots` for rollback
 - **Never trust `schema_version` alone**: `init_db` also runs `ensure_schema`, an idempotent reconciliation (`CREATE ... IF NOT EXISTS` scripts + a declarative `REQUIRED_COLUMNS` list probed via `PRAGMA table_info`) on **every** start. A `data.db` written by another build of this app can carry a ledger far ahead of this repo's migrations (a real incident: ledger at 16 while this repo shipped 1–6 → `sessions.context_summary` was never created → app started fine and only failed at `no such column: context_summary` on the first message). New migrations must therefore add their table to `CREATE_SCRIPTS` or their column to `REQUIRED_COLUMNS`; `fresh_and_repaired_schemas_match` fails loudly if you forget
-- **commands/**: 59 Tauri IPC commands registered in `lib.rs` — chat, settings, persona, memory, backup, stats, window management, tools (tool list / approvals / workspace roots)
+- **commands/**: 60 Tauri IPC commands registered in `lib.rs` — chat, settings, persona, memory, backup, stats, window management, tools (tool list / approvals / session grants / session AUTO / workspace roots)
 - **agent/harness/**: tool runtime — `Tool` trait + `ToolRegistry` (mode-gated visibility), SSE `tool_calls` accumulation, the multi-step loop (`runner.rs`), the workspace path jail (`jail.rs`), the sensitive-command guard (`command_guard.rs`) and the approval channel (`approve.rs`). See ARCHITECTURE.md §3.3.
 
 ### Context Window
@@ -176,6 +209,8 @@ that line's ledger reached 16 and silently suppressed this repo's migrations. Th
   `commands::persona::write_persona_file` / `validate_persona_id` — never `join` a raw id
 - Memory retrieval query is enhanced with the last 3 conversation messages for context
 - Auxiliary context reads must degrade, never abort the turn: `commands/chat.rs::read_summary` turns a failed summary read into "no summary this round" (logged) instead of propagating — a schema/query hiccup must never surface as "发送失败"
+- LLM transport failures are retried and must stay diagnosable: `OpenAiClient::post_json_with_retry` retries `.send()` failures 3× with backoff (safe — no response bytes were received) and every error is wrapped as `LLM 请求失败 · <model>（<provider>）：…` with the full reqwest `source()` chain (`describe_reqwest_error`), because reqwest's own `Display` hides the real cause behind `error sending request for url`. Never retry after the response stream has started.
+- Tool rounds are billed **per assistant message**, not per call: multiple read-only calls in one reply run in parallel and consume a single round, so `read_file` accepts `paths` for bulk reads and the prompts tell the model to batch reads. `tools.max_steps` is user-configurable (1..=128, default 32; Plan/Work share `max(20)`, casual chat stays 3). When the cap is hit the runner forces a tool-less closing turn and `hit_step_limit` flows through `AgentResponse` → `message-stats` so the task bar shows "步数用尽中断" and offers 「继续任务」 — never silently truncate a long task.
 - Tools (`agent/harness/`) are **main-window only**: `send_message` receives the Tauri-injected `WebviewWindow` and passes `tools: None` for the `float` window (that window is chat-only — the gate is the window label, never `persist`, because the pet's input box sends persisted messages too). Tool events are emitted with `emit_to("main")`.
 - Tool results **never cross turns**: they live in the in-memory message list of one generation, are never written to `messages`, and never reach summary/memory extraction. `tool_invocations` stores previews for UI replay only.
 - Every path that becomes a filesystem path must go through `harness::jail::WorkspaceSet` (`resolve` / `resolve_writable`) — never `join` a model-provided path. Command execution goes through `harness::command_guard::CommandGuard`; its hard deny-list always beats the user's allow-list.

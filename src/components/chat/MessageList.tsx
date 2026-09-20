@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useChatStore } from "../../stores/chatStore";
+import { useChatStore, type Message } from "../../stores/chatStore";
 import { MessageBubble } from "./MessageBubble";
+import { MessageTimeline } from "./MessageTimeline";
+import { RewindConfirmDialog } from "./RewindConfirmDialog";
 import { StreamingText } from "./StreamingText";
 import { ToolCallList } from "./ToolCallCard";
 
@@ -21,9 +23,14 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
   const liveToolCalls = useChatStore((s) => s.liveToolCalls);
   const toolsByMessage = useChatStore((s) => s.toolsByMessage);
   const currentSessionId = useChatStore((s) => s.currentSessionId);
+  const sessions = useChatStore((s) => s.sessions);
+  const isTaskSession =
+    sessions.find((s) => s.id === currentSessionId)?.session_type === "task";
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [showStats, setShowStats] = useState(false);
+  /** 回退确认的目标消息（null = 不显示弹窗） */
+  const [rewindTarget, setRewindTarget] = useState<Message | null>(null);
 
   /*
    * 工具调用的落位规则
@@ -119,44 +126,67 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
   }, [isStreaming]);
 
   return (
-    <div className="message-list" ref={containerRef}>
-      {messages.length === 0 && !isStreaming && (
-        <div className="empty-state">
-          <div className="empty-icon">✦</div>
-          <p>开始和{personaShortName ?? "角色"}聊天吧～</p>
-        </div>
-      )}
-      {messages.map((msg) => (
-        <MessageBubble
-          key={msg.id}
-          message={msg}
-          showStats={showStats}
-          // 尾部回复还没拿到落库记录时，用内存中的记录兜底渲染（避免卡片闪一下就没）
-          liveToolCalls={
-            attachToTailAssistant && msg.id === tailAssistantId
-              ? liveToolCalls
-              : undefined
-          }
+    <div className="message-list-wrap">
+      <div className="message-list" ref={containerRef}>
+        {messages.length === 0 && !isStreaming && (
+          <div className="empty-state">
+            <div className="empty-icon">✦</div>
+            {isTaskSession ? (
+              <>
+                <p>描述你的目标，Plan 阶段会先只读调查并给出计划</p>
+                <p className="empty-state-hint">
+                  例如「分析这个项目的构建流程并给出优化步骤」；
+                  批准计划后会自动切到 Work 逐步执行，改动可随时回滚
+                </p>
+              </>
+            ) : (
+              <p>开始和{personaShortName ?? "角色"}聊天吧～</p>
+            )}
+          </div>
+        )}
+        {messages.map((msg, index) => (
+          <MessageBubble
+            key={msg.id}
+            message={msg}
+            showStats={showStats}
+            anchorId={`msg-${msg.id}`}
+            isLast={index === messages.length - 1}
+            onRewind={setRewindTarget}
+            // 尾部回复还没拿到落库记录时，用内存中的记录兜底渲染（避免卡片闪一下就没）
+            liveToolCalls={
+              attachToTailAssistant && msg.id === tailAssistantId
+                ? liveToolCalls
+                : undefined
+            }
+          />
+        ))}
+        {/* 进行中的工具调用：显示在流式气泡上方（悬浮窗不会收到工具事件） */}
+        {isStreaming && liveToolCalls.length > 0 && (
+          <div className="message-row assistant">
+            <div className="message-bubble streaming tool-live-bubble">
+              <ToolCallList calls={liveToolCalls} />
+            </div>
+          </div>
+        )}
+        {isStreaming && <StreamingText />}
+        {/* 没有对应回复的工具记录（生成失败/被取消） */}
+        {orphanToolCalls && (
+          <div className="message-row assistant">
+            <div className="message-bubble tool-live-bubble">
+              <ToolCallList calls={liveToolCalls} />
+            </div>
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+      {/* 右侧消息时间轴：按消息实际位置打点，点击跳转、滚动高亮 */}
+      <MessageTimeline messages={messages} containerRef={containerRef} />
+      {rewindTarget && (
+        <RewindConfirmDialog
+          message={rewindTarget}
+          onClose={() => setRewindTarget(null)}
         />
-      ))}
-      {/* 进行中的工具调用：显示在流式气泡上方（悬浮窗不会收到工具事件） */}
-      {isStreaming && liveToolCalls.length > 0 && (
-        <div className="message-row assistant">
-          <div className="message-bubble streaming tool-live-bubble">
-            <ToolCallList calls={liveToolCalls} />
-          </div>
-        </div>
       )}
-      {isStreaming && <StreamingText />}
-      {/* 没有对应回复的工具记录（生成失败/被取消） */}
-      {orphanToolCalls && (
-        <div className="message-row assistant">
-          <div className="message-bubble tool-live-bubble">
-            <ToolCallList calls={liveToolCalls} />
-          </div>
-        </div>
-      )}
-      <div ref={bottomRef} />
     </div>
   );
 }

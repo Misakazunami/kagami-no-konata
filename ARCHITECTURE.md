@@ -300,7 +300,17 @@ Agent 层回答"谁来处理这条输入"（路由在 LLM **之前**），工具
 2. **工具结果不跨轮保留**：只活在本次生成的内存消息列表里，不写 `messages`、
    不进摘要与记忆提取；落库的 `tool_invocations` 只保存预览供 UI 回放。
 3. 工具失败不冒泡为错误，而是以 `<tool_result status="error">` 回灌给模型自行修正。
-4. 步数耗尽时追加一次**不带工具**的生成，保证用户总能得到自然语言回答。
+4. 步数耗尽时追加一次**不带工具**的生成，保证用户总能得到自然语言回答；
+   `hit_step_limit` 会随 `message-stats` 下发，界面提示"中断，可继续"。
+
+**轮次计费**：工具轮数按**助手消息**计——同一条回复里的多个只读调用
+（`read_file` / `list_dir` / `grep_search` / `glob_search`）并行执行、只算一轮；
+`read_file` 的 `paths` 数组支持一次读多个文件。步数上限可配（`tools.max_steps`，
+1~128，默认 32，任务会话 Plan/Work 共用且保底 20）。
+
+**任务模式可见性**：Plan 恒为 `ReadOnly`（另有联网只读例外）；Work 恒为 `Full`，
+不跟随 `tools.mode`——任务会话是显式创建的执行上下文，编码需要 `run_command`
+可见；真正的闸门是逐次审批（或会话 AUTO）与命令硬黑名单，而不是可见性。
 
 **双 surface 隔离**
 
@@ -330,6 +340,19 @@ Agent 层回答"谁来处理这条输入"（路由在 LLM **之前**），工具
   （`cmd`/`powershell`/`curl`/`rm`/`reg`/`schtasks`/`certutil`… 无法放行）、
   解释器求值参数（`python -c`、`node -e`）一律拒绝、`python -m` 仅限白名单模块、
   参数中的绝对路径必须落在工作区内、子进程只继承白名单环境变量；
+- **新命令的代执行参数**：默认列表新增搜索/文本（`rg`/`fd`/`jq`/`yq`/`diff`/`sort`/…）与
+  构建/检查工具链（`gofmt`/`golangci-lint`/clang/gcc/ninja/just/ruff/…）；
+  `fd -x/-X/--exec*`、`rg --pre/--hostname-bin/-z`、`sort --compress-program`
+  由 `command_guard::check_tool_specific_args` 逐程序拒绝。`sed`/`awk`/`xargs` 是
+  参数审查拦不住的代码执行通道，不进入默认列表；
+- **git 配置即代执行**：`git -c alias.x='!cmd'`、`git -c core.sshCommand/core.hooksPath/
+  credential.helper/…` 与 `git config` 写入同类键一律拒绝；`git clean` 只放行
+  dry-run（批量删除不经过回收站与快照）。会话 AUTO 打开后审批层不再逐次确认，
+  这些硬规则就是 `run_command` 的实际边界；
+- **会话 AUTO**（`sessions.auto_approve_all`，迁移 015）：仅任务会话可开，通过独立的
+  `HarnessRun.auto_approve_all` 布尔预授权所有 `requires_approval()` 调用，
+  只跳过审批弹窗——可见性、硬黑名单、路径监狱、敏感文件清单、快照与回收站全部照旧，
+  子代理恒为 `false`；发送时快照、生成中不可切换，开启前需确认；
 - **多步命令**：`run_command` 接受 `steps`（≤5 步）串行执行，**不使用 shell 组合**
   （没有管道/重定向/`&&`）；每一步都单独过守卫，任何一步被拒则整批都不执行；
   输出裁剪用 `max_output_lines` 而不是管道；
@@ -337,7 +360,12 @@ Agent 层回答"谁来处理这条输入"（路由在 LLM **之前**），工具
 - **多步命令的预检**：`run_command` 的每一步都先过守卫再执行，第 2 步会被拒时第 1 步绝不执行；
 - **改动前快照**：覆盖/编辑/删除/移动/复制文件前把原内容备份到 `snapshots/{stream_id}/`（仅文件、单文件 ≤4 MB、单 stream ≤64 MB，超限跳过并如实告知），配合 `restore_snapshot` 支持一键回滚；目录级删除由回收站兜底；
 - **只读子代理**：`spawn_subagents` 派出的每个任务都在"只读服务 + DenyAllApprover + 无子代理运行时"的
-  克隆上跑自己的循环，深度因此恒为 1 层；每轮生成有名额预算（默认 2），子代理用量估算回传进统计；
+  克隆上跑自己的循环，深度因此恒为 1 层；每轮生成有名额预算（默认 2），每个子任务默认 32 轮工具调用
+  （`DEFAULT_CHILD_STEPS`，与主循环默认一致），子代理用量估算回传进统计；
+  名额 / 步数 / 单次任务数 / 整批时间预算均可由用户在「设置 → 工具」里配置（`tools.subagent_*`）；
+  同一次调用里的任务**并行执行**，整批用独立的 `tools.subagent_timeout_secs`（默认 600 秒）而不是
+  普通工具的 `call_timeout`（默认 180 秒）；软截止到点会取消在跑的子代理并把已完成结论作为
+  `ToolStatus::Timeout` 带回；
 - **工作记忆**：唯一跨轮保留的内容，且只有模型主动 `save_note` 的结论（≤8 条 / 单条 2 KB / 总量 16 KB，
   超出淘汰最旧），注入时整段带 `<untrusted>`，不参与任何权限或审批决策；
 - **联网检索**：`web_search` 默认关闭（唯一外发用户提问的能力），只返回链接与摘要，正文仍走 `web_fetch` 的白名单；

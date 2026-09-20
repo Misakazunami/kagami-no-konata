@@ -31,6 +31,14 @@ interface ToolsConfig {
   call_timeout_secs: number;
   /** 工作记忆：模型主动记下的跨轮结论 */
   working_memory: boolean;
+  /** 子代理预算：每轮生成最多派出几个只读子代理 */
+  subagent_max_children: number;
+  /** 子代理预算：每个子代理的最大工具轮数 */
+  subagent_steps: number;
+  /** 子代理预算：单次 spawn_subagents 最多提交几个任务 */
+  subagent_max_tasks: number;
+  /** 子代理预算：整批子代理的时间预算（秒） */
+  subagent_timeout_secs: number;
   /** 联网检索（web_search） */
   search: SearchConfig;
   /** MCP 服务器（外部工具生态） */
@@ -46,11 +54,15 @@ const DEFAULT_TOOLS_CONFIG: ToolsConfig = {
   workspaces: [],
   deny_globs: [],
   auto_approve: [],
-  max_steps: 8,
+  max_steps: 32,
   max_output_bytes: 65536,
   approval_timeout_secs: 120,
-  call_timeout_secs: 60,
+  call_timeout_secs: 180,
   working_memory: true,
+  subagent_max_children: 2,
+  subagent_steps: 32,
+  subagent_max_tasks: 3,
+  subagent_timeout_secs: 600,
   search: {
     enabled: false,
     provider: "searxng",
@@ -68,6 +80,10 @@ const TOOL_MODE_HINT: Record<ToolsConfig["mode"], string> = {
   standard: "标准：读与App内写入自动放行，写文件/执行命令需要审批",
   full: "完整：在标准之上放开命令执行（仍禁止敏感命令）",
 };
+
+/** 任务会话的可见性不受上面的权限模式影响：Plan 只读、Work 恒为完整 */
+const TASK_MODE_HINT =
+  "任务会话例外：Plan 恒为只读，Work 恒为完整（命令仍需审批，除非会话内开启 AUTO）";
 
 type SearchProvider = "searxng" | "tavily" | "brave";
 
@@ -120,7 +136,8 @@ interface LlmProvider {
   model: string;
   enabled_models: string[];
   embedding_model: string;
-  max_tokens: number;
+  /** 留空（null / 缺省）= 不指定，请求体不带 max_tokens，由服务商决定输出上限 */
+  max_tokens?: number | null;
   temperature: number;
   enable_thinking?: boolean;
   /** 显式声明支持深度思考的模型（覆盖名称启发式探测） */
@@ -199,6 +216,20 @@ function clampNumber(raw: string, min: number, max: number, fallback: number): n
   if (raw.trim() === "") return fallback;
   const value = Number(raw);
   if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * 可空数值解析：留空 = `null`（不指定 / 使用服务商默认），非法输入同样回退 `null`
+ *
+ * 用于 max_tokens 这类"留空才有意义"的字段：后端 `Option<u32>` 收到 null 时
+ * 请求体不带该字段。若沿用 `clampNumber` 会在清空输入框时写回 2048，
+ * 用户就永远无法表达"不指定"。
+ */
+function parseOptionalClamped(raw: string, min: number, max: number): number | null {
+  if (raw.trim() === "") return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
   return Math.min(max, Math.max(min, value));
 }
 
@@ -828,8 +859,9 @@ export function SettingsPage() {
             </label>
             <label>
               <span>最大 Tokens</span>
-              <input type="number" min="1" max="1000000" value={activeProvider.max_tokens}
-                onChange={(e) => setEditingProvider({ ...activeProvider, max_tokens: clampNumber(e.target.value, 1, 1_000_000, 2048) })} />
+              <input type="number" min="1" max="1000000" placeholder="留空 = 使用服务商默认"
+                value={activeProvider.max_tokens ?? ""}
+                onChange={(e) => setEditingProvider({ ...activeProvider, max_tokens: parseOptionalClamped(e.target.value, 1, 1_000_000) })} />
             </label>
             <label>
               <span>Temperature</span>
@@ -1077,6 +1109,28 @@ export function SettingsPage() {
           </select>
           <span className="settings-hint">
             {TOOL_MODE_HINT[toolsConfig.mode] ?? ""}
+            <br />
+            {TASK_MODE_HINT}
+          </span>
+        </label>
+        <label>
+          <span>工具步数上限</span>
+          <input
+            type="number"
+            min="1"
+            max="128"
+            disabled={!toolsConfig.enabled}
+            value={toolsConfig.max_steps}
+            onChange={(e) =>
+              patchTools({
+                max_steps: clampNumber(e.target.value, 1, 128, 32),
+              })
+            }
+          />
+          <span className="settings-hint">
+            每次生成允许的最大工具轮数（默认 32，上限 128）。任务会话的 Plan 与 Work
+            共用这个预算（保底 20 轮），普通聊天固定不超过 3 轮；一轮可以并行执行
+            同一条回复里的多个只读调用
           </span>
         </label>
         <label>
@@ -1105,13 +1159,89 @@ export function SettingsPage() {
             onChange={(e) =>
               // 后端校验范围是 5 ~ 1800 秒；首次编译这类长命令需要更大的预算
               patchTools({
-                call_timeout_secs: clampNumber(e.target.value, 5, 1800, 60),
+                call_timeout_secs: clampNumber(e.target.value, 5, 1800, 180),
+              })
+            }
+          />
+           <span className="settings-hint">
+            执行命令的等待上限。超时不会直接报错：会带着已经产生的输出提前结束，
+            并把「跑到哪一步超时」如实汇报（首次编译建议 300 秒以上）
+          </span>
+        </label>
+
+        {/* 子代理预算：调查类任务的开销上限，直接决定"后台偷偷花了多少" */}
+        <label>
+          <span>子代理名额（每轮）</span>
+          <input
+            type="number"
+            min="1"
+            max="4"
+            disabled={!toolsConfig.enabled}
+            value={toolsConfig.subagent_max_children}
+            onChange={(e) =>
+              patchTools({
+                subagent_max_children: clampNumber(e.target.value, 1, 4, 2),
               })
             }
           />
           <span className="settings-hint">
-            执行命令的等待上限。超时不会直接报错：会带着已经产生的输出提前结束，
-            并把「跑到哪一步超时」如实汇报（首次编译建议 300 秒以上）
+            每轮生成最多派出几个只读子代理（默认 2）。派多了会显著增加 token 消耗
+          </span>
+        </label>
+        <label>
+          <span>子代理步数</span>
+          <input
+            type="number"
+            min="1"
+            max="64"
+            disabled={!toolsConfig.enabled}
+            value={toolsConfig.subagent_steps}
+            onChange={(e) =>
+              patchTools({
+                subagent_steps: clampNumber(e.target.value, 1, 64, 32),
+              })
+            }
+          />
+          <span className="settings-hint">
+            每个子代理自己的工具轮数上限（默认 32，与主循环一致）；子代理始终只读
+          </span>
+        </label>
+        <label>
+          <span>单次子代理任务数</span>
+          <input
+            type="number"
+            min="1"
+            max="3"
+            disabled={!toolsConfig.enabled}
+            value={toolsConfig.subagent_max_tasks}
+            onChange={(e) =>
+              patchTools({
+                subagent_max_tasks: clampNumber(e.target.value, 1, 3, 3),
+              })
+            }
+          />
+          <span className="settings-hint">
+            一次 spawn_subagents 调用最多提交几个调查任务（默认 3，上限由工具声明固定为 3）
+          </span>
+        </label>
+        <label>
+          <span>子代理时间预算（秒）</span>
+          <input
+            type="number"
+            min="30"
+            max="3600"
+            step="30"
+            disabled={!toolsConfig.enabled}
+            value={toolsConfig.subagent_timeout_secs}
+            onChange={(e) =>
+              patchTools({
+                subagent_timeout_secs: clampNumber(e.target.value, 30, 3600, 600),
+              })
+            }
+          />
+          <span className="settings-hint">
+            整批子代理的墙钟时间上限（默认 600 秒）。到点前会把已完成的结论带回来并注明
+            「时间预算用尽」，而不是被强制掐断；普通工具仍用上面的单次超时
           </span>
         </label>
 

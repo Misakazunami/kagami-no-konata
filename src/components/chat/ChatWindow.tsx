@@ -6,8 +6,11 @@ import { MessageList } from "./MessageList";
 import { InputBox } from "./InputBox";
 import { NotesPanel } from "./NotesPanel";
 import { PlanPanel } from "./PlanPanel";
-import { SnapshotBanner } from "./SnapshotBanner";
+import { ChangesPanel } from "./ChangesPanel";
+import { TaskStatusBar } from "./TaskStatusBar";
 import type { WorkspaceView } from "../../types/tools";
+import { copyText } from "../../utils/clipboard";
+import { buildConversationMarkdown } from "../../utils/exportConversation";
 import {
   DEFAULT_PERSONA_ID,
   FALLBACK_SHORT_NAME,
@@ -54,6 +57,7 @@ function groupSessionsByDate(sessions: Session[]): [string, Session[]][] {
 export function ChatWindow() {
   const sessions = useChatStore((s) => s.sessions);
   const currentSessionId = useChatStore((s) => s.currentSessionId);
+  const messages = useChatStore((s) => s.messages);
   const errorMessage = useChatStore((s) => s.errorMessage);
   const clearError = useChatStore((s) => s.clearError);
   const initSession = useChatStore((s) => s.initSession);
@@ -80,6 +84,8 @@ export function ChatWindow() {
   const [isCreatingTask, setIsCreatingTask] = useState(false);
   // 任务会话的模型选择方式：默认手动（跟随全局/会话内再选），可在此直接开启自动选择
   const [autoModels, setAutoModels] = useState(false);
+  // 创建时即选运行模式：直接进入 Work 可以跳过 Plan 阶段
+  const [newTaskMode, setNewTaskMode] = useState<"plan" | "work">("plan");
 
   const openTaskModal = async () => {
     setTaskModalError("");
@@ -87,6 +93,7 @@ export function ChatWindow() {
     setAutoModels(
       useChatStore.getState().modelCatalog?.settings.auto_by_default ?? false
     );
+    setNewTaskMode("plan");
     try {
       const list = await invoke<WorkspaceView[]>("list_workspaces");
       setWorkspaces(list);
@@ -94,9 +101,11 @@ export function ChatWindow() {
       setSelectedWorkspace(defaultWs ? defaultWs.id : "");
       setShowTaskModal(true);
     } catch (e) {
+      // 不再静默降级成"无工作区任务"：用户以为选了目录，实际跑在默认沙箱里
       console.error("加载工作区失败:", e);
-      // 降级直接创建
-      createSession(undefined, selectedPersona, "task");
+      useChatStore.setState({
+        errorMessage: `加载工作区失败，未创建任务会话：${typeof e === "string" ? e : String(e)}`,
+      });
     }
   };
 
@@ -121,7 +130,8 @@ export function ChatWindow() {
         targetWorkspaceId || undefined,
         // 自动选择：Plan 模式与子代理优先用子模型，Work 模式优先用主模型
         // （显式传 inherit 表示"跟随全局"，避免被设置里的默认自动覆盖）
-        autoModels ? { mode: "auto" } : { mode: "inherit" }
+        autoModels ? { mode: "auto" } : { mode: "inherit" },
+        newTaskMode
       );
       setShowTaskModal(false);
       setCustomPath("");
@@ -213,6 +223,21 @@ export function ChatWindow() {
   const handleToggleFloat = async () => {
     await invoke("toggle_float_window");
     // 状态由后端事件自动同步，无需手动切换
+  };
+
+  // 一键复制整个会话（Markdown）：用于粘贴到笔记 / issue / 分享
+  const [conversationCopied, setConversationCopied] = useState(false);
+  const handleCopyConversation = async () => {
+    if (messages.length === 0) return;
+    try {
+      await copyText(buildConversationMarkdown(currentSession, messages));
+      setConversationCopied(true);
+      setTimeout(() => setConversationCopied(false), 2000);
+    } catch (e) {
+      useChatStore.setState({
+        errorMessage: `复制对话失败：${typeof e === "string" ? e : String(e)}`,
+      });
+    }
   };
 
   // 主题切换
@@ -340,7 +365,16 @@ export function ChatWindow() {
                     ) : (
                       <div className="session-title-wrap">
                         {s.session_type === "task" && (
-                          <span className="session-type-badge">任务</span>
+                          <span
+                            className={`session-type-badge ${s.task_mode === "work" ? "work" : "plan"}`}
+                            title={
+                              s.task_mode === "work"
+                                ? "任务会话 · 执行模式（Work）"
+                                : "任务会话 · 规划模式（Plan）"
+                            }
+                          >
+                            {s.task_mode === "work" ? "⚡任务" : "📋任务"}
+                          </span>
                         )}
                         <span className="session-title">{s.title}</span>
                         {personaName && s.persona_id !== DEFAULT_PERSONA_ID && (
@@ -405,7 +439,16 @@ export function ChatWindow() {
           <>
             <div className="chat-header">
               <span className="chat-persona-badge">{currentPersonaName}</span>
+              <TaskStatusBar />
               <div className="chat-header-actions">
+                <button
+                  className="header-action-btn"
+                  onClick={handleCopyConversation}
+                  disabled={messages.length === 0}
+                  title="把整个会话复制为 Markdown"
+                >
+                  {conversationCopied ? "✓ 已复制" : "⧉ 复制对话"}
+                </button>
                 <button className="header-action-btn" onClick={handleSwitchToFloat} title="切换到悬浮窗">
                   ↗ 切换
                 </button>
@@ -417,8 +460,8 @@ export function ChatWindow() {
               </div>
             </div>
             <MessageList personaShortName={currentPersonaShortName} />
-            {/* 回滚条与计划面板都贴着输入框：它们是"这一轮任务"的状态，不是聊天内容 */}
-            <SnapshotBanner />
+            {/* 改动记录与计划面板都贴着输入框：它们是"这一轮任务"的状态，不是聊天内容 */}
+            <ChangesPanel />
             <PlanPanel />
             <NotesPanel />
             <InputBox />
@@ -490,6 +533,32 @@ export function ChatWindow() {
               </div>
               <div className="task-modal-hint">
                 填写路径后会先把它加入工作区列表，并用它作为本次任务的执行目录。
+              </div>
+            </div>
+
+            <div className="task-modal-section">
+              <div className="task-modal-section-title">运行模式</div>
+              <div className="task-modal-mode-group" role="group" aria-label="任务运行模式">
+                <button
+                  type="button"
+                  className={`task-modal-mode-btn${newTaskMode === "plan" ? " active plan" : ""}`}
+                  aria-pressed={newTaskMode === "plan"}
+                  onClick={() => setNewTaskMode("plan")}
+                >
+                  📋 规划 (Plan)
+                </button>
+                <button
+                  type="button"
+                  className={`task-modal-mode-btn${newTaskMode === "work" ? " active work" : ""}`}
+                  aria-pressed={newTaskMode === "work"}
+                  onClick={() => setNewTaskMode("work")}
+                >
+                  ⚡ 执行 (Work)
+                </button>
+              </div>
+              <div className="task-modal-hint">
+                建议先规划：Plan 阶段只读调查并产出计划，批准后再执行；
+                直接选 Work 则跳过规划，适合目标已经明确的任务。
               </div>
             </div>
 

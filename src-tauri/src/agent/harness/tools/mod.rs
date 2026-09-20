@@ -128,12 +128,18 @@ mod tests {
     }
 
     #[test]
-    fn readonly_mode_only_exposes_read_tools() {
+    fn readonly_mode_only_exposes_read_and_session_tools() {
         let registry = builtin_registry();
         for name in registry.visible_names(ToolMode::ReadOnly) {
             let permission = registry.permission_of(&name).unwrap();
+            // 只读模式允许会话级写入（计划/工作记忆）——它们是模型维护进度的载体；
+            // 文件写入、命令执行、长期记忆写入必须仍旧不可见
             assert!(
-                permission.is_read_only(),
+                matches!(
+                    permission,
+                    crate::agent::harness::traits::Permission::Read
+                        | crate::agent::harness::traits::Permission::WriteSession
+                ),
                 "只读模式不应暴露 {}（{:?}）",
                 name,
                 permission

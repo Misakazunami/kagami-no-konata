@@ -32,6 +32,14 @@ export interface MessageStatsData {
    * 自动选择下主轮次与子代理用的模型不同，界面必须能如实展示"这条是谁答的"。
    */
   model?: string;
+  /**
+   * 工具步数用尽、模型被强制收尾
+   *
+   * 界面据此提示"因步数上限中断，可继续"，避免用户以为任务已经完成。
+   */
+  step_limit_hit?: boolean;
+  /** 本次生成实际执行的工具轮数（"中断于第 N 步"用） */
+  tool_steps?: number;
 }
 
 /** `stream-error` 事件载荷（后端生成失败时发出） */
@@ -62,12 +70,13 @@ export type ToolStatus =
 /**
  * 工具权限等级（决定是否需要审批与风险级别）
  *
- * `read` 只读；`write_app` 应用内写入；`write_fs` 文件系统写入；
- * `execute` 执行命令；`network` 访问网络。
+ * `read` 只读；`write_app` 应用内写入；`write_session` 会话级写入（计划/工作记忆）；
+ * `write_fs` 文件系统写入；`execute` 执行命令；`network` 访问网络。
  */
 export type ToolPermission =
   | "read"
   | "write_app"
+  | "write_session"
   | "write_fs"
   | "execute"
   | "network";
@@ -102,6 +111,8 @@ export interface ToolCallStartData extends NestedToolEventFields {
   permission: ToolPermission;
   /** 本次生成内的第几步（从 1 开始） */
   step: number;
+  /** 本次生成的工具轮数上限（用于展示「第 N/M 步」） */
+  max_steps: number;
 }
 
 /** `tool-call-result` 事件载荷：一次工具调用结束（成功或失败） */
@@ -219,6 +230,8 @@ export interface SubagentStatusData {
   duration_ms?: number;
   /** 自动选择时这条子任务实际用的子模型（未配置子模型时为空） */
   model?: string;
+  /** `skipped` 的原因（名额不足 / 时间预算不足），仅供界面展示 */
+  reason?: string;
 }
 
 /** `notes-updated` 事件载荷：只带计数，正文由界面按需回读 */
@@ -246,6 +259,62 @@ export interface RestoreReportView {
   /** 备份文件已不存在（被清理过）而跳过的条目 */
   missing: number;
   errors: string[];
+}
+
+/** `list_session_snapshots` 返回的单个文件（不含内部备份名） */
+export interface SessionSnapshotFileView {
+  root_id: string;
+  rel_path: string;
+  bytes: number;
+  created_at: string;
+}
+
+/** `list_session_snapshots` 返回的一轮改动（按 stream 分组） */
+export interface SessionSnapshotStreamView {
+  stream_id: string;
+  /** 该轮最早一条备份的时间 */
+  created_at: string;
+  total_bytes: number;
+  files: SessionSnapshotFileView[];
+}
+
+/**
+ * `session-updated` 事件载荷
+ *
+ * 除了会话同步，还携带本轮落库的消息 id：前端乐观消息（`crypto.randomUUID()`）
+ * 与数据库 id 不同源，若不对齐，紧接着点「重试 / 编辑 / 回退」时后端按本地 id
+ * 查不到消息。主窗口收到自己那轮时把本地 id 换成这里下发的数据库 id。
+ */
+export interface SessionUpdatedData {
+  session_id: string;
+  stream_id: string;
+  /** 本轮 assistant 消息的数据库 id（未落库时为 null/缺省） */
+  message_id?: string | null;
+  /** 本轮用户消息的数据库 id（重试/编辑复用旧行时为 null） */
+  user_message_id?: string | null;
+}
+
+/** `preview_rewind` 返回的一个受影响轮次（可一并撤销的文件改动） */
+export interface RewindAffectedStreamView {
+  stream_id: string;
+  files: number;
+  bytes: number;
+}
+
+/** `preview_rewind` 命令的返回值（回退确认弹窗用） */
+export interface RewindPreviewView {
+  /** 将删除的消息条数 */
+  removed: number;
+  /** 受影响、可一并撤销文件改动的轮次（新 → 旧） */
+  affected_streams: RewindAffectedStreamView[];
+}
+
+/** `delete_messages_from` 命令的返回值（后端 `RewindOutcome`） */
+export interface RewindOutcomeView {
+  removed: number;
+  affected_streams: string[];
+  target_index: number;
+  summary_cleared: boolean;
 }
 
 export const STREAM_EVENT = {

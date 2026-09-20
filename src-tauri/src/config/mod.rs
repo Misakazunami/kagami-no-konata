@@ -92,6 +92,47 @@ pub fn load_config(app_data_dir: &Path) -> Result<AppConfig> {
         repaired = true;
     }
 
+    // 两处旧默认值的一次性归一化（标记文件保证只执行一次：之后用户
+    // 主动把同样的值填回来也不会在下次启动被覆盖）：
+    // - llm.providers[].max_tokens == 2048 → None（不指定，由服务商决定输出上限）
+    // - tools.max_steps == 8 → 32（新默认；工作模式因此从 20 提高到 32）
+    let defaults_marker = app_data_dir.join(".config-defaults-v2.migrated");
+    if !defaults_marker.exists() {
+        for provider in &mut config.llm.providers {
+            if provider.max_tokens == Some(2048) {
+                provider.max_tokens = None;
+                repaired = true;
+            }
+        }
+        if config.tools.max_steps == 8 {
+            config.tools.max_steps = 32;
+            repaired = true;
+        }
+        if let Err(e) = fs::write(&defaults_marker, "1") {
+            eprintln!(
+                "[config] 写入默认值迁移标记失败（下次启动会重试）: {}",
+                e
+            );
+        }
+    }
+
+    // v3：单次工具超时旧默认 60 秒 → 180 秒。只迁移"恰好等于旧默认值"的
+    // 配置：首次 cargo build / 完整测试套件经常超过 60 秒，旧默认值会把
+    // "还在编译"误判成超时收手；用户显式设置过的其他值不受影响。
+    let timeout_marker = app_data_dir.join(".config-defaults-v3.migrated");
+    if !timeout_marker.exists() {
+        if config.tools.call_timeout_secs == 60 {
+            config.tools.call_timeout_secs = 180;
+            repaired = true;
+        }
+        if let Err(e) = fs::write(&timeout_marker, "1") {
+            eprintln!(
+                "[config] 写入默认值迁移标记失败（下次启动会重试）: {}",
+                e
+            );
+        }
+    }
+
     if repaired {
         let _ = save_config(app_data_dir, &config);
     }
@@ -287,5 +328,121 @@ mod tests {
         assert_eq!(loaded.ui.theme, "dark");
         assert_eq!(loaded.memory.max_context_memories, 5);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 旧默认 2048 一次性迁移为"不指定"；用户随后填回的值不再被覆盖
+    #[test]
+    fn load_config_migrates_legacy_default_max_tokens_once() {
+        let dir = temp_dir("max-tokens-migrate");
+        let mut config = AppConfig::default();
+        config.llm.providers[0].max_tokens = Some(2048);
+        fs::write(
+            config_path(&dir),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_config(&dir).expect("migrate");
+        assert_eq!(
+            loaded.llm.providers[0].max_tokens, None,
+            "旧默认值 2048 应迁移为不指定"
+        );
+        assert!(dir.join(".config-defaults-v2.migrated").exists());
+
+        // 迁移结果已落盘，且 JSON 里不再出现 max_tokens
+        let saved_text = fs::read_to_string(config_path(&dir)).unwrap();
+        assert!(!saved_text.contains("max_tokens"), "{saved_text}");
+        let saved: AppConfig = serde_json::from_str(&saved_text).unwrap();
+
+        // 用户主动填回 2048 → 标记文件已存在，不再迁移
+        let mut user_config = saved;
+        user_config.llm.providers[0].max_tokens = Some(2048);
+        save_config(&dir, &user_config).unwrap();
+        let reloaded = load_config(&dir).expect("second load");
+        assert_eq!(reloaded.llm.providers[0].max_tokens, Some(2048));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 用户设过的非旧默认值（例如 1000）不应被迁移
+    #[test]
+    fn load_config_keeps_custom_max_tokens() {
+        let dir = temp_dir("max-tokens-custom");
+        let mut config = AppConfig::default();
+        config.llm.providers[0].max_tokens = Some(1000);
+        fs::write(
+            config_path(&dir),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_config(&dir).expect("load");
+        assert_eq!(loaded.llm.providers[0].max_tokens, Some(1000));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 工具步数旧默认 8 一次性迁移到 32；用户自定义的步数保持不动
+    #[test]
+    fn load_config_migrates_legacy_tool_step_default() {
+        let dir = temp_dir("tool-steps-migrate");
+        let mut config = AppConfig::default();
+        config.tools.max_steps = 8;
+        fs::write(
+            config_path(&dir),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_config(&dir).expect("migrate");
+        assert_eq!(loaded.tools.max_steps, 32, "旧默认 8 应迁移到 32");
+
+        // 自定义值（例如 16）不受迁移影响
+        let mut custom = AppConfig::default();
+        custom.tools.max_steps = 16;
+        fs::write(
+            config_path(&dir),
+            serde_json::to_string_pretty(&custom).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_config(&dir).expect("load custom");
+        assert_eq!(loaded.tools.max_steps, 16);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 单次工具超时旧默认 60 一次性迁移到 180；用户自定义值保持不动
+    #[test]
+    fn load_config_migrates_legacy_call_timeout_default() {
+        let dir = temp_dir("call-timeout-migrate");
+        let mut config = AppConfig::default();
+        config.tools.call_timeout_secs = 60;
+        fs::write(
+            config_path(&dir),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_config(&dir).expect("migrate");
+        assert_eq!(
+            loaded.tools.call_timeout_secs, 180,
+            "旧默认 60 秒应迁移到 180"
+        );
+        assert!(dir.join(".config-defaults-v3.migrated").exists());
+
+        // 用户显式设置的值不受迁移影响（另一个目录避免标记文件干扰）
+        let dir2 = temp_dir("call-timeout-custom");
+        let mut custom = AppConfig::default();
+        custom.tools.call_timeout_secs = 300;
+        fs::write(
+            config_path(&dir2),
+            serde_json::to_string_pretty(&custom).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_config(&dir2).expect("load custom");
+        assert_eq!(loaded.tools.call_timeout_secs, 300);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
     }
 }
