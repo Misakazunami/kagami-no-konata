@@ -230,9 +230,7 @@ kagami-no-konata/
 │   │   └── mcp/               # MCP 服务器桥接
 │   └── personas/              # 预置人格文件
 │
-├── public/                    # 静态资源（Live2D 模型/桌宠素材）
-├── ARCHITECTURE.md            # 架构设计文档
-└── CLAUDE.md                  # AI 辅助开发指南
+└── public/                    # 静态资源（Live2D 模型/桌宠素材）
 ```
 
 ---

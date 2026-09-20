@@ -230,9 +230,7 @@ kagami-no-konata/
 │   │   └── mcp/               # MCP server bridging
 │   └── personas/              # Built-in persona files
 │
-├── public/                    # Static assets (Live2D models/pet assets)
-├── ARCHITECTURE.md            # Architecture design document
-└── CLAUDE.md                  # AI-assisted development guide
+└── public/                    # Static assets (Live2D models/pet assets)
 ```
 
 ---
