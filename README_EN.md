@@ -26,6 +26,7 @@
 - [Getting Started](#-getting-started)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
+  - [Building on Windows](#building-on-windows)
   - [First Launch](#first-launch)
 - [Configuration](#-configuration)
 - [Project Structure](#-project-structure)
@@ -109,9 +110,44 @@ pnpm install
 # 3. Start in development mode (first Rust compilation takes ~3-5 minutes)
 pnpm tauri dev
 
-# 4. Build for release (Windows generates NSIS / MSI)
+# 4. Build for release (Windows generates an NSIS installer)
 pnpm tauri build
 ```
+
+### Building on Windows
+
+**Prerequisites**
+
+- [Node.js](https://nodejs.org/) (LTS) + pnpm: `npm install -g pnpm`
+- [Rust](https://rustup.rs/): choose the MSVC toolchain during installation (default `stable-x86_64-pc-windows-msvc`)
+- [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/): select "Desktop development with C++"
+- **WebView2 Runtime**: usually preinstalled on Windows 10/11; if missing, download it from [Microsoft](https://developer.microsoft.com/microsoft-edge/webview2/)
+
+**Option 1: One-click scripts (recommended)**
+
+PowerShell scripts are provided in the repository root; they check the environment, install dependencies, and start automatically:
+
+```powershell
+# If script execution is blocked on first run, execute:
+# Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+.\start-dev.ps1    # Development mode (first compile takes ~3-5 minutes)
+.\build.ps1        # Release build (first build takes ~5-15 minutes)
+```
+
+**Option 2: Manual commands**
+
+```powershell
+pnpm install
+pnpm tauri dev     # Development mode
+pnpm tauri build   # Release build
+```
+
+**Build artifacts**
+
+The installer is located at `src-tauri\target\release\bundle\nsis\` (`.exe`); double-click to install.
+
+> Tip: if `cargo` is not found in your terminal, run `$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"` first (the scripts already handle this).
 
 ### First Launch
 

@@ -26,6 +26,7 @@
 - [快速开始](#-快速开始)
   - [环境要求](#环境要求)
   - [安装步骤](#安装步骤)
+  - [Windows 构建](#windows-构建)
   - [首次启动](#首次启动)
 - [配置说明](#-配置说明)
 - [项目结构](#-项目结构)
@@ -109,9 +110,44 @@ pnpm install
 # 3. 开发模式启动（首次编译 Rust 约 3–5 分钟）
 pnpm tauri dev
 
-# 4. 发布构建（Windows 生成 NSIS / MSI）
+# 4. 发布构建（Windows 生成 NSIS 安装程序）
 pnpm tauri build
 ```
+
+### Windows 构建
+
+**前置依赖**
+
+- [Node.js](https://nodejs.org/)（LTS）+ pnpm：`npm install -g pnpm`
+- [Rust](https://rustup.rs/)：安装时选择 MSVC 工具链（默认 `stable-x86_64-pc-windows-msvc`）
+- [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)：安装时勾选「使用 C++ 的桌面开发」
+- **WebView2 Runtime**：Windows 10/11 通常已预装；若缺失可从[微软官网](https://developer.microsoft.com/microsoft-edge/webview2/)下载
+
+**方式一：一键脚本（推荐）**
+
+仓库根目录提供 PowerShell 脚本，会自动检查环境、安装依赖并启动：
+
+```powershell
+# 若首次运行提示脚本被禁止，先执行：
+# Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+.\start-dev.ps1    # 开发模式（首次编译约 3–5 分钟）
+.\build.ps1        # 发布构建（首次约 5–15 分钟）
+```
+
+**方式二：手动命令**
+
+```powershell
+pnpm install
+pnpm tauri dev     # 开发模式
+pnpm tauri build   # 发布构建
+```
+
+**构建产物**
+
+安装程序位于 `src-tauri\target\release\bundle\nsis\`（`.exe`），双击即可安装。
+
+> 提示：若终端找不到 `cargo`，先执行 `$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"`（脚本已自动处理）。
 
 ### 首次启动
 
