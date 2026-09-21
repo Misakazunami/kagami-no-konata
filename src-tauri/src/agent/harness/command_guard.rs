@@ -38,10 +38,26 @@ const DENY_PROGRAMS: &[&str] = &[
 ];
 
 /// 这些扩展名的程序本身就是脚本/快捷方式，直接执行等于绕过白名单
+///
+/// 注意 `cmd`/`bat` **不在这里**：Windows 上大量开发工具只提供 `.cmd` 入口
+/// （npm/pnpm/yarn/mvn/gradle/tsc…），一律拒绝等于把这些工具链整个关掉。
+/// 它们由 [`SCRIPT_HOST_EXTENSIONS`] 单独把关：只有程序基名通过允许列表
+/// 且未命中硬黑名单时才放行，执行时还要经 `cmd.exe` 包装与参数审查。
 const DENY_EXTENSIONS: &[&str] = &[
-    "bat", "cmd", "com", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp",
-    "scr", "pif", "lnk", "reg", "inf", "hta", "cpl", "jar", "application",
+    "com", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "scr", "pif",
+    "lnk", "reg", "inf", "hta", "cpl", "jar", "application",
 ];
+
+/// `cmd.exe` 能解释的脚本扩展名（仅允许列表内的程序可用）
+const SCRIPT_HOST_EXTENSIONS: &[&str] = &["cmd", "bat"];
+
+/// 经 `cmd.exe` 执行脚本时不允许出现在参数里的字符
+///
+/// 这些字符在 cmd 的命令行里具有特殊含义（引号、变量展开、命令分隔、重定向、
+/// 括号分组、换行），即使加引号也可能被二次解释；转义规则又与 CreateProcess
+/// 的引号规则不同，无法可靠做到既正确又安全。因此选择"拒绝而不是转义"。
+const CMD_FORBIDDEN_ARG_CHARS: &[char] =
+    &['"', '%', '!', '^', '&', '|', '<', '>', '(', ')', '\r', '\n'];
 
 /// 解释器：禁止用"求值参数"把一行代码直接喂进去
 const INTERPRETERS: &[&str] = &[
@@ -106,6 +122,9 @@ pub struct CheckedCommand {
     pub env: Vec<(String, String)>,
     /// 人类可读的完整命令（用于 UI 与落库）
     pub display: String,
+    /// Windows：脚本宿主程序（.cmd/.bat）经 `cmd.exe /d /s /c` 执行时传给
+    /// `/c` 的完整命令串（已含外层引号）；普通程序或其它平台恒为 `None`
+    pub windows_cmd_arg: Option<String>,
 }
 
 /// 命令守卫：白名单 + 硬黑名单 + 参数审查 + 目录约束
@@ -129,6 +148,11 @@ impl CommandGuard {
             .collect();
         // 内置默认允许列表始终有效，用户即使清空配置也不会把常用开发工具一起清掉
         for p in crate::config::types::DEFAULT_COMMAND_ALLOWLIST {
+            allow.insert(normalize_program(p));
+        }
+        // Windows 专属补充（findstr / where / fc / more 等系统自带的只读文本工具）
+        #[cfg(windows)]
+        for p in crate::config::types::WINDOWS_COMMAND_ALLOWLIST {
             allow.insert(normalize_program(p));
         }
         // 黑名单优先级最高：从允许集合中剔除
@@ -190,6 +214,17 @@ impl CommandGuard {
                 base
             ));
         }
+        // .cmd/.bat：Windows 开发工具链的主要入口形式（npm/pnpm/yarn/mvn/gradle…）。
+        // 只有基名通过允许列表才放行；执行时经 cmd.exe 包装并拒绝参数里的 cmd
+        // 元字符，见 `windows_cmd_arg` 与 `build_cmd_script_arg`。
+        if let Some(ext) = extension_of(program) {
+            if SCRIPT_HOST_EXTENSIONS.contains(&ext.as_str()) && !self.allow.contains(&base) {
+                return Err(format!(
+                    "敏感命令已被阻止：.{} 脚本只有在「{}」通过允许列表后才可执行",
+                    ext, base
+                ));
+            }
+        }
         if !self.allow.contains(&base) {
             return Err(format!(
                 "程序「{}」不在允许列表中。可在「设置 → 工具 → 命令允许列表」中添加（敏感命令无法添加）",
@@ -221,10 +256,23 @@ impl CommandGuard {
         }
 
         // ─── 4. 解析程序真实路径 ───
-        let program_path = resolve_program(program, &cwd, workspaces)?;
+        let program_path = resolve_program(program, &cwd, &self.allow, workspaces)?;
 
         // ─── 5. 参数中的路径必须在工作区内 ───
         check_path_args(args, &cwd, workspaces)?;
+
+        // ─── 6. Windows 脚本宿主：构造 cmd.exe /d /s /c 的命令串 ───
+        //
+        // 解析结果可能是 `npm` → `npm.cmd`（PATH 命中的是脚本），所以这里以
+        // 解析后的真实路径为准，而不是模型传入的程序名。
+        let resolved_is_script = extension_of(&program_path.display().to_string())
+            .map(|ext| SCRIPT_HOST_EXTENSIONS.contains(&ext.as_str()))
+            .unwrap_or(false);
+        let windows_cmd_arg = if cfg!(windows) && resolved_is_script {
+            Some(build_cmd_script_arg(&program_path, args)?)
+        } else {
+            None
+        };
 
         let display = std::iter::once(program_path.display().to_string())
             .chain(args.iter().cloned())
@@ -237,8 +285,64 @@ impl CommandGuard {
             cwd,
             env: sanitized_env(),
             display,
+            windows_cmd_arg,
         })
     }
+}
+
+/// 构造 `cmd.exe /d /s /c <arg>` 里的 `<arg>`
+///
+/// 结构是 `"<脚本>" "<参数1>" "<参数2>"`，外层再包一对引号，交给 `/s` 剥离。
+/// 之所以敢自己拼命令串：所有参数已经过了 [`CMD_FORBIDDEN_ARG_CHARS`] 审查，
+/// 不含任何会被 cmd 解释的字符；脚本路径由守卫自己解析，不含引号。
+/// 拒绝而不是转义是刻意的——cmd 的转义规则与 CreateProcess 的引号规则不一致，
+/// 两套规则叠加时"转义正确"很难证明。
+fn build_cmd_script_arg(script: &Path, args: &[String]) -> Result<String, String> {
+    // 脚本路径虽然在双引号内（`&`/`|` 不会成为命令分隔符），但 `%` 仍会被
+    // cmd 展开；路径里的 `%` 无法安全表达，直接拒绝而不是赌它不会出现
+    let script_text = script.display().to_string();
+    if let Some(bad) = script_text
+        .chars()
+        .find(|c| matches!(c, '%' | '"' | '\r' | '\n'))
+    {
+        return Err(format!(
+            "脚本路径包含无法安全传给 cmd.exe 的字符「{}」：{}",
+            bad, script_text
+        ));
+    }
+    for arg in args {
+        if let Some(bad) = arg.chars().find(|c| CMD_FORBIDDEN_ARG_CHARS.contains(c)) {
+            return Err(format!(
+                "已阻止参数「{}」：通过 cmd.exe 执行 .cmd/.bat 时，参数不能包含特殊字符「{}」（无法安全转义）",
+                arg, bad
+            ));
+        }
+    }
+    let mut tail = format!("\"{}\"", script_text);
+    for arg in args {
+        tail.push(' ');
+        tail.push_str(&format!("\"{}\"", arg));
+    }
+    // `/s` 会剥掉命令串最外层的一对引号，因此这里主动包一层，
+    // 保证脚本路径与参数各自保留引号（路径/参数含空格时必需）
+    Ok(format!("\"{}\"", tail))
+}
+
+/// Windows 下 `cmd.exe` 的稳定位置（ComSpec 优先，其次 SystemRoot\System32）
+pub fn windows_cmd_exe() -> PathBuf {
+    if let Some(comspec) = std::env::var_os("ComSpec") {
+        let candidate = PathBuf::from(comspec);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let candidate = PathBuf::from(root).join("System32").join("cmd.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("cmd.exe")
 }
 
 fn normalize_program(program: &str) -> String {
@@ -565,12 +669,7 @@ fn check_path_args(args: &[String], cwd: &Path, workspaces: &WorkspaceSet) -> Re
             continue;
         }
 
-        let looks_absolute = candidate.starts_with('/')
-            || candidate.starts_with('~')
-            || candidate.starts_with(r"\\")
-            || is_windows_absolute(candidate);
-
-        if looks_absolute {
+        if looks_like_absolute_arg(candidate, cfg!(windows)) {
             if candidate.starts_with('~') {
                 return Err(format!("已阻止参数「{}」：不允许访问用户主目录", arg));
             }
@@ -618,10 +717,23 @@ fn is_windows_absolute(value: &str) -> bool {
         && (bytes[2] == '\\' || bytes[2] == '/')
 }
 
+/// 参数是否长得像绝对路径（用于工作区约束检查）
+///
+/// Windows 的原生程序大量使用 `/R`、`/F`、`/IM` 这类开关；`/` 在 Windows 上
+/// 不是绝对路径前缀（绝对路径必须带盘符，已由 [`is_windows_absolute`] 捕获），
+/// 所以只有非 Windows 平台才把 `/xxx` 当路径。
+fn looks_like_absolute_arg(value: &str, windows: bool) -> bool {
+    (!windows && value.starts_with('/'))
+        || value.starts_with('~')
+        || value.starts_with(r"\\")
+        || is_windows_absolute(value)
+}
+
 /// 解析程序路径：带路径分隔符时必须在工作区内，否则在 PATH 中查找
 fn resolve_program(
     program: &str,
     cwd: &Path,
+    allow: &HashSet<String>,
     workspaces: &WorkspaceSet,
 ) -> Result<PathBuf, String> {
     let has_separator = program.contains('/') || program.contains('\\');
@@ -641,6 +753,14 @@ fn resolve_program(
         if !inside {
             return Err(format!(
                 "可执行文件必须位于工作区内：{}",
+                canonical.display()
+            ));
+        }
+        // Windows 不能直接执行无扩展名文件（Node 的 `npm` 是给 Git Bash 用的
+        // sh 脚本，CreateProcess 会把它当无效镜像），提前给出可读错误
+        if cfg!(windows) && !is_windows_executable(&canonical) {
+            return Err(format!(
+                "不是可执行文件（Windows 仅支持 .exe/.com/.cmd/.bat）：{}",
                 canonical.display()
             ));
         }
@@ -670,15 +790,25 @@ fn resolve_program(
         }
         for name in &names {
             let full = dir.join(name);
-            if full.is_file() {
-                // 命中的如果是不允许的脚本类型，直接拒绝
-                if let Some(ext) = extension_of(&full.display().to_string()) {
-                    if DENY_EXTENSIONS.contains(&ext.as_str()) {
+            if !full.is_file() {
+                continue;
+            }
+            match extension_of(&full.display().to_string()) {
+                // 不允许的脚本/快捷方式类型：跳过
+                Some(ext) if DENY_EXTENSIONS.contains(&ext.as_str()) => continue,
+                // .cmd/.bat：只有基名通过允许列表才可用（Windows 上 npm 等
+                // 工具只提供 .cmd 入口；Node 安装目录里无扩展名的同名文件是
+                // sh 脚本，不能执行，这里显式跳过）
+                Some(ext) if SCRIPT_HOST_EXTENSIONS.contains(&ext.as_str()) => {
+                    if !allow.contains(&normalize_program(&full.display().to_string())) {
                         continue;
                     }
                 }
-                return Ok(full);
+                // Windows 无法执行无扩展名文件
+                None if cfg!(windows) => continue,
+                _ => {}
             }
+            return Ok(full);
         }
     }
 
@@ -688,11 +818,22 @@ fn resolve_program(
     ))
 }
 
+/// Windows 可执行文件判定（PE、老式 COM、cmd 脚本宿主）
+fn is_windows_executable(path: &Path) -> bool {
+    extension_of(&path.display().to_string())
+        .map(|ext| matches!(ext.as_str(), "exe" | "com" | "cmd" | "bat"))
+        .unwrap_or(false)
+}
+
 /// 只传递白名单环境变量，绝不把 API Key / Token 交给子进程
 pub fn sanitized_env() -> Vec<(String, String)> {
     const KEEP: &[&str] = &[
         "PATH",
         "PATHEXT",
+        // Windows：cmd.exe 的位置、系统目录、用户目录与各工具链的安装位置。
+        // 这些都不是秘密，但丢掉会让 .cmd 包装、cargo/npm 的用户级配置
+        // （CARGO_HOME/RUSTUP_HOME）与 MCP 的 npx 启动整体失效。
+        "ComSpec",
         "SystemRoot",
         "SystemDrive",
         "windir",
@@ -701,6 +842,22 @@ pub fn sanitized_env() -> Vec<(String, String)> {
         "TMPDIR",
         "HOME",
         "USERPROFILE",
+        "USERNAME",
+        "USERDOMAIN",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "COMMONPROGRAMFILES",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "JAVA_HOME",
+        "GOROOT",
+        "GOPATH",
+        "NODE_PATH",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
@@ -1083,7 +1240,86 @@ mod tests {
     fn sensitive_detection_helper() {
         assert!(CommandGuard::is_sensitive("cmd.exe"));
         assert!(CommandGuard::is_sensitive("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
-        assert!(CommandGuard::is_sensitive("script.bat"));
+        assert!(CommandGuard::is_sensitive("evil.ps1"));
+        // .cmd/.bat 本身不再是"硬黑名单"，是否可用取决于基名白名单
+        assert!(!CommandGuard::is_sensitive("script.bat"));
+        assert!(!CommandGuard::is_sensitive("npm.cmd"));
         assert!(!CommandGuard::is_sensitive("cargo"));
+    }
+
+    /// Windows 上 `.cmd` 入口（npm/pnpm 等）：只有基名在允许列表内才放行
+    #[test]
+    fn cmd_shim_requires_allowlisted_base_program() {
+        let guard = guard();
+        let (ws, _tmp) = test_set();
+
+        // 允许列表内的 npm：不再被扩展名硬拦。本机没装 npm 时错误应是
+        // "找不到程序"（说明已经走到 PATH 解析），而不是"不允许执行"
+        let err = guard.check("npm.cmd", &[], None, &ws).unwrap_err();
+        assert!(!err.contains("不允许执行"), "{err}");
+        assert!(err.contains("找不到程序"), "{err}");
+
+        // 任意脚本仍然被拦（基名不在允许列表内）
+        for program in ["cleanup.bat", "evil.cmd"] {
+            let err = guard.check(program, &[], None, &ws).unwrap_err();
+            assert!(err.contains("敏感命令已被阻止"), "{program} => {err}");
+        }
+        // 硬黑名单里的程序伪装成 .cmd/.bat 也不行
+        let err = guard.check("cmd.bat", &[], None, &ws).unwrap_err();
+        assert!(err.contains("敏感命令已被阻止"), "{err}");
+    }
+
+    /// cmd.exe 包装串：参数里的 cmd 元字符一律拒绝，普通参数按引号拼接
+    #[test]
+    fn cmd_script_arg_is_quoted_and_rejects_metacharacters() {
+        let script = Path::new(r"C:\Program Files\nodejs\npm.cmd");
+        let arg = build_cmd_script_arg(
+            script,
+            &["install".to_string(), "a b".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            arg,
+            "\"\"C:\\Program Files\\nodejs\\npm.cmd\" \"install\" \"a b\"\""
+        );
+
+        for bad in [
+            "a&b", "a|b", "a>b", "a<b", "%PATH%", "x!y", "a^b", "(x)", "\"q\"", "a\nb",
+        ] {
+            let err = build_cmd_script_arg(script, &[bad.to_string()]).unwrap_err();
+            assert!(err.contains("已阻止参数"), "{bad:?} => {err}");
+        }
+        // 正常参数不受影响
+        assert!(build_cmd_script_arg(script, &["--noEmit".to_string(), "src".to_string()]).is_ok());
+
+        // 脚本路径里的 `%` 会被 cmd 展开，必须拒绝
+        let err = build_cmd_script_arg(Path::new(r"C:\tools\100%\npm.cmd"), &[]).unwrap_err();
+        assert!(err.contains("脚本路径"), "{err}");
+    }
+
+    /// Windows 专属默认允许程序必须真的合并进允许集合
+    #[cfg(windows)]
+    #[test]
+    fn windows_allowlist_is_merged() {
+        let guard = CommandGuard::new(&ToolConfig::default());
+        let allowed = guard.allowed_programs();
+        for program in crate::config::types::WINDOWS_COMMAND_ALLOWLIST {
+            assert!(
+                allowed.iter().any(|p| p == program),
+                "{program} 应在 Windows 允许列表中"
+            );
+        }
+    }
+
+    /// Windows 的 `/R`、`/IM` 这类开关不是路径；Unix 的 `/etc/passwd` 仍是路径
+    #[test]
+    fn windows_style_switches_are_not_treated_as_paths() {
+        assert!(looks_like_absolute_arg("/etc/passwd", false));
+        assert!(looks_like_absolute_arg("/home/u/x", false));
+        assert!(!looks_like_absolute_arg("/R", true));
+        assert!(!looks_like_absolute_arg("/IM", true));
+        assert!(looks_like_absolute_arg(r"C:\Windows\win.ini", true));
+        assert!(looks_like_absolute_arg(r"\\server\share", false));
+        assert!(looks_like_absolute_arg("~/x", true));
     }
 }

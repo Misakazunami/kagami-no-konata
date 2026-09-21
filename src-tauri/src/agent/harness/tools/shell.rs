@@ -31,6 +31,8 @@ const PREVIEW_CHARS: usize = 300;
 /// 安全边界（详见 `harness::command_guard`）：
 /// 1. **不使用 shell**：直接以 argv 方式 spawn，杜绝 `;` `&&` `|` 等注入面。
 ///    需要连续跑多条命令时用 `steps`（严格按数组顺序串行执行），不要拼 shell 语法；
+///    唯一的例外是 Windows 的 `.cmd`/`.bat`（npm/pnpm/mvn/gradle 等工具的入口）：
+///    它们必须由 `cmd.exe /d /s /c` 解释，且参数里的 cmd 元字符一律拒绝；
 /// 2. 硬黑名单优先于用户配置：`cmd` / `powershell` / `curl` / `rm` / `reg` 等
 ///    即使被写进允许列表也会被拦截；
 /// 3. 解释器的求值参数（`python -c`、`node -e`）一律拒绝；
@@ -351,9 +353,22 @@ async fn run_step(
     deadline: Instant,
     max_output_lines: usize,
 ) -> Result<(String, StepOutcome, bool)> {
-    let mut child = tokio::process::Command::new(&command.program);
+    // Windows 的 .cmd/.bat 不是 PE 镜像，必须交给 cmd.exe 解释；
+    // 命令串已在 command_guard 里做过元字符审查，见 `build_cmd_script_arg`。
+    // 其它情况直接以 argv 方式 spawn，不使用 shell。
+    let mut child = if let Some(cmd_arg) = &command.windows_cmd_arg {
+        let mut cmd = tokio::process::Command::new(
+            crate::agent::harness::command_guard::windows_cmd_exe(),
+        );
+        // /d 跳过 AutoRun，/s 配合最外层引号保证含空格路径不被截断
+        cmd.arg("/d").arg("/s").arg("/c").arg(cmd_arg);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new(&command.program);
+        cmd.args(&command.args);
+        cmd
+    };
     child
-        .args(&command.args)
         .current_dir(&command.cwd)
         .env_clear()
         .envs(command.env.iter().cloned())

@@ -1,18 +1,19 @@
-//! 回收站（Linux/macOS）与"不可用时的显式拒绝"
+//! 回收站：Linux/macOS 走自实现的 XDG / `~/.Trash`，Windows 走系统回收站
 //!
-//! 为什么自己写而不引第三方 crate：这一层必须**可测**且行为明确。
-//! 引入 `trash` crate 会同时带进各平台的 COM/Objective-C 绑定，
-//! 而本项目只在 Linux 上验证，Windows 行为将完全未经测试。
-//! 因此这里采取"能安全回收就回收，做不到就明确拒绝"的策略：
+//! 为什么 Linux/macOS 自己写而不引第三方 crate：XDG 那一套必须**可测**且行为
+//! 明确，`trash` crate 会同时带进各平台的 COM/Objective-C 绑定，而本项目在
+//! Linux 上验证主路径。因此：
 //!
 //! - Linux：按 XDG Trash 规范写入 `$XDG_DATA_HOME/Trash/{files,info}`；
 //! - macOS：`~/.Trash`；
-//! - Windows：**不支持**（返回错误），除非调用方显式要求"永久删除"。
-//!   宁可让模型/用户看到"这里不能删"，也不要静默永久删除用户文件。
+//! - Windows：走 `trash` crate（系统 `IFileOperation`），真正进资源管理器
+//!   回收站；仅在回收站不可用（网络盘/FAT 等）时如实报错，绝不静默永久删除。
 //!
 //! 关键不变式：**先确保文件已经被安全安置，再让它从原位置消失**。
-//! 跨卷（rename 返回 EXDEV）时退化为"复制到回收站 + 删除原文件"，
+//! XDG 路径下跨卷（rename 返回 EXDEV）时退化为"复制到回收站 + 删除原文件"，
 //! 复制失败就整体放弃（原文件不动）。
+
+#![cfg_attr(windows, allow(dead_code))] // Windows 走系统回收站，XDG 实现仅供测试/其它平台
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,11 @@ impl Removal {
 
 /// 本平台是否支持回收站
 pub fn is_supported() -> bool {
+    // Windows：由系统 IFileOperation 提供回收站（具体某块盘能否回收由系统判定，
+    // 失败时 move_to_trash 会如实报错，不会静默永久删除）
+    if cfg!(windows) {
+        return true;
+    }
     if cfg!(target_os = "linux") {
         return trash_root().is_ok();
     }
@@ -57,7 +63,19 @@ pub fn unsupported_reason() -> String {
     )
 }
 
-/// 把文件/目录移入回收站
+/// 把文件/目录移入系统回收站
+#[cfg(windows)]
+pub fn move_to_trash(target: &Path) -> Result<PathBuf> {
+    // trash crate 在 Windows 上走 IFileOperation（与资源管理器同一个回收站），
+    // 目录会被递归回收。回收站不可用的卷（网络盘/FAT）会返回错误——保持
+    // fail-closed，绝不退化成"永久删除"。
+    ::trash::delete(target)
+        .map_err(|e| anyhow::anyhow!("移入回收站失败：{}（如需永久删除请显式设置 permanent=true）", e))?;
+    Ok(target.to_path_buf())
+}
+
+/// 把文件/目录移入回收站（Linux/macOS 的 XDG / ~/.Trash 实现）
+#[cfg(not(windows))]
 pub fn move_to_trash(target: &Path) -> Result<PathBuf> {
     if !is_supported() {
         anyhow::bail!("{}", unsupported_reason());
@@ -466,6 +484,32 @@ mod tests {
         let stamp = format_deletion_date();
         let re = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$").unwrap();
         assert!(re.is_match(&stamp), "{stamp}");
+    }
+
+    /// Windows：真实走系统回收站（只在 Windows 上编译与执行）
+    #[cfg(windows)]
+    #[test]
+    fn windows_moves_file_into_system_trash() {
+        let fx = Fixture::new("win-recycle");
+        let victim = fx.root.join("win-note.txt");
+        std::fs::write(&victim, "内容").unwrap();
+
+        assert!(is_supported(), "Windows 上必须支持回收站");
+        move_to_trash(&victim).expect("应当成功移入回收站");
+        assert!(!victim.exists(), "原位置必须已经不存在");
+    }
+
+    /// Windows：目录也必须能整棵树回收
+    #[cfg(windows)]
+    #[test]
+    fn windows_moves_directory_into_system_trash() {
+        let fx = Fixture::new("win-recycle-dir");
+        let dir = fx.root.join("win-dir");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("inner/a.txt"), "x").unwrap();
+
+        move_to_trash(&dir).expect("目录也必须能回收");
+        assert!(!dir.exists(), "原位置必须已经不存在");
     }
 
     #[test]

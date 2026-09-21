@@ -641,6 +641,17 @@ pub fn is_valid_workspace_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+/// 「AppData 凭据保护」两条内置模式
+///
+/// 它们的本意是挡住**别的应用**在用户 AppData 里的凭据；但本应用的默认工作区
+/// 恰好位于 `%APPDATA%/com.konata-mirror.main/workspace`，如果无条件匹配绝对
+/// 路径，Windows 上整个默认工作区都会被拒绝访问。因此 `WorkspaceSet` 会对
+/// 应用自身数据目录内的路径单独剔除这两条（其余内置条目照旧生效）。
+pub const APP_DATA_DENY_GLOBS: &[&str] = &[
+    "**/AppData/Roaming/**",
+    "**/AppData/Local/**",
+];
+
 /// 内置拒绝访问的文件模式（用户不能移除，只能追加）
 ///
 /// 只读工具同样受限：`config.json` 里存着 API Key，一旦被读进上下文，
@@ -704,6 +715,19 @@ pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
     // 前端项目本地二进制（`./node_modules/.bin/xxx` 的方式调用）
     "vitest", "jest", "vite", "next", "esbuild", "rollup", "webpack",
 ];
+
+/// Windows 专属的默认允许程序（仅在 Windows 上合并进允许集合）
+///
+/// Windows 没有 Unix 的 grep/find/diff，用系统自带的只读文本工具补足：
+/// - `findstr`：按内容/正则检索（对应 grep）
+/// - `where`：定位程序（对应 which）
+/// - `fc`：文件比对（对应 diff）
+/// - `more`：分页查看文本
+///
+/// 这些都是只读程序，不提供下载/执行/改配置通道；参数里的路径仍受
+/// `command_guard::check_path_args` 的工作区约束与敏感路径检查。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WINDOWS_COMMAND_ALLOWLIST: &[&str] = &["findstr", "where", "fc", "more"];
 
 fn default_max_steps() -> usize {
     32
@@ -886,6 +910,10 @@ pub struct McpServerConfig {
     pub id: String,
     pub enabled: bool,
     /// 启动命令（必须是 PATH 中的程序）
+    ///
+    /// Windows 上 `.cmd`/`.bat` 入口（如 npx）无法直接 CreateProcess，
+    /// `mcp::client` 会自动用 `cmd.exe /d /s /c` 包装；也可以自己写成
+    /// `cmd` + args `["/c", "npx", ...]`。
     pub command: String,
     pub args: Vec<String>,
     /// 传给子进程的环境变量（只传这里写明的，不继承应用密钥）
@@ -1298,6 +1326,24 @@ mod tests {
         ok.command = "npx".to_string();
         cfg.tools.mcp.servers = vec![ok];
         assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    }
+
+    /// AppData 两条内置模式必须确实在默认清单里（否则豁免逻辑会成为空操作）
+    #[test]
+    fn app_data_deny_globs_are_part_of_defaults() {
+        for pattern in APP_DATA_DENY_GLOBS {
+            assert!(
+                DEFAULT_DENY_GLOBS.contains(pattern),
+                "内置模式 {pattern} 必须存在于 DEFAULT_DENY_GLOBS"
+            );
+        }
+        let cfg = ToolConfig::default();
+        for pattern in APP_DATA_DENY_GLOBS {
+            assert!(
+                cfg.deny_globs.iter().any(|g| g == pattern),
+                "默认配置必须包含内置模式 {pattern}"
+            );
+        }
     }
 
     /// Linux 上大小写不同就是不同目录，不应判成"互相嵌套"

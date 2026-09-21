@@ -52,6 +52,71 @@ pub struct McpCallResult {
     pub is_error: bool,
 }
 
+/// 构造启动命令
+///
+/// Windows 上 `.cmd`/`.bat` 不是 PE 镜像，`CreateProcess` 无法直接执行
+/// （`npx`、`uvx` 这类常见 MCP 入口都是 `.cmd` shim）。这里在解析到脚本宿主体
+/// 时自动用 `cmd.exe /d /s /c` 包装；`command` 与 `args` 都来自用户写死的
+/// 配置（模型永远改不了），因此拼接不构成注入面。
+fn build_command(cfg: &McpServerConfig) -> Command {
+    #[cfg(windows)]
+    {
+        if let Some(script) = resolve_windows_script(cfg.command.trim()) {
+            let mut tail = format!("\"{}\"", script.display());
+            for arg in &cfg.args {
+                tail.push(' ');
+                tail.push_str(&format!("\"{}\"", arg));
+            }
+            let mut cmd = Command::new(crate::agent::harness::command_guard::windows_cmd_exe());
+            cmd.arg("/d").arg("/s").arg("/c").arg(format!("\"{}\"", tail));
+            return cmd;
+        }
+    }
+    let mut cmd = Command::new(cfg.command.trim());
+    cmd.args(&cfg.args);
+    cmd
+}
+
+/// Windows：把裸命令或 `.cmd`/`.bat` 解析成脚本路径；`.exe` 与内置程序返回 None
+#[cfg(windows)]
+fn resolve_windows_script(command: &str) -> Option<std::path::PathBuf> {
+    let has_separator = command.contains('\\') || command.contains('/');
+    let extension = std::path::Path::new(command)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+
+    match extension.as_deref() {
+        Some("cmd") | Some("bat") => {
+            if has_separator {
+                Some(std::path::PathBuf::from(command))
+            } else {
+                find_in_path(command)
+            }
+        }
+        Some(_) => None,
+        None if has_separator => None,
+        // 无扩展名裸名：按 PATHEXT 找，只有命中 .cmd/.bat 才需要包装
+        None => {
+            let pathext = std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            pathext
+                .split(';')
+                .map(|ext| ext.trim().to_ascii_lowercase())
+                .filter(|ext| ext == ".cmd" || ext == ".bat")
+                .find_map(|ext| find_in_path(&format!("{}{}", command, ext)))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
 pub struct McpClient {
     server_id: String,
     child: Child,
@@ -94,8 +159,7 @@ impl McpClient {
             anyhow::bail!("MCP 服务器「{}」没有配置启动命令", cfg.id);
         }
 
-        let mut child = Command::new(cfg.command.trim())
-            .args(&cfg.args)
+        let mut child = build_command(cfg)
             .env_clear()
             // 白名单环境变量 + 用户为该服务器显式配置的项
             .envs(crate::agent::harness::command_guard::sanitized_env())

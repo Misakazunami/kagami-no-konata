@@ -32,6 +32,12 @@ regex = "1"
 globset = "0.4.20"
 walkdir = "2.5.0"
 
+# Windows 回收站：走系统 IFileOperation（Linux/macOS 使用 trash.rs 自带的
+# XDG / ~/.Trash 实现，不引入本依赖）。放在 target 依赖里保证其它平台
+# 不会编译到 COM 绑定。
+[target.'cfg(windows)'.dependencies]
+trash = "5"
+
 [profile.release]
 opt-level = "z"
 lto = true

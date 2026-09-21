@@ -55,6 +55,13 @@ pub struct WorkspaceSet {
     roots: Vec<Root>,
     deny: GlobSet,
     deny_patterns: Vec<String>,
+    /// 应用自身数据目录（已规范化）
+    ///
+    /// 默认工作区就在它下面（`%APPDATA%/com.konata-mirror.main/workspace`），
+    /// 因此其中的路径必须豁免「AppData 凭据保护」两条内置模式。
+    app_data_dir: PathBuf,
+    /// 剔除 AppData 两条内置模式后的拒绝集合（仅供应用自身数据目录内使用）
+    deny_without_appdata: GlobSet,
 }
 
 impl WorkspaceSet {
@@ -78,10 +85,25 @@ impl WorkspaceSet {
             })
             .collect();
 
+        let deny_patterns = cfg.deny_globs.clone();
+        // 应用自身数据目录内的路径不再套用 AppData 两条内置模式，其余条目照旧：
+        // 这是默认工作区在 Windows 上可用的前提（详见 APP_DATA_DENY_GLOBS 的注释）
+        let without_appdata: Vec<String> = deny_patterns
+            .iter()
+            .filter(|pattern| {
+                !crate::config::types::APP_DATA_DENY_GLOBS.contains(&pattern.as_str())
+            })
+            .cloned()
+            .collect();
+        let app_data_dir = std::fs::canonicalize(app_data_dir)
+            .unwrap_or_else(|_| lexical_normalize(app_data_dir));
+
         Self {
             roots,
-            deny: build_globset(&cfg.deny_globs),
-            deny_patterns: cfg.deny_globs.clone(),
+            deny: build_globset(&deny_patterns),
+            deny_patterns,
+            app_data_dir,
+            deny_without_appdata: build_globset(&without_appdata),
         }
     }
 
@@ -272,18 +294,29 @@ impl WorkspaceSet {
 
     fn find_root_for_absolute(&self, raw: &str) -> Option<&Root> {
         let path = Path::new(raw);
-        let canonical = std::fs::canonicalize(path).ok();
-        self.roots.iter().find(|r| {
-            let candidate = canonical.clone().unwrap_or_else(|| path.to_path_buf());
-            candidate.starts_with(&r.path)
-        })
+        // 已存在的路径用 canonicalize 的结果；不存在的（新建文件）只能按原文比。
+        // Windows 上 canonicalize 会带 `\\?\` 前缀，而原文没有，直接 starts_with
+        // 必然失败——先统一成可比较形式再判包含关系。
+        let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let candidate = comparable_path(&candidate);
+        self.roots
+            .iter()
+            .find(|r| candidate.starts_with(comparable_path(&r.path)))
     }
 
     fn check_deny(&self, root: &Root, abs: &Path) -> Result<(), String> {
         let abs_str = to_slash(abs);
         let rel_str = abs.strip_prefix(&root.path).map(to_slash).unwrap_or_default();
 
-        let hit = self.deny.is_match(&abs_str)
+        // 默认工作区位于 `%APPDATA%` 下：绝对路径命中 AppData 两条内置模式时，
+        // 只要位于应用自身数据目录内就改用剔除后的集合，否则整个默认工作区
+        // 都会被拒绝访问。其余内置条目（config.json、*.db、.env…）照常生效。
+        let abs_hit = if abs.starts_with(&self.app_data_dir) {
+            self.deny_without_appdata.is_match(&abs_str)
+        } else {
+            self.deny.is_match(&abs_str)
+        };
+        let hit = abs_hit
             || (!rel_str.is_empty() && self.deny.is_match(&rel_str))
             || self.deny.is_match(
                 abs.file_name()
@@ -298,6 +331,35 @@ impl WorkspaceSet {
             ));
         }
         Ok(())
+    }
+}
+
+/// 路径包含关系比较用的规范化形式
+///
+/// Windows 的 `canonicalize` 返回 verbatim 路径（`\\?\C:\...`），而模型提供的
+/// 不存在的路径只有 `C:\...`；两者必须剥掉前缀后再比。UNC 形式还原成
+/// `\\server\share`。Windows 文件系统大小写不敏感，统一小写后比较；
+/// 其它平台保持原样（`\` 是合法文件名字符，绝不参与规范化）。
+fn comparable_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let stripped: String = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        format!("//{}", rest)
+    } else if let Some(rest) = text.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        text.to_string()
+    };
+    #[cfg(windows)]
+    {
+        PathBuf::from(stripped.to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(stripped)
     }
 }
 
@@ -563,6 +625,68 @@ mod tests {
         assert!(set.resolve("CON").is_err());
         assert!(set.resolve("sub/NUL.txt").is_err());
         assert!(set.resolve("file.txt:stream").is_err());
+    }
+
+    /// Windows 默认工作区位于 `%APPDATA%` 下：不能因为路径里含
+    /// `AppData/Roaming` 就被内置凭据保护规则整体拒绝访问。
+    /// 这个用例在 Linux 上用同样的目录名即可复现同一个 glob 匹配。
+    #[test]
+    fn app_data_globs_do_not_block_the_app_workspace_itself() {
+        let tmp = TempDir::new("appdata");
+        let app_data = tmp.path().join("AppData").join("Roaming").join("konata");
+        let workspace = app_data.join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("note.txt"), "ok").unwrap();
+        std::fs::write(workspace.join("config.json"), "{}").unwrap();
+
+        let cfg = ToolConfig::with_single_root(&workspace, true, "默认");
+        let set = WorkspaceSet::from_config(&cfg, &app_data);
+
+        assert!(
+            set.resolve("note.txt").is_ok(),
+            "默认工作区内的普通文件必须可访问：{:?}",
+            set.resolve("note.txt").err()
+        );
+        assert!(set.resolve("src").is_ok());
+        assert!(set.resolve(".").is_ok());
+        // 豁免的只有 AppData 两条：其它内置拒绝条目照旧生效
+        let err = set.resolve("config.json").unwrap_err();
+        assert!(err.contains("拒绝清单"), "{err}");
+    }
+
+    /// 豁免只针对应用自身数据目录：其它目录哪怕路径里带 AppData 也照旧拒绝
+    #[test]
+    fn app_data_globs_still_block_paths_outside_app_data() {
+        let tmp = TempDir::new("appdata-other");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let workspace = tmp.path().join("AppData").join("Roaming").join("other-app");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("secret.txt"), "x").unwrap();
+
+        let cfg = ToolConfig::with_single_root(&workspace, true, "别的应用");
+        let set = WorkspaceSet::from_config(&cfg, &elsewhere);
+
+        let err = set.resolve("secret.txt").unwrap_err();
+        assert!(err.contains("拒绝清单"), "{err}");
+    }
+
+    /// `\\?\` 前缀必须剥掉后再比较（Windows 上"新建文件的绝对路径"就靠它救）
+    #[test]
+    fn verbatim_prefix_is_stripped_before_comparison() {
+        for (raw, expected) in [
+            (r"\\?\C:\ws\new.txt", r"C:\ws\new.txt"),
+            (r"\\?\UNC\srv\share\a", r"\\srv\share\a"),
+            ("//?/C:/ws/new.txt", "C:/ws/new.txt"),
+            ("/tmp/ws/new.txt", "/tmp/ws/new.txt"),
+        ] {
+            assert_eq!(comparable_path(Path::new(raw)), PathBuf::from(expected), "{raw}");
+        }
+        // 前缀不同的两侧仍能判定包含关系，且不会把 ws2 误判进 ws
+        assert!(comparable_path(Path::new("//?/C:/ws/new.txt"))
+            .starts_with(comparable_path(Path::new("//?/C:/ws"))));
+        assert!(!comparable_path(Path::new("//?/C:/ws2/a.txt"))
+            .starts_with(comparable_path(Path::new("//?/C:/ws"))));
     }
 
     #[test]
