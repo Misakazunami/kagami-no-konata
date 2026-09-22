@@ -13,8 +13,14 @@ pub async fn list_memories(
     limit: Option<usize>,
 ) -> Result<Vec<MemoryEntry>, String> {
     let limit = limit.map(|n| n.min(MAX_UI_MEMORIES));
-    let store = state.memory_store.lock().map_err(|e| e.to_string())?;
-    store.list_memories_for_ui(limit).map_err(|e| e.to_string())
+    // 记忆可能有几万条：查询与序列化放到阻塞线程
+    let store = state.memory_store.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = store.lock().map_err(|e| e.to_string())?;
+        store.list_memories_for_ui(limit).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("读取记忆失败：{}", e))?
 }
 
 /// 删除指定记忆
@@ -27,6 +33,11 @@ pub async fn delete_memory(state: State<'_, AppState>, id: String) -> Result<(),
 /// 清空所有记忆
 #[tauri::command]
 pub async fn clear_memories(state: State<'_, AppState>) -> Result<(), String> {
-    let store = state.memory_store.lock().map_err(|e| e.to_string())?;
-    store.clear_memories().map_err(|e| e.to_string())
+    let store = state.memory_store.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = store.lock().map_err(|e| e.to_string())?;
+        store.clear_memories().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("清空记忆失败：{}", e))?
 }

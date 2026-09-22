@@ -18,10 +18,16 @@ const MAX_TEXT_CHARS: usize = 12_000;
 const MAX_REDIRECTS: usize = 3;
 
 /// 禁止打开的可执行/脚本扩展名（调起系统程序等于执行代码）
+///
+/// 除可执行文件外还包含"会被宿主解释执行/触发外部协议"的类型：
+/// `html/svg/xml` 在浏览器里可执行脚本，`url/webloc/desktop/scf` 是
+/// 快捷方式/协议处理器，Office 宏文档同样是代码执行载体。
 const BLOCKED_EXTENSIONS: &[&str] = &[
     "exe", "bat", "cmd", "com", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi",
     "msp", "scr", "pif", "lnk", "reg", "inf", "hta", "cpl", "jar", "dll", "sys", "drv", "app",
     "sh", "bash", "zsh", "run", "bin", "elf", "dmg", "pkg", "deb", "rpm", "apk",
+    "html", "htm", "xhtml", "svg", "xml", "xsl", "xslt", "url", "webloc", "desktop", "scf",
+    "docm", "xlsm", "pptm", "dotm", "xltm",
 ];
 
 fn http_client() -> &'static reqwest::Client {
@@ -38,6 +44,79 @@ fn http_client() -> &'static reqwest::Client {
             .build()
             .expect("build http client")
     })
+}
+
+/// 解析主机名里的裸 IP（IPv6 的 host_str 会带方括号，必须剥掉才能 parse）
+fn parse_literal_ip(host: &str) -> Option<std::net::IpAddr> {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    trimmed.parse::<std::net::IpAddr>().ok()
+}
+
+/// 该 IP 是否属于禁止访问的范围（本机 / 内网 / 链路本地 / 保留段）
+///
+/// DNS rebinding 的下半场：域名可以过白名单，解析结果却指向内网
+/// （云元数据 `169.254.169.254` 是最典型的目标）。因此解析出的**每个**地址
+/// 都要过这里，不能只信域名字符串。
+pub fn ip_is_forbidden(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            // IPv4-mapped IPv6 已在上面归一化，这里只看原生 v4
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // 100.64.0.0/10（运营商级 NAT）、192.0.0.0/24 等保留段
+                || v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1])
+                || v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            // ::ffff:127.0.0.1 这类映射地址按其内层 v4 判定
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return ip_is_forbidden(std::net::IpAddr::V4(mapped));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7（唯一本地地址）
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // fe80::/10（链路本地）
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// 解析主机名并要求所有解析结果都落在公网
+///
+/// `ensure_host_allowed` 只做字符串检查；这个异步版本补上 DNS 解析后的
+/// IP 校验，二者必须一起用（见 `WebFetch::call` / `OpenWithSystem::call`）。
+async fn ensure_host_resolves_publicly(host: &str, port: u16) -> Result<()> {
+    // 裸 IP 字面量不需要（也不应该）走 DNS
+    if let Some(ip) = parse_literal_ip(host) {
+        if ip_is_forbidden(ip) {
+            anyhow::bail!("不允许访问本机/内网地址：{}", host);
+        }
+        return Ok(());
+    }
+
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| anyhow::anyhow!("域名 {} 解析失败：{}", host, e))?;
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if ip_is_forbidden(addr.ip()) {
+            anyhow::bail!(
+                "域名 {} 解析到本机/内网地址（{}），已阻止访问",
+                host,
+                addr.ip()
+            );
+        }
+    }
+    if !resolved_any {
+        anyhow::bail!("域名 {} 没有解析到任何地址", host);
+    }
+    Ok(())
 }
 
 /// 校验一个 URL 是否可以访问：http(s) + 域名白名单 + 拒绝本机/裸 IP
@@ -64,8 +143,12 @@ fn ensure_host_allowed(url: &reqwest::Url, domains: &[String]) -> Result<String>
     if !allowed {
         anyhow::bail!("域名 {} 不在允许清单中。允许的域名：{}", host, domains.join("、"));
     }
-    if host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
+    if host == "localhost" {
         anyhow::bail!("不允许访问本机地址或裸 IP");
+    }
+    // IPv6 的 host_str 带方括号，必须先剥掉再 parse，否则 `[::1]` 会漏过检查
+    if parse_literal_ip(&host).is_some() {
+        anyhow::bail!("不允许访问本机地址或裸 IP：{}", host);
     }
     Ok(host)
 }
@@ -99,7 +182,13 @@ impl Tool for WebFetch {
         let parsed = reqwest::Url::parse(&url)
             .map_err(|e| anyhow::anyhow!("链接不合法：{}", e))?;
         // 初始 URL 先校验一次；后续每一跳重定向再各自校验（见循环）
-        ensure_host_allowed(&parsed, &cx.services.web_domains)?;
+        let host = ensure_host_allowed(&parsed, &cx.services.web_domains)?;
+        // 字符串检查之外还要看 DNS 解析结果：白名单域名可以解析到内网（rebinding）
+        ensure_host_resolves_publicly(
+            &host,
+            parsed.port_or_known_default().unwrap_or(443),
+        )
+        .await?;
 
         cx.ensure_not_cancelled()?;
         // 手动逐跳跟随重定向：每一跳都重新过白名单与"非本机/裸 IP"检查，
@@ -123,7 +212,12 @@ impl Tool for WebFetch {
             current = current
                 .join(location)
                 .map_err(|e| anyhow::anyhow!("重定向地址不合法：{}", e))?;
-            ensure_host_allowed(&current, &cx.services.web_domains)?;
+            let host = ensure_host_allowed(&current, &cx.services.web_domains)?;
+            ensure_host_resolves_publicly(
+                &host,
+                current.port_or_known_default().unwrap_or(443),
+            )
+            .await?;
             redirects += 1;
         };
         let status = response.status();
@@ -195,8 +289,13 @@ impl Tool for OpenWithSystem {
         let full = if target.starts_with("http://") || target.starts_with("https://") {
             let parsed = reqwest::Url::parse(&target)
                 .map_err(|e| anyhow::anyhow!("链接不合法：{}", e))?;
-            // 与 web_fetch 同一套校验：白名单 + 拒绝本机/裸 IP
-            ensure_host_allowed(&parsed, &cx.services.web_domains)?;
+            // 与 web_fetch 同一套校验：白名单 + 拒绝本机/裸 IP + DNS 解析结果
+            let host = ensure_host_allowed(&parsed, &cx.services.web_domains)?;
+            ensure_host_resolves_publicly(
+                &host,
+                parsed.port_or_known_default().unwrap_or(443),
+            )
+            .await?;
             target.clone()
         } else {
             let resolved = cx.services.workspaces.resolve_existing(&target).map_err(anyhow::Error::msg)?;
@@ -417,6 +516,59 @@ mod tests {
         assert!(allow("http://[::1]/x").is_err(), "IPv6 回环同样拒绝");
         assert!(allow("https://evil.test/x").is_err(), "白名单外域名必须被拒");
         assert!(allow("file:///etc/passwd").is_err(), "非 http(s) 必须被拒");
+    }
+
+    /// IPv6 字面量在 host_str 里带方括号：必须剥掉再 parse，否则 `[::1]`
+    /// 会被当成"普通域名"漏过 IP 检查
+    #[test]
+    fn bracketed_ipv6_literal_is_recognised() {
+        assert_eq!(
+            parse_literal_ip("[::1]"),
+            Some("::1".parse().unwrap())
+        );
+        assert!(parse_literal_ip("example.com").is_none());
+        assert!(parse_literal_ip("[2001:db8::1]").is_some());
+    }
+
+    /// DNS rebinding 的下半场：解析结果落进内网/保留段必须被拒绝
+    #[test]
+    fn forbidden_ip_ranges_are_rejected() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "172.16.1.1",
+            "192.168.1.1",
+            "169.254.169.254", // 云元数据
+            "0.0.0.0",
+            "100.64.0.1", // CGNAT
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                ip_is_forbidden(ip.parse().unwrap()),
+                "{ip} 必须被判定为禁止地址"
+            );
+        }
+        for ip in ["1.1.1.1", "8.8.8.8", "2606:4700::1111"] {
+            assert!(!ip_is_forbidden(ip.parse().unwrap()), "{ip} 是公网地址");
+        }
+    }
+
+    /// 新增的宿主解释型/协议型扩展名必须被 open_with_system 拒绝
+    #[test]
+    fn open_with_system_blocks_script_host_extensions() {
+        let fx = Fixture::new("htm", vec![]);
+        for name in ["page.html", "icon.svg", "link.url", "macro.docm", "shortcut.desktop"] {
+            std::fs::write(fx.dir.join(name), "x").unwrap();
+        }
+        let cx = fx.ctx();
+        for name in ["page.html", "icon.svg", "link.url", "macro.docm", "shortcut.desktop"] {
+            let err = block_on(OpenWithSystem.call(json!({"target": name}), &cx)).unwrap_err();
+            assert!(err.to_string().contains("不允许"), "{name} => {err}");
+        }
+        assert!(fx.opened.lock().unwrap().is_empty());
     }
 
     #[test]

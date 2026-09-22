@@ -128,14 +128,20 @@ impl MemoryExtractor {
             planned.push((fact, reuse));
         }
 
-        let mut embeddings_iter = if need_embed.is_empty() {
-            Vec::new().into_iter()
+        let embeddings = if need_embed.is_empty() {
+            Vec::new()
         } else {
             match proxy.embed(need_embed).await {
-                Ok(v) => v.into_iter(),
-                Err(_) => Vec::new().into_iter(),
+                Ok(v) => v,
+                Err(e) => {
+                    // 绝不把"没有向量"的记忆写进库：它们不会被检索到（数据黑洞），
+                    // 而且下一轮会重复提取一遍、白白多花一次 LLM 调用。
+                    // 整轮放弃并如实记录，下次对话自然重试。
+                    anyhow::bail!("记忆向量化失败，本轮不写入任何记忆（下次对话会重试）：{}", e);
+                }
             }
         };
+        let mut embeddings_iter = embeddings.into_iter();
 
         let mut entries = Vec::new();
         for (fact, reused_embedding) in planned {

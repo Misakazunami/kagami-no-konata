@@ -43,6 +43,12 @@ where
     drop(config);
 
     state.dispatcher.chat_agent().update_provider(&provider);
+
+    // 停用/取消信任/删除 MCP 服务器时，工具集合会自动隐藏它们，但外部
+    // 进程不会自己退出：这里统一做一次资源回收（仍启用的是空操作）。
+    for tool in state.dispatcher.chat_agent().tools().all() {
+        tool.shutdown_disabled();
+    }
     Ok(output)
 }
 

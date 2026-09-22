@@ -1,6 +1,6 @@
 use anyhow::Result;
-use chrono::{Local, Utc};
-use rusqlite::Connection;
+use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::agent::context::{Message, Role, Session};
@@ -44,6 +44,12 @@ pub struct RewindOutcome {
     pub target_index: i64,
     /// 是否因为截断清空了持久化上下文摘要（摘要引用了已不存在的消息）
     pub summary_cleared: bool,
+    /// 随截断一并清理的工作记忆条数（截断点之后写下的结论已不可信）
+    #[serde(default)]
+    pub notes_removed: usize,
+    /// 计划里的"进行中"项是否被置为"受阻"（历史已被改写，原进度已无法继续）
+    #[serde(default)]
+    pub plan_blocked: bool,
 }
 
 /// 工具调用轨迹行（仅供 UI 回放，不参与模型上下文）
@@ -435,6 +441,11 @@ impl ChatStore {
     /// - 被删/被编辑的消息落在已摘要区间（`target_index < summarized_count`）时，
     ///   摘要正文里包含已不存在的内容，必须整体清空重算；
     /// - 否则水位无需变化（被删的都是摘要覆盖范围之外的消息）。
+    ///
+    /// 还要清理两类"跟随历史"的跨轮状态：截断点之后写下的工作记忆（引用了
+    /// 已删除的内容，注入下一轮只会误导模型），以及计划里"进行中"的条目
+    /// （历史被改写后已不可能继续，置为"受阻"而不是留在"进行中"）。
+    #[allow(clippy::type_complexity)]
     fn truncate_from_tx(
         tx: &rusqlite::Transaction<'_>,
         session_id: &str,
@@ -442,7 +453,7 @@ impl ChatStore {
         target_created_at: &str,
         target_index: i64,
         inclusive: bool,
-    ) -> Result<(usize, Vec<String>, bool)> {
+    ) -> Result<(usize, Vec<String>, bool, usize, bool)> {
         let op = if inclusive { ">=" } else { ">" };
         let ids_subquery = format!(
             "SELECT id FROM messages WHERE session_id = ?1 AND rowid {} ?2",
@@ -485,6 +496,64 @@ impl ChatStore {
             rusqlite::params![session_id, target_rowid],
         )?;
 
+        // 截断点之后写下的工作记忆：它们引用的工具输出/结论已经不在历史里。
+        //
+        // 注意边界不能用 target_created_at：assistant 消息是在整轮生成**结束后**
+        // 才落库的，本轮工具里写下的笔记时间戳比它更早。正确的界是"第一条被删
+        // 消息之前的那条消息"——本轮笔记一定晚于它。
+        let boundary_op = if inclusive { "<" } else { "<=" };
+        let boundary: Option<String> = tx
+            .query_row(
+                &format!(
+                    "SELECT created_at FROM messages
+                     WHERE session_id = ?1 AND rowid {} ?2
+                     ORDER BY rowid DESC LIMIT 1",
+                    boundary_op
+                ),
+                rusqlite::params![session_id, target_rowid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let notes_removed = match boundary {
+            Some(boundary) => tx.execute(
+                "DELETE FROM tool_notes WHERE session_id = ?1 AND created_at > ?2",
+                rusqlite::params![session_id, boundary],
+            )?,
+            // 截断点之前没有任何消息：整个会话的笔记都属于被删区间
+            None => tx.execute("DELETE FROM tool_notes WHERE session_id = ?1", [session_id])?,
+        };
+
+        // 计划：把"进行中"置为"受阻"（保留已完成/待办项，用户能看到真实状态）
+        let mut plan_blocked = false;
+        if removed > 0 {
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT plan_json FROM session_plans WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(raw) = raw {
+                if let Some(mut plan) = SessionPlan::from_json(&raw) {
+                    let mut changed = false;
+                    for item in &mut plan.items {
+                        if item.status == crate::agent::plan::PlanStatus::Doing {
+                            item.status = crate::agent::plan::PlanStatus::Blocked;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        plan.updated_at = Utc::now().to_rfc3339();
+                        tx.execute(
+                            "UPDATE session_plans SET plan_json = ?1, updated_at = ?2 WHERE session_id = ?3",
+                            rusqlite::params![plan.to_json(), plan.updated_at, session_id],
+                        )?;
+                        plan_blocked = true;
+                    }
+                }
+            }
+        }
+
         let new_total: i64 = tx.query_row(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
             [session_id],
@@ -511,7 +580,13 @@ impl ChatStore {
             )?;
         }
 
-        Ok((removed, affected_streams, summary_cleared))
+        Ok((
+            removed,
+            affected_streams,
+            summary_cleared,
+            notes_removed,
+            plan_blocked,
+        ))
     }
 
     /// 回退预览（只读）：删除范围与受影响的快照轮次，供确认弹窗展示
@@ -557,6 +632,8 @@ impl ChatStore {
             affected_streams,
             target_index,
             summary_cleared: false,
+            notes_removed: 0,
+            plan_blocked: false,
         })
     }
 
@@ -573,14 +650,15 @@ impl ChatStore {
         let (target_rowid, _role, _content, target_created_at) =
             Self::locate_message(&tx, session_id, message_id)?;
         let target_index = Self::message_index_before(&tx, session_id, target_rowid)?;
-        let (removed, affected_streams, summary_cleared) = Self::truncate_from_tx(
-            &tx,
-            session_id,
-            target_rowid,
-            &target_created_at,
-            target_index,
-            inclusive,
-        )?;
+        let (removed, affected_streams, summary_cleared, notes_removed, plan_blocked) =
+            Self::truncate_from_tx(
+                &tx,
+                session_id,
+                target_rowid,
+                &target_created_at,
+                target_index,
+                inclusive,
+            )?;
         if removed > 0 {
             tx.execute(
                 "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -593,6 +671,8 @@ impl ChatStore {
             affected_streams,
             target_index,
             summary_cleared,
+            notes_removed,
+            plan_blocked,
         })
     }
 
@@ -618,14 +698,15 @@ impl ChatStore {
             rusqlite::params![content, token_count, message_id, session_id],
         )?;
         let target_index = Self::message_index_before(&tx, session_id, target_rowid)?;
-        let (removed, affected_streams, summary_cleared) = Self::truncate_from_tx(
-            &tx,
-            session_id,
-            target_rowid,
-            &target_created_at,
-            target_index,
-            false,
-        )?;
+        let (removed, affected_streams, summary_cleared, notes_removed, plan_blocked) =
+            Self::truncate_from_tx(
+                &tx,
+                session_id,
+                target_rowid,
+                &target_created_at,
+                target_index,
+                false,
+            )?;
         tx.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
             rusqlite::params![Utc::now().to_rfc3339(), session_id],
@@ -636,6 +717,8 @@ impl ChatStore {
             affected_streams,
             target_index,
             summary_cleared,
+            notes_removed,
+            plan_blocked,
         })
     }
 
@@ -768,38 +851,19 @@ impl ChatStore {
     }
 
     /// 按日期查找会话（限指定类型：任务会话不能被"今日聊天"复用）
+    ///
+    /// `created_at` 存的是 UTC RFC3339，而调用方的"今天"来自 `Local::now()`：
+    /// SQL 必须用 `localtime` 修饰符换算，否则 UTC+8 环境下每天 00:00–08:00
+    /// 创建的会话都匹配不到"今日"，导致重复建会话与错误的人格解析。
     pub fn find_session_by_date(&self, date: &str, session_type: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {} FROM sessions
-             WHERE date(created_at) = ?1 AND session_type = ?2
+             WHERE date(created_at, 'localtime') = ?1 AND session_type = ?2
              ORDER BY updated_at DESC LIMIT 1",
             SESSION_COLUMNS
         ))?;
 
         let mut rows = stmt.query_map(rusqlite::params![date, session_type], map_session_row)?;
-
-        match rows.next() {
-            Some(session) => Ok(Some(session?)),
-            None => Ok(None),
-        }
-    }
-
-    /// 查找今日的空会话（无消息）
-    pub fn find_empty_session_today(&self) -> Result<Option<Session>> {
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {}
-             FROM sessions s
-             LEFT JOIN messages m ON s.id = m.session_id
-             WHERE date(s.created_at) = ?1
-             GROUP BY s.id
-             HAVING COUNT(m.id) = 0
-             ORDER BY s.created_at DESC
-             LIMIT 1",
-            SESSION_COLUMNS_ALIASED
-        ))?;
-
-        let mut rows = stmt.query_map(rusqlite::params![today], map_session_row)?;
 
         match rows.next() {
             Some(session) => Ok(Some(session?)),
@@ -835,8 +899,8 @@ impl ChatStore {
     /// 更新会话标题
     pub fn update_session_title(&self, session_id: &str, title: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET title = ?1 WHERE id = ?2",
-            rusqlite::params![title, session_id],
+            "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![title, Utc::now().to_rfc3339(), session_id],
         )?;
         Ok(())
     }
@@ -1051,8 +1115,8 @@ impl ChatStore {
     /// 写入一条工作记忆，并按上限淘汰最旧的条目
     ///
     /// 淘汰规则：先按**条数**（最多 [`crate::agent::notes::MAX_NOTES`] 条），
-    /// 再按**总字节**（最多 `MAX_TOTAL_BYTES`）。淘汰只发生在写的时候，
-    /// 因此读路径永远是"取出来就能直接注入"，不需要在提示词组装阶段做裁剪。
+    /// 再按**总字节**（最多 `MAX_TOTAL_BYTES`）。淘汰与写入在**同一事务**内：
+    /// 否则崩溃/失败会留下超限数据，直到下一次写入才被修掉。
     pub fn save_note(&self, session_id: &str, note: &SessionNote) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -1067,14 +1131,19 @@ impl ChatStore {
                 note.created_at,
             ],
         )?;
+        Self::trim_notes_conn(&tx, session_id)?;
         tx.commit()?;
-        self.trim_notes(session_id)?;
         Ok(())
     }
 
     /// 按条数与总量上限淘汰超出部分（最旧的先走）
     pub fn trim_notes(&self, session_id: &str) -> Result<()> {
-        let notes = self.list_notes(session_id)?;
+        Self::trim_notes_conn(&self.conn, session_id)
+    }
+
+    /// `trim_notes` 的连接版实现（供事务内调用）
+    fn trim_notes_conn(conn: &Connection, session_id: &str) -> Result<()> {
+        let notes = Self::list_notes_conn(conn, session_id)?;
         let mut keep_bytes = 0usize;
         // list_notes 按时间正序：从新往旧保留
         let mut keep: Vec<&SessionNote> = Vec::new();
@@ -1090,10 +1159,7 @@ impl ChatStore {
         let keep_ids: Vec<String> = keep.iter().map(|note| note.id.clone()).collect();
         for note in &notes {
             if !keep_ids.contains(&note.id) {
-                self.conn.execute(
-                    "DELETE FROM tool_notes WHERE id = ?1",
-                    [&note.id],
-                )?;
+                conn.execute("DELETE FROM tool_notes WHERE id = ?1", [&note.id])?;
             }
         }
         Ok(())
@@ -1101,7 +1167,11 @@ impl ChatStore {
 
     /// 读取某个会话的工作记忆（按时间正序，最旧的在前）
     pub fn list_notes(&self, session_id: &str) -> Result<Vec<SessionNote>> {
-        let mut stmt = self.conn.prepare(
+        Self::list_notes_conn(&self.conn, session_id)
+    }
+
+    fn list_notes_conn(conn: &Connection, session_id: &str) -> Result<Vec<SessionNote>> {
+        let mut stmt = conn.prepare(
             "SELECT id, title, content, bytes, created_at
              FROM tool_notes WHERE session_id = ?1 ORDER BY created_at ASC",
         )?;
@@ -1406,10 +1476,21 @@ mod tests {
         // 类型过滤：普通会话入口不能复用任务会话
         assert!(store.find_latest_empty_session("chat").unwrap().is_none());
 
-        // `created_at` 存的是 RFC3339 的 UTC 时间，这一列的比较也必须用 UTC 日期
-        let today = Utc::now().format("%Y-%m-%d").to_string();
-        assert!(store.find_session_by_date(&today, "task").unwrap().is_some());
-        assert!(store.find_session_by_date(&today, "chat").unwrap().is_none());
+        // `created_at` 存 UTC，但"今天"是用户本地概念：查询必须按 localtime
+        // 换算，否则 UTC+8 的凌晨时段找不到刚创建的会话（真实缺陷）。
+        let local_today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(store.find_session_by_date(&local_today, "task").unwrap().is_some());
+        assert!(store.find_session_by_date(&local_today, "chat").unwrap().is_none());
+
+        // 本地日期与 UTC 日期不同的时区里，用 UTC 日期查询必须查不到
+        // （证明查询确实按本地时间解释，而不是碰巧同日）
+        let utc_today = Utc::now().format("%Y-%m-%d").to_string();
+        if utc_today != local_today {
+            assert!(
+                store.find_session_by_date(&utc_today, "task").unwrap().is_none(),
+                "查询必须按本地日期解释 created_at"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1696,6 +1777,93 @@ mod tests {
         assert!(outcome.summary_cleared);
         let (summary, count) = store.get_summary_with_count(&session2.id).unwrap();
         assert!(summary.is_empty() && count == 0);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 回退不仅截断消息，还会清理截断点之后的工作记忆，并把计划里的
+    /// "进行中"项置为"受阻"（否则下一轮会拿着已删除历史的结论继续干活）
+    #[test]
+    fn rewind_clears_notes_and_blocks_plan_doing() {
+        use crate::agent::notes::SessionNote;
+        use crate::agent::plan::{PlanItem, PlanStatus, SessionPlan};
+
+        let (store, dir) = temp_store("rewind-state");
+        let session = store.create_session("p", "t", None, None, None).unwrap();
+
+        // 更早一轮留下的笔记：截断到 a1 时必须保留
+        store
+            .save_note(
+                &session.id,
+                &SessionNote::new("old".to_string(), None, "更早的结论".to_string()),
+            )
+            .unwrap();
+        let u1 = store
+            .add_message(&session.id, Role::User, "旧问题", 1, 0, None, None)
+            .unwrap();
+        // 这一轮生成期间（assistant 消息落库之前）写下的笔记：属于被删区间
+        store
+            .save_note(
+                &session.id,
+                &SessionNote::new("during".to_string(), None, "基于旧回答的结论".to_string()),
+            )
+            .unwrap();
+        let a1 = store
+            .add_message(&session.id, Role::Assistant, "旧回答", 1, 0, None, None)
+            .unwrap();
+        store
+            .add_message(&session.id, Role::User, "接着问", 1, 0, None, None)
+            .unwrap();
+
+        store
+            .save_plan(
+                &session.id,
+                &SessionPlan::new(
+                    vec![
+                        PlanItem {
+                            title: "读代码".to_string(),
+                            status: PlanStatus::Done,
+                        },
+                        PlanItem {
+                            title: "改实现".to_string(),
+                            status: PlanStatus::Doing,
+                        },
+                    ],
+                    None,
+                ),
+            )
+            .unwrap();
+        store
+            .save_note(
+                &session.id,
+                &SessionNote::new(
+                    "n1".to_string(),
+                    None,
+                    "基于旧回答的结论".to_string(),
+                ),
+            )
+            .unwrap();
+
+        // 回退到 a1（含）：a1 之后的提问与作答都被删除
+        let outcome = store.rewind_messages(&session.id, &a1.id, true).unwrap();
+        assert_eq!(outcome.removed, 2);
+        assert_eq!(
+            outcome.notes_removed, 2,
+            "被删区间（含生成期间写下）的笔记必须一并清理"
+        );
+        assert!(outcome.plan_blocked, "进行中的计划项必须被置为受阻");
+        let notes = store.list_notes(&session.id).unwrap();
+        assert_eq!(notes.len(), 1, "更早一轮的笔记必须保留：{notes:?}");
+        assert_eq!(notes[0].id, "old");
+
+        let plan = store.get_plan(&session.id).unwrap().expect("计划仍在");
+        assert_eq!(plan.items[0].status, PlanStatus::Done, "已完成项不受影响");
+        assert_eq!(plan.items[1].status, PlanStatus::Blocked, "进行中 → 受阻");
+
+        // 回退到更早的 u1（不含）：a1 已删，目标就是第一条，无事发生
+        let outcome = store.rewind_messages(&session.id, &u1.id, false).unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.notes_removed, 0);
 
         let _ = std::fs::remove_dir_all(dir);
     }

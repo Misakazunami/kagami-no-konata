@@ -108,10 +108,16 @@ pub async fn get_tool_invocations(
     session_id: String,
 ) -> Result<Vec<ToolInvocationRow>, String> {
     ensure_main_window(&window)?;
-    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-    store
-        .get_tool_invocations(&session_id)
-        .map_err(|e| e.to_string())
+    // 长任务的轨迹可能上千条：放到阻塞线程，不占住 async 执行器
+    let store = state.chat_store.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = store.lock().map_err(|e| e.to_string())?;
+        store
+            .get_tool_invocations(&session_id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("读取工具轨迹失败：{}", e))?
 }
 
 // ─── 任务计划（`update_plan` 工具写、界面读） ───────────────

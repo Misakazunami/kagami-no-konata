@@ -81,6 +81,14 @@ impl ToolRegistry {
         self.tools.len()
     }
 
+    /// 全部已注册工具（含当前不可见的）
+    ///
+    /// 配置变更后需要遍历所有工具做资源回收（例如停用 MCP 服务器时结束
+    /// 它的子进程），因此这里不过滤 `enabled()`/模式。
+    pub fn all(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
     /// 按模式过滤后的可见工具描述
     pub fn visible(&self, mode: ToolMode) -> Vec<&Arc<dyn Tool>> {
         self.visible_with(mode, false)

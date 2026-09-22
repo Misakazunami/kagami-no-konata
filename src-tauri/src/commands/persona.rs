@@ -106,7 +106,7 @@ pub(crate) fn write_persona_file(
         return Err("非法的人格 ID：写入路径越出人格目录".to_string());
     }
 
-    fs::write(&file_path, yaml_content).map_err(|e| e.to_string())?;
+    write_atomic(&file_path, yaml_content)?;
 
     // 清理可能存在的旧 .yml 文件，避免双文件遮蔽混乱
     let legacy_path = dir.join(format!("{}.yml", persona_id));
@@ -114,6 +114,32 @@ pub(crate) fn write_persona_file(
         let _ = fs::remove_file(&legacy_path);
     }
 
+    Ok(())
+}
+
+/// 原子写入：临时文件 → fsync → rename
+///
+/// 人格文件每次对话都要读取，写一半崩溃会留下坏 YAML；与 `config.json`
+/// 使用同一套"要么旧内容、要么完整新内容"的写法。
+fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| "无法确定人格文件目录".to_string())?;
+    let tmp = dir.join(format!(".persona-tmp-{}", uuid::Uuid::new_v4()));
+    {
+        let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        if let Err(e) = file.write_all(content.as_bytes()).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
     Ok(())
 }
 

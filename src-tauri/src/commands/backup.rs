@@ -3,13 +3,92 @@ use tauri::State;
 
 use crate::commands::persona::{is_inside_dir, personas_dir, validate_persona_id, write_persona_file};
 use crate::persona::types::PersonaConfig;
-use crate::store::memory_store::{MemoryEntry, MemoryStore, MAX_IMPORT_ENTRIES};
+use crate::store::memory_store::{
+    decode_embedding_b64, encode_embedding_b64, MemoryEntry, MemoryStore, MemoryType,
+    MAX_IMPORT_ENTRIES,
+};
 use crate::AppState;
 
 /// 导入 JSON 的大小上限（防止一次 IPC 把进程内存打满）
 const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 /// 人格备份中单份 YAML 的长度上限
 const MAX_PERSONA_YAML_BYTES: usize = 256 * 1024;
+/// 导出 JSON 的软上限：超过就自动丢弃向量（并标记），避免把几百 MB 的
+/// 字符串灌进 IPC 与前端 Blob，最后还超过导入上限、备份变得不可恢复
+const MAX_EXPORT_BYTES: usize = 24 * 1024 * 1024;
+
+/// 备份里的一条记忆
+///
+/// `embedding_b64` 是新格式（f32 小端 + Base64，约为 JSON 数字数组的一半）；
+/// `embedding` 字段保留用于导入旧备份。导出时只写 `embedding_b64`。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct MemoryBackupEntry {
+    pub id: String,
+    pub content: String,
+    #[serde(default)]
+    pub memory_type: MemoryType,
+    #[serde(default = "default_importance")]
+    pub importance: f32,
+    #[serde(default)]
+    pub source_session: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub last_accessed: String,
+    #[serde(default)]
+    pub access_count: i32,
+    /// 旧格式：JSON 数字数组（仅导入时识别）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+    /// 新格式：f32 小端 + Base64
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_b64: Option<String>,
+}
+
+fn default_importance() -> f32 {
+    0.5
+}
+
+impl MemoryBackupEntry {
+    fn from_entry(memory: &MemoryEntry, include_embedding: bool) -> Self {
+        Self {
+            id: memory.id.clone(),
+            content: memory.content.clone(),
+            memory_type: memory.memory_type.clone(),
+            importance: memory.importance,
+            source_session: memory.source_session.clone(),
+            created_at: memory.created_at.clone(),
+            last_accessed: memory.last_accessed.clone(),
+            access_count: memory.access_count,
+            embedding: None,
+            embedding_b64: if include_embedding {
+                memory.embedding.as_deref().map(encode_embedding_b64)
+            } else {
+                None
+            },
+        }
+    }
+
+    fn into_entry(self) -> MemoryEntry {
+        // 优先新格式；旧备份的 JSON 数组继续兼容
+        let embedding = self
+            .embedding_b64
+            .as_deref()
+            .and_then(decode_embedding_b64)
+            .or(self.embedding);
+        MemoryEntry {
+            id: self.id,
+            content: self.content,
+            memory_type: self.memory_type,
+            importance: self.importance,
+            embedding,
+            source_session: self.source_session,
+            created_at: self.created_at,
+            last_accessed: self.last_accessed,
+            access_count: self.access_count,
+        }
+    }
+}
 
 /// 记忆备份数据
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -18,7 +97,11 @@ pub struct MemoryBackup {
     pub version: u32,
     #[serde(default)]
     pub exported_at: String,
-    pub memories: Vec<MemoryEntry>,
+    /// 因体积超限而**主动丢弃**了向量（导入后这些记忆仍可被按重要性检索到，
+    /// 只是语义相似度排序会弱一些；如实在备份里标记，用户才能知情）
+    #[serde(default)]
+    pub embeddings_omitted: bool,
+    pub memories: Vec<MemoryBackupEntry>,
 }
 
 /// 人格备份数据
@@ -78,18 +161,53 @@ fn parse_import<T: serde::de::DeserializeOwned>(json_content: &str, what: &str) 
 }
 
 /// 导出所有记忆到 JSON 字符串
+///
+/// `include_embeddings` 默认 true：向量以 Base64 紧凑编码写入，保证导出的
+/// 备份能原样导回、语义检索能力不丢。若编码后超过 [`MAX_EXPORT_BYTES`]，
+/// 会自动改为不带向量导出并设置 `embeddings_omitted`（宁可丢排序精度，
+/// 也不能产出根本导不回来的备份）。
 #[tauri::command]
-pub async fn export_memories(state: State<'_, AppState>) -> Result<String, String> {
-    let store = state.memory_store.lock().map_err(|e| e.to_string())?;
-    let memories = store.list_memories(None).map_err(|e| e.to_string())?;
+pub async fn export_memories(
+    state: State<'_, AppState>,
+    include_embeddings: Option<bool>,
+) -> Result<String, String> {
+    let include_embeddings = include_embeddings.unwrap_or(true);
+    // 全量读取 + 向量编码 + JSON 序列化都是 CPU/IO 重活：放到阻塞线程
+    let store = state.memory_store.clone();
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let memories = {
+            let store = store.lock().map_err(|e| e.to_string())?;
+            store.list_memories(None).map_err(|e| e.to_string())?
+        };
 
-    let backup = MemoryBackup {
-        version: 1,
-        exported_at: chrono::Local::now().to_rfc3339(),
-        memories,
-    };
+        let build = |include: bool, omitted: bool| MemoryBackup {
+            version: 2,
+            exported_at: chrono::Local::now().to_rfc3339(),
+            embeddings_omitted: omitted,
+            memories: memories
+                .iter()
+                .map(|memory| MemoryBackupEntry::from_entry(memory, include))
+                .collect(),
+        };
 
-    serde_json::to_string_pretty(&backup).map_err(|e| e.to_string())
+        let mut backup = build(include_embeddings, false);
+        let mut json = serde_json::to_string_pretty(&backup).map_err(|e| e.to_string())?;
+
+        if include_embeddings && json.len() > MAX_EXPORT_BYTES {
+            eprintln!(
+                "[memory] 导出 {} 条记忆含向量约 {} MB，超过 {} MB 上限：改为不含向量导出",
+                memories.len(),
+                json.len() / 1024 / 1024,
+                MAX_EXPORT_BYTES / 1024 / 1024
+            );
+            backup = build(false, true);
+            json = serde_json::to_string_pretty(&backup).map_err(|e| e.to_string())?;
+        }
+
+        Ok(json)
+    })
+    .await
+    .map_err(|e| format!("导出任务失败：{}", e))?
 }
 
 /// 从 JSON 字符串导入记忆
@@ -104,38 +222,47 @@ pub async fn import_memories(
     json_content: String,
     merge: bool,
 ) -> Result<ImportReport, String> {
-    let backup: MemoryBackup = parse_import(&json_content, "记忆备份")?;
+    // 解析（可能 64 MB JSON）、清洗与 5 万条事务写入都是重活：整体放到阻塞线程
+    let store = state.memory_store.clone();
+    tokio::task::spawn_blocking(move || -> Result<ImportReport, String> {
+        let backup: MemoryBackup = parse_import(&json_content, "记忆备份")?;
 
-    if backup.memories.len() > MAX_IMPORT_ENTRIES {
-        return Err(format!(
-            "备份包含 {} 条记忆，超过单次导入上限 {} 条",
-            backup.memories.len(),
-            MAX_IMPORT_ENTRIES
-        ));
-    }
-
-    let mut report = ImportReport::new();
-    let mut entries = Vec::with_capacity(backup.memories.len());
-    for entry in backup.memories {
-        match MemoryStore::sanitize_imported(entry) {
-            Some(clean) => {
-                if clean.embedding.is_none() {
-                    report.without_embedding += 1;
-                }
-                entries.push(clean);
-            }
-            None => report.skipped += 1,
+        if backup.memories.len() > MAX_IMPORT_ENTRIES {
+            return Err(format!(
+                "备份包含 {} 条记忆，超过单次导入上限 {} 条",
+                backup.memories.len(),
+                MAX_IMPORT_ENTRIES
+            ));
         }
-    }
+        if backup.embeddings_omitted {
+            eprintln!("[memory] 该备份导出时未包含向量：导入后按重要性参与检索");
+        }
 
-    let store = state.memory_store.lock().map_err(|e| e.to_string())?;
-    let (imported, failed) = store
-        .import_memories(&entries, merge)
-        .map_err(|e| format!("导入失败（已回滚，未改动现有数据）: {}", e))?;
+        let mut report = ImportReport::new();
+        let mut entries = Vec::with_capacity(backup.memories.len());
+        for entry in backup.memories {
+            match MemoryStore::sanitize_imported(entry.into_entry()) {
+                Some(clean) => {
+                    if clean.embedding.is_none() {
+                        report.without_embedding += 1;
+                    }
+                    entries.push(clean);
+                }
+                None => report.skipped += 1,
+            }
+        }
 
-    report.imported = imported;
-    report.failed = failed;
-    Ok(report)
+        let store = store.lock().map_err(|e| e.to_string())?;
+        let (imported, failed) = store
+            .import_memories(&entries, merge)
+            .map_err(|e| format!("导入失败（已回滚，未改动现有数据）: {}", e))?;
+
+        report.imported = imported;
+        report.failed = failed;
+        Ok(report)
+    })
+    .await
+    .map_err(|e| format!("导入任务失败：{}", e))?
 }
 
 /// 导出所有人格到 JSON 字符串
@@ -276,4 +403,87 @@ pub async fn import_personas(
     state.dispatcher.chat_agent().reload_personas(&data_dir);
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> MemoryEntry {
+        MemoryEntry {
+            id: "m1".to_string(),
+            content: "用户喜欢猫".to_string(),
+            memory_type: MemoryType::Preference,
+            importance: 0.8,
+            embedding: Some(vec![0.1, -0.25, 0.75, 1.0]),
+            source_session: "s1".to_string(),
+            created_at: "2026-01-01T00:00:00+00:00".to_string(),
+            last_accessed: "2026-01-01T00:00:00+00:00".to_string(),
+            access_count: 3,
+        }
+    }
+
+    /// 新格式备份必须无损往返（含向量），且不能出现 JSON 数字数组
+    #[test]
+    fn backup_round_trips_embeddings_compactly() {
+        let backup = MemoryBackup {
+            version: 2,
+            exported_at: "now".to_string(),
+            embeddings_omitted: false,
+            memories: vec![MemoryBackupEntry::from_entry(&entry(), true)],
+        };
+        let json = serde_json::to_string(&backup).unwrap();
+        assert!(json.contains("embedding_b64"), "{json}");
+        assert!(
+            !json.contains("0.75") && !json.contains("embedding\":["),
+            "向量不能以 JSON 数字数组导出：{json}"
+        );
+
+        let parsed: MemoryBackup = serde_json::from_str(&json).unwrap();
+        let restored = parsed.memories.into_iter().next().unwrap().into_entry();
+        assert_eq!(restored.embedding, entry().embedding);
+        assert_eq!(restored.content, "用户喜欢猫");
+        assert_eq!(restored.memory_type, MemoryType::Preference);
+        assert_eq!(restored.access_count, 3);
+    }
+
+    /// 不含向量的导出必须标记，且条目的向量字段为空
+    #[test]
+    fn omitted_embeddings_are_flagged() {
+        let backup = MemoryBackup {
+            version: 2,
+            exported_at: "now".to_string(),
+            embeddings_omitted: true,
+            memories: vec![MemoryBackupEntry::from_entry(&entry(), false)],
+        };
+        let json = serde_json::to_string(&backup).unwrap();
+        let parsed: MemoryBackup = serde_json::from_str(&json).unwrap();
+        assert!(parsed.embeddings_omitted);
+        assert!(parsed.memories[0].embedding.is_none());
+        assert!(parsed.memories[0].embedding_b64.is_none());
+    }
+
+    /// 旧版备份（embedding 为 JSON 数字数组）必须继续可导入
+    #[test]
+    fn legacy_backup_format_still_imports() {
+        let legacy = r#"{
+            "version": 1,
+            "exported_at": "old",
+            "memories": [{
+                "id": "m-old",
+                "content": "旧格式",
+                "memory_type": "fact",
+                "importance": 0.4,
+                "embedding": [0.5, 0.5],
+                "source_session": "s1",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "last_accessed": "2026-01-01T00:00:00+00:00",
+                "access_count": 0
+            }]
+        }"#;
+        let parsed: MemoryBackup = serde_json::from_str(legacy).unwrap();
+        let imported = parsed.memories.into_iter().next().unwrap().into_entry();
+        assert_eq!(imported.embedding, Some(vec![0.5, 0.5]));
+        assert_eq!(imported.content, "旧格式");
+    }
 }

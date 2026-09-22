@@ -214,13 +214,24 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     )?;
 
     // 获取当前版本
+    //
+    // 这里绝不能 `unwrap_or(0)`：一旦账本损坏（比如列被写成非整数），
+    // 当成"版本 0"会从 001 开始重放迁移，`ALTER TABLE ADD COLUMN` 撞上
+    // 已存在的列 → init_db 失败 → 应用永久起不来。宁可在这里明确报错，
+    // 让用户能按提示备份/修复，也不要走进那条死路。
     let current_version: i32 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
             [],
             |row| row.get(0),
         )
-        .unwrap_or(0);
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "读取迁移版本失败（schema_version 账本可能已损坏）：{}。\
+                 请先备份 data.db，再联系维护者修复；不要手工删表",
+                e
+            )
+        })?;
 
     for (version, sql) in MIGRATIONS {
         if *version <= current_version {
@@ -232,8 +243,10 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         // （SQLite 不支持 ADD COLUMN IF NOT EXISTS）→ 报 duplicate column →
         // init_db 失败 → 应用永久无法启动。
         let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(sql)?;
-        tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [version])?;
+        tx.execute_batch(sql)
+            .map_err(|e| anyhow::anyhow!("迁移 {} 执行失败（已整体回滚）：{}", version, e))?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [version])
+            .map_err(|e| anyhow::anyhow!("迁移 {} 的版本号写入失败：{}", version, e))?;
         tx.commit()?;
     }
 
@@ -562,6 +575,30 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
             .unwrap();
         println!("修复后会话总数：{}（含探针行）", sessions);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 账本损坏时必须明确报错，而不是当成"版本 0"重放迁移
+    /// （重放会撞 duplicate column，把可修复的问题变成永久无法启动）
+    #[test]
+    fn corrupt_version_ledger_fails_loudly_instead_of_replaying_migrations() {
+        let dir = temp_dir("bad-ledger");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let conn = open_connection(&dir).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version TEXT PRIMARY KEY);
+                 INSERT INTO schema_version (version) VALUES ('not-a-number');",
+            )
+            .unwrap();
+        }
+
+        let err = init_db(&dir).expect_err("损坏的账本必须让初始化失败");
+        let text = err.to_string();
+        assert!(text.contains("读取迁移版本失败"), "{text}");
+        assert!(text.contains("schema_version"), "{text}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

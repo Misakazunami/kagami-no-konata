@@ -299,6 +299,18 @@ impl Tool for McpTool {
         ))
     }
 
+    /// 服务器被停用/取消信任/删除后结束它的子进程
+    ///
+    /// 只把工具从可见集合摘掉是不够的：外部进程仍然在后台运行，
+    /// 用户以为"关掉了"其实没有。重新启用需要重启应用重建连接。
+    fn shutdown_disabled(&self) {
+        if self.enabled() {
+            return; // 仍然启用/可信：绝不能误杀
+        }
+        let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        client.shutdown();
+    }
+
     async fn call(&self, args: Value, cx: &ToolCtx<'_>) -> Result<ToolOutput> {
         cx.ensure_not_cancelled()?;
         // 防御性复查：从本轮生成开始到工具真正执行的间隙里，用户可能已经
@@ -637,6 +649,71 @@ rl.on("line", (line) => {
         let cx = ctx_with(&services, Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let err = block_on(echo.call(json!({"text": "hi"}), &cx)).unwrap_err();
         assert!(err.to_string().contains("停用或取消信任"), "{err}");
+    }
+
+    /// 停用/取消信任后必须真的结束子进程，而不是只在界面上"消失"
+    #[test]
+    fn disabled_server_process_is_shut_down() {
+        if !node_available() {
+            eprintln!("未安装 node，跳过 MCP 集成测试");
+            return;
+        }
+        let fx = FakeFixture::new("shutdown");
+        let handle = config_with_servers(vec![fx.config(McpPermission::Read)]);
+        let tools = connect_configured(&handle);
+        let echo = tools
+            .iter()
+            .find(|t| t.descriptor().name == "mcp:fake:echo")
+            .expect("工具应当已注册")
+            .clone();
+
+        // 取消信任 → 资源回收必须结束进程
+        {
+            let mut config = handle.lock().unwrap();
+            config.tools.mcp.servers[0].trusted = false;
+        }
+        echo.shutdown_disabled();
+
+        // 重新信任后，工具重新可见，但底层进程已经死了：调用必须如实失败
+        {
+            let mut config = handle.lock().unwrap();
+            config.tools.mcp.servers[0].trusted = true;
+        }
+        assert!(echo.enabled(), "重新信任后工具恢复可见");
+        let services = test_services(&fx.dir);
+        let cx = ctx_with(&services, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let out = block_on(echo.call(json!({"text": "hi"}), &cx)).unwrap();
+        assert_eq!(
+            out.status,
+            ToolStatus::Error,
+            "进程已结束，调用必须报错而不是假装成功：{}",
+            out.content
+        );
+    }
+
+    /// 仍然启用的服务器绝不能被误杀
+    #[test]
+    fn enabled_server_is_not_shut_down() {
+        if !node_available() {
+            eprintln!("未安装 node，跳过 MCP 集成测试");
+            return;
+        }
+        let fx = FakeFixture::new("keep");
+        let handle = config_with_servers(vec![fx.config(McpPermission::Read)]);
+        let tools = connect_configured(&handle);
+        let echo = tools
+            .iter()
+            .find(|t| t.descriptor().name == "mcp:fake:echo")
+            .expect("工具应当已注册")
+            .clone();
+
+        echo.shutdown_disabled(); // 未停用 → 空操作
+
+        let services = test_services(&fx.dir);
+        let cx = ctx_with(&services, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let out = block_on(echo.call(json!({"text": "still alive"}), &cx)).unwrap();
+        assert_eq!(out.status, ToolStatus::Ok, "{}", out.content);
+        assert!(out.content.contains("still alive"), "{}", out.content);
     }
 
     #[test]

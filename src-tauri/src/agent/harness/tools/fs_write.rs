@@ -93,6 +93,12 @@ impl Tool for WriteFile {
         );
         if existed {
             text.push_str(&snapshot_note(capture.as_ref()));
+        } else {
+            // 新建文件没有"原内容"可备份，回滚也只会恢复被覆盖的文件：
+            // 必须如实说明，否则用户会以为"回滚"会把这个新文件也删掉
+            text.push_str(
+                "\n（本次为新建文件，没有可回滚的原内容；如需撤销请手动删除该文件）",
+            );
         }
         Ok(ToolOutput::text(text.clone()).with_preview(text))
     }
@@ -361,6 +367,25 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".konata-tmp-"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    /// 新建文件没有原内容可回滚：文案必须如实说明，不能套用"未启用快照"的兜底
+    #[test]
+    fn new_file_note_explains_rollback_scope() {
+        let fx = Fixture::new("new-note", true).with_snapshots("快照");
+        let cx = fx.ctx();
+        let out = block_on(WriteFile.call(
+            json!({"path": "brand-new.txt", "content": "x"}),
+            &cx,
+        ))
+        .unwrap();
+        assert!(out.content.contains("已创建"), "{}", out.content);
+        assert!(out.content.contains("新建文件"), "{}", out.content);
+        assert!(
+            !out.content.contains("未启用文件快照"),
+            "不能误导成快照未启用：{}",
+            out.content
+        );
     }
 
     #[test]

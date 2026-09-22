@@ -36,6 +36,13 @@ const SEND_MAX_ATTEMPTS: usize = 3;
 /// 重试退避（第 n 次失败后等 `n * 400ms`，总等待 1.2 秒以内）
 const SEND_RETRY_BACKOFF_MS: u64 = 400;
 
+/// SSE 解析缓冲的上限
+///
+/// 正常事件都以 `\n\n` 结尾，缓冲不会长期堆积；若对端一直发不出分隔符
+/// （协议不兼容/恶意网关），没有上限的话缓冲会一直涨到连接被 180 秒
+/// read_timeout 掐断。超过这个上限直接判定为格式异常并报错。
+const MAX_SSE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
 /// 把 reqwest 错误的完整来源链拼成一句话
 ///
 /// reqwest 的 `Display` 只有顶层 `error sending request for url (...)`，
@@ -246,6 +253,16 @@ impl OpenAiClient {
                     match byte_stream.next().await {
                         Some(Ok(bytes)) => {
                             state.buffer.extend_from_slice(&bytes);
+                            if state.buffer.len() > MAX_SSE_BUFFER_BYTES {
+                                state.finished = true;
+                                return Some((
+                                    Err(anyhow!(
+                                        "流式响应缓冲超过 {} MB 仍未出现事件分隔符，疑似格式异常",
+                                        MAX_SSE_BUFFER_BYTES / 1024 / 1024
+                                    )),
+                                    (byte_stream, state),
+                                ));
+                            }
                         }
                         Some(Err(e)) => {
                             state.finished = true;

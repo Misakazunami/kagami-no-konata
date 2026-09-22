@@ -26,22 +26,13 @@ const CONTEXT_SUMMARIZE_THRESHOLD: i64 = 20;
 /// 摘要生成失败时的降级窗口上限（宁可多带一些历史，也不让消息凭空消失）
 const CONTEXT_FALLBACK_MAX: i64 = 40;
 
-/// 估算 token 数量（粗略兜底：英文约 4 字符/token，中文约 1.4 字/token）
+/// 估算 token 数量（粗略兜底，仅用于统计展示）
 ///
-/// 仅在没有提供商 `usage` 数据时用于统计展示。
-/// 历史实现两个分支写的是同一句 `tokens += 1` 再统一除以 2，
-/// 导致中文场景系统性高估约 3 倍。
+/// 统一委托给 `harness::traits::estimate_tokens`：历史上这里与工具运行时
+/// 各有一份实现（浮点 ceil vs 整数 div_ceil），同一段文本在两处会算出
+/// 不同的数字，用量统计因此对不上账。
 fn estimate_tokens(text: &str) -> i64 {
-    let mut ascii = 0f64;
-    let mut wide = 0f64;
-    for c in text.chars() {
-        if c.is_ascii() {
-            ascii += 1.0;
-        } else {
-            wide += 1.0;
-        }
-    }
-    ((ascii / 4.0) + (wide / 1.4)).ceil().max(1.0) as i64
+    crate::agent::harness::traits::estimate_tokens(text) as i64
 }
 
 /// 构建增强检索查询：用户输入 + 最近几轮对话
@@ -504,6 +495,47 @@ fn reserve_session(
     Ok(cancel)
 }
 
+/// 截断历史后同步广播计划/工作记忆的变化
+///
+/// 回退/编辑/重试都会连带清理"跟随历史"的跨轮状态（见 `truncate_from_tx`）：
+/// 不广播的话，界面上的计划面板会停留在"进行中"，用户以为任务还能继续。
+fn broadcast_truncation_side_effects(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    session_id: &str,
+    outcome: &RewindOutcome,
+) {
+    if outcome.plan_blocked {
+        if let Ok(store) = state.chat_store.lock() {
+            if let Ok(Some(plan)) = store.get_plan(session_id) {
+                let _ = app.emit_to(
+                    tauri::EventTarget::webview_window("main"),
+                    crate::agent::harness::EVENT_PLAN_UPDATED,
+                    json!({
+                        "session_id": session_id,
+                        "items": plan.items,
+                        "note": plan.note,
+                    }),
+                );
+            }
+        }
+    }
+    if outcome.notes_removed > 0 {
+        if let Ok(store) = state.chat_store.lock() {
+            let count = store.list_notes(session_id).map(|n| n.len()).unwrap_or(0);
+            let _ = app.emit_to(
+                tauri::EventTarget::webview_window("main"),
+                crate::agent::harness::EVENT_NOTES_UPDATED,
+                json!({
+                    "session_id": session_id,
+                    "count": count,
+                    "removed": outcome.notes_removed,
+                }),
+            );
+        }
+    }
+}
+
 /// 发送消息并获取流式响应
 ///
 /// - `stream_id`：本次生成的唯一标识，用于流式事件过滤与取消（不传则自动生成）
@@ -906,6 +938,23 @@ async fn run_generation(
     );
 
     // 自动标题生成
+    //
+    // 生成期间会话可能已被删除（用户在长任务跑到一半时删掉了它）：此时
+    // 标题与记忆都不该再写。`add_message` 的失败兜底只覆盖了正文，这里
+    // 必须在继续之前确认会话仍然存在，否则记忆会以悬空的 source_session
+    // 落库、标题写入也会静默失败。
+    let session_alive = {
+        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+        store.get_session(&session_id).is_ok()
+    };
+    if !session_alive {
+        eprintln!(
+            "[chat] 会话已被删除，跳过标题与记忆提取 session={} stream={}",
+            session_id, stream_id
+        );
+        return Ok(());
+    }
+
     let should_generate_title = {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
         match store.get_session(&session_id) {
@@ -969,7 +1018,10 @@ async fn run_generation(
                     let _ = mem_store.store_memory(entry);
                 }
             }
-            _ => {}
+            Ok(_) => {}
+            // 提取/向量化失败必须留下日志：静默失败会让用户以为"记忆在正常工作"，
+            // 实际上这几轮的内容永远不会被记住
+            Err(e) => eprintln!("[memory] 本轮记忆提取失败（未写入任何记忆）: {}", e),
         }
     }
 
@@ -1067,6 +1119,7 @@ pub async fn delete_messages_from(
     remove_stream(&state, &guard_id);
 
     let outcome = result?;
+    broadcast_truncation_side_effects(&app, &state, &session_id, &outcome);
     // 空 stream_id：两个窗口都会回读（非空且等于本窗口 lastLocalStreamId 时才会被跳过）
     let _ = app.emit(
         "session-updated",
@@ -1118,12 +1171,12 @@ pub async fn regenerate_message(
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
         store
             .rewind_messages(&session_id, &message_id, inclusive)
-            .map(|_| ())
             .map_err(|e| e.to_string())
     };
 
     let result = match prepared {
-        Ok(()) => {
+        Ok(outcome) => {
+            broadcast_truncation_side_effects(&app, &state, &session_id, &outcome);
             run_generation(
                 &app,
                 &window,
@@ -1174,12 +1227,12 @@ pub async fn edit_message(
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
         store
             .edit_user_message(&session_id, &message_id, &content, token_count)
-            .map(|_| ())
             .map_err(|e| e.to_string())
     };
 
     let result = match prepared {
-        Ok(()) => {
+        Ok(outcome) => {
+            broadcast_truncation_side_effects(&app, &state, &session_id, &outcome);
             run_generation(
                 &app,
                 &window,
@@ -1517,10 +1570,16 @@ pub async fn get_messages(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Vec<Message>, String> {
-    let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-    store
-        .get_messages(&session_id)
-        .map_err(|e| e.to_string())
+    // 长会话的消息回读可能很大：放到阻塞线程，不占住 async 执行器
+    let store = state.chat_store.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = store.lock().map_err(|e| e.to_string())?;
+        store
+            .get_messages(&session_id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("读取消息失败：{}", e))?
 }
 
 /// 删除会话
@@ -1568,6 +1627,15 @@ pub async fn delete_session(
         .delete_session(&session_id)
         .map_err(|e| e.to_string())?;
     drop(store);
+
+    // 记忆要跨会话长期保留，不随会话删除；但来源标记必须断开，
+    // 否则界面上会留下指向已删除会话的悬空 source_session
+    if let Ok(memory) = state.memory_store.lock() {
+        if let Err(e) = memory.clear_source_session(&session_id) {
+            eprintln!("[memory] 清理会话来源标记失败 {}: {}", session_id, e);
+        }
+    }
+
     if !snapshot_streams.is_empty() {
         let snapshots = crate::agent::harness::SnapshotStore::new(
             &state.app_data_dir,

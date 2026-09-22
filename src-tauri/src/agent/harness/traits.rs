@@ -477,6 +477,13 @@ pub trait Tool: Send + Sync {
     fn approval_summary(&self, _args: &Value, _cx: &ToolCtx<'_>) -> Option<String> {
         None
     }
+
+    /// 该工具当前已被禁用时释放它持有的外部资源（默认无操作）
+    ///
+    /// 动态来源（MCP）会在配置停用/取消信任后调用：只让工具从可见集合消失
+    /// 还不够，外部进程必须真的结束。实现必须自行确认"现在确实处于禁用状态"
+    /// 才动手，避免误杀仍在使用的资源。
+    fn shutdown_disabled(&self) {}
 }
 
 // ─── 文本截断工具 ────────────────────────────────────────
@@ -647,7 +654,9 @@ impl HeadTailBuffer {
 ///    [`ToolOutput::content`]（runner 的不变式 1）；
 /// 2. 合帧：不足 4 KB 且距上次刷新不足 200 ms 时只进缓冲，避免每个 token
 ///    都发一次事件（前端每个 chunk 都会触发一次 store 更新）；
-/// 3. 载荷带全 `session_id` / `stream_id` / `call_id`，前端才能按会话与调用配对。
+/// 3. 载荷带全 `session_id` / `stream_id` / `call_id`，前端才能按会话与调用配对；
+/// 4. 总量封顶：超过 [`TOOL_STREAM_TOTAL_BYTES`] 后只发一句收尾说明，
+///    其余静默丢弃（模型侧仍拿到完整结果），避免 `yes` 这类命令打爆 IPC。
 pub struct ToolStream {
     emit: Arc<dyn EventSink>,
     session_id: String,
@@ -658,6 +667,10 @@ pub struct ToolStream {
     step: usize,
     pending: String,
     last_flush: Instant,
+    /// 已经转发给 UI 的字节数
+    sent_bytes: usize,
+    /// 收尾说明是否已发（避免反复发同一句）
+    capped_notice_sent: bool,
 }
 
 /// 触发一次刷新的字节阈值
@@ -666,6 +679,15 @@ const TOOL_STREAM_FLUSH_BYTES: usize = 4 * 1024;
 const TOOL_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 /// 单次事件的载荷上限（防止一行巨长输出把事件撑爆）
 const TOOL_STREAM_CHUNK_BYTES: usize = 16 * 1024;
+/// 单次工具调用向 UI 转发的总量上限
+///
+/// 模型侧有 `max_output_bytes` 兜底，但 UI 事件必须独立封顶：`yes`、
+/// `cargo build -vv` 这类命令会持续输出，不限制的话在超时前可以把
+/// 几十上百 MB 灌进 IPC 与前端 store（每个 chunk 都会触发一次状态更新）。
+const TOOL_STREAM_TOTAL_BYTES: usize = 1024 * 1024;
+/// 达到上限后发送的最后一条说明
+const TOOL_STREAM_CAPPED_NOTICE: &str =
+    "\n…[实时输出过多，已停止转发；完整结果见工具卡片]…\n";
 
 impl ToolStream {
     pub fn new(cx: &ToolCtx<'_>, tool: &str, stream: &'static str) -> Self {
@@ -679,6 +701,8 @@ impl ToolStream {
             step: cx.step,
             pending: String::new(),
             last_flush: Instant::now(),
+            sent_bytes: 0,
+            capped_notice_sent: false,
         }
     }
 
@@ -700,8 +724,35 @@ impl ToolStream {
         self.last_flush = Instant::now();
         let mut rest = data.as_str();
         while !rest.is_empty() {
-            let end = floor_char_boundary(rest, TOOL_STREAM_CHUNK_BYTES.min(rest.len()));
-            let end = if end == 0 { rest.len() } else { end };
+            if self.sent_bytes >= TOOL_STREAM_TOTAL_BYTES {
+                if !self.capped_notice_sent {
+                    self.capped_notice_sent = true;
+                    self.emit.emit(
+                        EVENT_TOOL_OUTPUT,
+                        json!({
+                            "session_id": self.session_id,
+                            "stream_id": self.stream_id,
+                            "call_id": self.call_id,
+                            "tool": self.tool,
+                            "stream": self.stream,
+                            "step": self.step,
+                            "data": TOOL_STREAM_CAPPED_NOTICE,
+                        }),
+                    );
+                }
+                return;
+            }
+            let allowed = TOOL_STREAM_TOTAL_BYTES - self.sent_bytes;
+            let end = floor_char_boundary(
+                rest,
+                TOOL_STREAM_CHUNK_BYTES.min(rest.len()).min(allowed),
+            );
+            if end == 0 {
+                // 剩余配额装不下一个完整字符：直接收尾，绝不切坏 UTF-8
+                self.sent_bytes = TOOL_STREAM_TOTAL_BYTES;
+                continue;
+            }
+            self.sent_bytes += end;
             self.emit.emit(
                 EVENT_TOOL_OUTPUT,
                 json!({
@@ -871,5 +922,66 @@ mod tests {
         let (same, trimmed) = HeadTailBuffer::tail_lines("a\nb", 10);
         assert_eq!(same, "a\nb");
         assert!(!trimmed);
+    }
+
+    /// UI 实时输出必须有总量上限：否则 `yes` 这类命令会在超时前把
+    /// 几十 MB 灌进 IPC 与前端 store
+    #[test]
+    fn tool_stream_caps_total_bytes_sent_to_ui() {
+        struct Sink {
+            events: Mutex<Vec<serde_json::Value>>,
+        }
+
+        impl EventSink for Sink {
+            fn emit(&self, _event: &str, payload: serde_json::Value) {
+                self.events.lock().unwrap().push(payload);
+            }
+        }
+
+        let sink = Arc::new(Sink {
+            events: Mutex::new(Vec::new()),
+        });
+        let mut stream = ToolStream {
+            emit: sink.clone(),
+            session_id: "s1".to_string(),
+            stream_id: "st1".to_string(),
+            call_id: "c1".to_string(),
+            tool: "run_command".to_string(),
+            stream: "stdout",
+            step: 0,
+            pending: String::new(),
+            last_flush: Instant::now(),
+            sent_bytes: 0,
+            capped_notice_sent: false,
+        };
+
+        // 推入约 2 MB（远超上限）
+        let chunk = "x".repeat(4096);
+        for _ in 0..512 {
+            stream.push(&chunk);
+        }
+        stream.flush();
+
+        let events = sink.events.lock().unwrap();
+        let total: usize = events
+            .iter()
+            .map(|payload| payload["data"].as_str().unwrap_or("").len())
+            .sum();
+        assert!(
+            total <= TOOL_STREAM_TOTAL_BYTES + TOOL_STREAM_CAPPED_NOTICE.len(),
+            "转发总量必须封顶，实际 {total}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|payload| payload["data"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("已停止转发")),
+            "超过上限必须发一句收尾说明"
+        );
+        // 载荷仍带全配对字段
+        assert_eq!(events[0]["session_id"], "s1");
+        assert_eq!(events[0]["call_id"], "c1");
     }
 }

@@ -153,6 +153,15 @@ impl Drop for McpClient {
 }
 
 impl McpClient {
+    /// 主动结束服务器进程（用户停用/取消信任时调用）
+    ///
+    /// 与 `Drop` 相同：kill 之后管道关闭，读写线程自然退出。之后这个客户端
+    /// 不能再发请求（用户重新启用需要重启应用来重建连接，如实报错即可）。
+    pub fn shutdown(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     /// 启动服务器并完成握手（阻塞，调用方负责放到后台线程或用启动路径执行）
     pub fn connect(cfg: &McpServerConfig) -> Result<Self> {
         if cfg.command.trim().is_empty() {
