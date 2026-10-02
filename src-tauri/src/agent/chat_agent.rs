@@ -174,13 +174,19 @@ impl ChatAgent {
 
         // 1. System prompt（人设或任务模式注入）
         let mut system_prompt = if ctx.session_type == "task" {
-            let persona_name = {
+            // 任务模式把人设设定本身交给提示词构造器（而不是只给名字）：
+            // 只给名字时模型对角色一无所知，交付会退化成中性工程师腔。
+            // 人格被删除时与对话链路一致地回退到内置默认人格，而不是直接失去人设。
+            let persona = {
                 let engine = self.personas.read().unwrap_or_else(|e| e.into_inner());
-                engine.get_persona(&ctx.persona_id).map(|p| p.name.clone())
+                engine
+                    .get_persona(&ctx.persona_id)
+                    .or_else(|| engine.default_persona())
+                    .cloned()
             };
             super::task_prompt::build_task_system_prompt(
                 &ctx.task_mode,
-                persona_name.as_deref(),
+                persona.as_ref(),
                 &ctx.user_nickname,
             )
         } else {
@@ -756,6 +762,48 @@ mod tests {
         assert!(system.contains("备注：等用户确认"), "{system}");
         // 计划属于 system 段，不能混进对话历史
         assert_eq!(messages.len(), 2);
+    }
+
+    /// 任务会话的 system prompt 必须带上人设设定本身（只给名字 = 人格不明显）
+    #[test]
+    fn task_session_prompt_carries_the_persona() {
+        let agent = make_agent();
+
+        let mut task = base_ctx("帮我改个脚本", vec![]);
+        task.session_type = "task".to_string();
+        task.task_mode = "work".to_string();
+        task.tools = Some(test_runtime());
+        let messages = agent.build_messages(&task).unwrap();
+        let system = &messages[0].content;
+
+        // 任务模式的规则仍在，且人设块也在（历史实现只有名字）
+        assert!(system.contains("# 运行模式：专业技术任务智能体"));
+        assert!(system.contains("### 角色原始设定"), "{system}");
+        assert!(system.contains("全名泉此方"), "人设原始设定应进上下文");
+        assert!(system.contains("## 表达要求"));
+        assert!(system.contains("技术事实最高"), "冲突裁决顺序必须写明");
+        // 通用注入不受影响：时间、工具规则仍在
+        assert!(system.contains("【当前时间】"));
+        assert!(system.contains("【工具使用规则】"));
+
+        // 对话链路不注入任务模式的规则
+        let chat = base_ctx("你好", vec![]);
+        let chat_system = &agent.build_messages(&chat).unwrap()[0].content;
+        assert!(!chat_system.contains("# 运行模式：专业技术任务智能体"));
+    }
+
+    /// 任务会话引用了一个不存在的人格时，必须回退到内置默认人格而不是失去人设
+    #[test]
+    fn task_session_falls_back_to_default_persona() {
+        let agent = make_agent();
+
+        let mut task = base_ctx("你好", vec![]);
+        task.session_type = "task".to_string();
+        task.persona_id = "被删掉的人格".to_string();
+        let system = &agent.build_messages(&task).unwrap()[0].content;
+
+        assert!(system.contains("### 角色原始设定"), "{system}");
+        assert!(system.contains("全名泉此方"), "应回退到内置默认人格");
     }
 
     /// 会话级模型方案必须真的改变本轮使用的 backend（否则"选了模型没生效"）

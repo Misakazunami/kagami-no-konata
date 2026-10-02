@@ -46,6 +46,14 @@ pub struct PersonaConfig {
 }
 
 impl PersonaConfig {
+    /// 插值后的角色原始设定（`{user_nickname}` → 用户昵称）
+    ///
+    /// 系统提示词（对话链路）与任务模式的人设块都走这一个入口：变量表只有一份，
+    /// 将来新增占位符不会出现"对话里换了、任务模式里没换"这种漏改。
+    pub fn rendered_system_prompt(&self, user_nickname: &str) -> String {
+        self.system_prompt.replace("{user_nickname}", user_nickname)
+    }
+
     /// 按钮/空状态用的短名
     ///
     /// 优先级：显式 `short_name` → `name` 去掉括号注释（"此方（こなた）" → "此方"）→ `name`

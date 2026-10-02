@@ -88,10 +88,7 @@ impl PersonaEngine {
             .or_else(|| self.default_persona())
             .ok_or_else(|| anyhow::anyhow!("人格引擎为空，无法构建系统提示词"))?;
 
-        let mut prompt = persona.system_prompt.clone();
-
-        // 变量插值
-        prompt = prompt.replace("{user_nickname}", user_nickname);
+        let mut prompt = persona.rendered_system_prompt(user_nickname);
 
         // 注入用户信息
         if let Some(user) = user_info {
@@ -176,6 +173,21 @@ mod tests {
         assert!(
             prompt.contains("此方"),
             "回退后应使用内置默认人格的提示词"
+        );
+    }
+
+    /// `{user_nickname}` 必须被插值：任务模式的人设块与对话链路共用同一处实现
+    #[test]
+    fn system_prompt_interpolates_user_nickname() {
+        let engine = PersonaEngine::new().expect("engine");
+        let prompt = engine
+            .build_system_prompt(super::super::types::DEFAULT_PERSONA_ID, "阿宅", None)
+            .expect("prompt");
+
+        assert!(prompt.contains("你称呼用户为\"阿宅\""), "{prompt}");
+        assert!(
+            !prompt.contains("{user_nickname}"),
+            "占位符不得残留：{prompt}"
         );
     }
 
