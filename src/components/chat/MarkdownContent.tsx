@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { copyText } from "../../utils/clipboard";
+import { useUiStore } from "../../stores/uiStore";
 
 /**
  * 外链渲染：交给系统默认浏览器打开
@@ -47,7 +48,12 @@ function CopyablePre({ children, className }: HTMLAttributes<HTMLPreElement>) {
   const handleCopy = async () => {
     const text = preRef.current?.innerText ?? "";
     if (!text) return;
-    await copyText(text);
+    const ok = await copyText(text);
+    if (!ok) {
+      // 复制失败却显示"已复制"会让用户粘贴出空内容
+      useUiStore.getState().pushToast("复制失败：剪贴板不可用", "error");
+      return;
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };

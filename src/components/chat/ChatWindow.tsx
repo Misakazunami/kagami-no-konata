@@ -2,6 +2,9 @@ import { useEffect, useMemo, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useChatStore, type Session } from "../../stores/chatStore";
+import { useUiStore } from "../../stores/uiStore";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { MessageList } from "./MessageList";
 import { InputBox } from "./InputBox";
 import { NotesPanel } from "./NotesPanel";
@@ -11,6 +14,21 @@ import { TaskStatusBar } from "./TaskStatusBar";
 import type { WorkspaceView } from "../../types/tools";
 import { copyText } from "../../utils/clipboard";
 import { buildConversationMarkdown } from "../../utils/exportConversation";
+import {
+  IconAlert,
+  IconCheck,
+  IconClipboardList,
+  IconCopy,
+  IconExpand,
+  IconMinimize,
+  IconMoon,
+  IconPlus,
+  IconSettings,
+  IconSparkles,
+  IconSun,
+  IconX,
+  IconZap,
+} from "../icons";
 import {
   DEFAULT_PERSONA_ID,
   FALLBACK_SHORT_NAME,
@@ -65,8 +83,16 @@ export function ChatWindow() {
   const createSession = useChatStore((s) => s.createSession);
   const switchSession = useChatStore((s) => s.switchSession);
   const deleteSession = useChatStore((s) => s.deleteSession);
+  const sessionsStatus = useChatStore((s) => s.sessionsStatus);
   const renameSession = useChatStore((s) => s.renameSession);
   const setCurrentPage = useChatStore((s) => s.setCurrentPage);
+  /** 各会话仍在进行中的生成（侧栏"生成中"圆点） */
+  const backgroundStreams = useChatStore((s) => s.backgroundStreams);
+  const isStreaming = useChatStore((s) => s.isStreaming);
+  const pushToast = useUiStore((s) => s.pushToast);
+
+  // 待确认的删除会话（原生 confirm 样式不可控、文案也放不下影响范围提示）
+  const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
 
   // 人格列表
   const [personas, setPersonas] = useState<PersonaSummary[]>([]);
@@ -230,7 +256,11 @@ export function ChatWindow() {
   const handleCopyConversation = async () => {
     if (messages.length === 0) return;
     try {
-      await copyText(buildConversationMarkdown(currentSession, messages));
+      const ok = await copyText(buildConversationMarkdown(currentSession, messages));
+      if (!ok) {
+        pushToast("复制失败：剪贴板不可用", "error");
+        return;
+      }
       setConversationCopied(true);
       setTimeout(() => setConversationCopied(false), 2000);
     } catch (e) {
@@ -263,12 +293,11 @@ export function ChatWindow() {
     setIsDark(current !== "light");
   }, []);
 
-  // 创建任务弹窗：Esc 关闭 + 打开时聚焦（键盘用户不被困在背景里）
+  // 创建任务弹窗：焦点陷阱 + Esc 关闭 + 关闭后归还焦点（与其他弹窗同一套标准）
   const taskModalRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(taskModalRef, showTaskModal);
   useEffect(() => {
     if (!showTaskModal) return;
-    const previous = document.activeElement as HTMLElement | null;
-    taskModalRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -276,10 +305,7 @@ export function ChatWindow() {
       }
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      previous?.focus?.();
-    };
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, [showTaskModal]);
 
   return (
@@ -287,7 +313,9 @@ export function ChatWindow() {
       {/* 侧边栏 */}
       <div className="sidebar">
         <div className="sidebar-header">
-          <h2>✦ Kagami no Konata</h2>
+          <h2>
+            <IconSparkles /> Kagami no Konata
+          </h2>
           {/* 第一行：新建入口（两个按钮等宽，各自占一半，避免被侧边栏宽度挤破） */}
           <div className="new-session-controls">
             <button
@@ -295,14 +323,14 @@ export function ChatWindow() {
               onClick={() => createSession(undefined, selectedPersona, "chat")}
               title="创建普通聊天会话"
             >
-              + 对话
+              <IconPlus /> 对话
             </button>
             <button
               className="new-chat-btn task"
               onClick={openTaskModal}
               title="创建专业任务工程会话"
             >
-              ⚡ 任务
+              <IconZap /> 任务
             </button>
           </div>
           {/* 第二行：人设选择（单独一行，宽度不再与按钮抢空间） */}
@@ -313,6 +341,7 @@ export function ChatWindow() {
               value={selectedPersona}
               onChange={(e) => setSelectedPersona(e.target.value)}
               title="新建会话使用的人设"
+              aria-label="新建会话使用的人设"
             >
               {personas.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -330,57 +359,87 @@ export function ChatWindow() {
               </div>
               {items.map((s) => {
                 const personaName = personas.find((p) => p.id === s.persona_id)?.name;
+                // 本会话有一轮生成在跑（当前会话或后台会话都算）
+                const generating =
+                  s.id === currentSessionId ? isStreaming : s.id in backgroundStreams;
                 return (
                   <div
                     key={s.id}
                     className={`session-item ${s.id === currentSessionId ? "active" : ""}`}
-                    role="button"
-                    tabIndex={0}
-                    aria-current={s.id === currentSessionId ? "true" : undefined}
-                    onClick={() => {
-                      if (editingId !== s.id) switchSession(s.id);
-                    }}
-                    onKeyDown={(e) => {
-                      if (editingId === s.id) return;
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        switchSession(s.id);
-                      }
-                    }}
-                    onDoubleClick={(e) => startRename(s, e)}
                   >
-                    {editingId === s.id ? (
-                      <input
-                        ref={editRef}
-                        className="session-title-edit"
-                        value={editValue}
-                        onChange={(e) => setEditValue(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") commitRename();
-                          if (e.key === "Escape") cancelRename();
-                        }}
-                        onBlur={commitRename}
-                        onClick={(e) => e.stopPropagation()}
+                    {/*
+                      可点区与删除按钮是**兄弟**而不是嵌套：
+                      `role="button"` 里再放一个 <button> 是非法 ARIA 结构，
+                      读屏会把删除按钮并进条目一起朗读。
+                    */}
+                    <div
+                      className="session-item-main"
+                      role="button"
+                      tabIndex={0}
+                      aria-current={s.id === currentSessionId ? "true" : undefined}
+                      onClick={() => {
+                        if (editingId !== s.id) switchSession(s.id);
+                      }}
+                      onKeyDown={(e) => {
+                        if (editingId === s.id) return;
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          switchSession(s.id);
+                        }
+                      }}
+                      onDoubleClick={(e) => startRename(s, e)}
+                    >
+                      {editingId === s.id ? (
+                        <input
+                          ref={editRef}
+                          className="session-title-edit"
+                          value={editValue}
+                          aria-label="会话标题"
+                          onChange={(e) => setEditValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitRename();
+                            if (e.key === "Escape") cancelRename();
+                          }}
+                          onBlur={commitRename}
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                      ) : (
+                        <div className="session-title-wrap">
+                          {s.session_type === "task" && (
+                            <span
+                              className={`session-type-badge ${s.task_mode === "work" ? "work" : "plan"}`}
+                              title={
+                                s.task_mode === "work"
+                                  ? "任务会话 · 执行模式（Work）"
+                                  : "任务会话 · 规划模式（Plan）"
+                              }
+                            >
+                              {s.task_mode === "work" ? (
+                                <>
+                                  <IconZap />任务
+                                </>
+                              ) : (
+                                <>
+                                  <IconClipboardList />任务
+                                </>
+                              )}
+                            </span>
+                          )}
+                          <span className="session-title">{s.title}</span>
+                          {personaName && s.persona_id !== DEFAULT_PERSONA_ID && (
+                            <span className="session-persona-tag">{personaName}</span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    {/* 切走后仍在生成的会话必须看得见，否则那一轮既无人盯也无人能停 */}
+                    {generating && (
+                      <span
+                        className="session-streaming-dot"
+                        role="status"
+                        aria-label="该会话正在生成回复"
+                        title="正在生成回复…"
                       />
-                    ) : (
-                      <div className="session-title-wrap">
-                        {s.session_type === "task" && (
-                          <span
-                            className={`session-type-badge ${s.task_mode === "work" ? "work" : "plan"}`}
-                            title={
-                              s.task_mode === "work"
-                                ? "任务会话 · 执行模式（Work）"
-                                : "任务会话 · 规划模式（Plan）"
-                            }
-                          >
-                            {s.task_mode === "work" ? "⚡任务" : "📋任务"}
-                          </span>
-                        )}
-                        <span className="session-title">{s.title}</span>
-                        {personaName && s.persona_id !== DEFAULT_PERSONA_ID && (
-                          <span className="session-persona-tag">{personaName}</span>
-                        )}
-                      </div>
                     )}
                     <button
                       className="session-delete"
@@ -388,20 +447,34 @@ export function ChatWindow() {
                       title="删除会话"
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (confirm(`确认删除会话「${s.title}」？`)) {
-                          deleteSession(s.id);
-                        }
+                        setDeleteTarget(s);
                       }}
                     >
-                      ×
+                      <IconX />
                     </button>
                   </div>
                 );
               })}
             </div>
           ))}
-          {sessions.length === 0 && (
-            <div className="session-empty">暂无会话</div>
+          {sessionsStatus === "loading" && sessions.length === 0 && (
+            <div className="session-empty" role="status">
+              正在加载会话…
+            </div>
+          )}
+          {sessionsStatus === "error" && sessions.length === 0 && (
+            <div className="session-empty">
+              会话列表加载失败
+              <button
+                className="session-retry"
+                onClick={() => void useChatStore.getState().loadSessions()}
+              >
+                重试
+              </button>
+            </div>
+          )}
+          {sessionsStatus === "ready" && sessions.length === 0 && (
+            <div className="session-empty">暂无会话，点上方按钮新建</div>
           )}
         </div>
         <div className="sidebar-footer">
@@ -410,13 +483,13 @@ export function ChatWindow() {
             onClick={toggleTheme}
             title={isDark ? "切换到亮色模式" : "切换到暗色模式"}
           >
-            {isDark ? "☀" : "🌙"}
+            {isDark ? <IconSun /> : <IconMoon />}
           </button>
           <button
             className="settings-btn"
             onClick={() => setCurrentPage("settings")}
           >
-            ⚙ 设置
+            <IconSettings /> 设置
           </button>
         </div>
       </div>
@@ -425,14 +498,46 @@ export function ChatWindow() {
       <div className="chat-main">
         {errorMessage && (
           <div className="chat-error-banner" role="alert">
-            <span className="chat-error-text">⚠ {errorMessage}</span>
-            <button
-              className="chat-error-close"
-              onClick={clearError}
-              title="关闭提示"
-            >
-              ×
-            </button>
+            <span className="chat-error-text">
+              <IconAlert /> {errorMessage}
+            </span>
+            <span className="chat-error-actions">
+              {/*
+                发送失败时原文已由 store 回填进输入框：这里把"下一步"说清楚，
+                用户不必盯着一行红字猜该怎么办。
+              */}
+              <button
+                className="chat-error-action"
+                onClick={() => {
+                  const el = document.querySelector<HTMLTextAreaElement>(
+                    ".input-box textarea"
+                  );
+                  el?.focus();
+                }}
+                title="定位到输入框（原文已填回，可直接修改后重发）"
+              >
+                修改重发
+              </button>
+              <button
+                className="chat-error-action"
+                onClick={() => {
+                  void copyText(errorMessage).then((ok) =>
+                    pushToast(ok ? "已复制错误详情" : "复制失败：剪贴板不可用", ok ? "success" : "error")
+                  );
+                }}
+                title="复制错误详情"
+              >
+                复制
+              </button>
+              <button
+                className="chat-error-close"
+                onClick={clearError}
+                title="关闭提示"
+                aria-label="关闭错误提示"
+              >
+                <IconX />
+              </button>
+            </span>
           </div>
         )}
         {currentSessionId ? (
@@ -442,20 +547,29 @@ export function ChatWindow() {
               <TaskStatusBar />
               <div className="chat-header-actions">
                 <button
-                  className="header-action-btn"
+                  className={`header-action-btn icon-only${conversationCopied ? " done" : ""}`}
                   onClick={handleCopyConversation}
                   disabled={messages.length === 0}
-                  title="把整个会话复制为 Markdown"
+                  aria-label="复制对话"
+                  title={conversationCopied ? "已复制为 Markdown" : "把整个会话复制为 Markdown"}
                 >
-                  {conversationCopied ? "✓ 已复制" : "⧉ 复制对话"}
+                  {conversationCopied ? <IconCheck /> : <IconCopy />}
                 </button>
-                <button className="header-action-btn" onClick={handleSwitchToFloat} title="切换到悬浮窗">
-                  ↗ 切换
+                <button
+                  className="header-action-btn icon-only"
+                  onClick={handleSwitchToFloat}
+                  aria-label="切换到悬浮窗"
+                  title="切换到悬浮窗（隐藏主窗口）"
+                >
+                  <IconExpand />
                 </button>
-                <button className="header-action-btn" onClick={handleToggleFloat} title={floatVisible ? "关闭悬浮窗" : "打开悬浮窗"}>
-                  {floatVisible
-                    ? `↙ 召回${currentPersonaShortName}`
-                    : `↗ 召唤${currentPersonaShortName}`}
+                <button
+                  className="header-action-btn icon-only"
+                  onClick={handleToggleFloat}
+                  aria-label={floatVisible ? `召回${currentPersonaShortName}` : `召唤${currentPersonaShortName}`}
+                  title={floatVisible ? "关闭悬浮窗" : "打开悬浮窗"}
+                >
+                  {floatVisible ? <IconMinimize /> : <IconSparkles />}
                 </button>
               </div>
             </div>
@@ -468,7 +582,9 @@ export function ChatWindow() {
           </>
         ) : (
           <div className="no-session">
-            <div className="no-session-icon">✦</div>
+            <div className="no-session-icon">
+              <IconSparkles />
+            </div>
             <h2>Kagami no Konata</h2>
             <p>正在准备今日会话...</p>
           </div>
@@ -487,7 +603,9 @@ export function ChatWindow() {
             aria-label="创建任务会话"
             onClick={(e) => e.stopPropagation()}
           >
-            <h3>⚡ 创建任务会话</h3>
+            <h3>
+              <IconZap /> 创建任务会话
+            </h3>
 
             <label>
               <span>执行工作区</span>
@@ -511,6 +629,7 @@ export function ChatWindow() {
                 <input
                   type="text"
                   placeholder="绝对路径，例如 /home/me/project 或 D:\project"
+                  aria-label="自定义项目绝对路径"
                   value={customPath}
                   onChange={(e) => setCustomPath(e.target.value)}
                 />
@@ -519,6 +638,7 @@ export function ChatWindow() {
                 <input
                   type="text"
                   placeholder="标签（可选）"
+                  aria-label="工作区标签（可选）"
                   value={customLabel}
                   onChange={(e) => setCustomLabel(e.target.value)}
                 />
@@ -545,7 +665,7 @@ export function ChatWindow() {
                   aria-pressed={newTaskMode === "plan"}
                   onClick={() => setNewTaskMode("plan")}
                 >
-                  📋 规划 (Plan)
+                  <IconClipboardList /> 规划 (Plan)
                 </button>
                 <button
                   type="button"
@@ -553,7 +673,7 @@ export function ChatWindow() {
                   aria-pressed={newTaskMode === "work"}
                   onClick={() => setNewTaskMode("work")}
                 >
-                  ⚡ 执行 (Work)
+                  <IconZap /> 执行 (Work)
                 </button>
               </div>
               <div className="task-modal-hint">
@@ -580,7 +700,7 @@ export function ChatWindow() {
 
             {taskModalError && (
               <div className="task-modal-error" role="alert">
-                ⚠ {taskModalError}
+                <IconAlert /> {taskModalError}
               </div>
             )}
 
@@ -603,6 +723,26 @@ export function ChatWindow() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* 删除会话确认：给出影响范围，并说明会话类型（任务会话的计划/笔记一并消失） */}
+      {deleteTarget && (
+        <ConfirmDialog
+          title="确认删除会话"
+          description={
+            <>
+              将删除会话「{deleteTarget.title}」
+              {deleteTarget.session_type === "task"
+                ? "（任务会话，计划与工作记忆一并删除）"
+                : ""}
+              ，且无法恢复。
+            </>
+          }
+          confirmLabel="确认删除"
+          danger
+          onConfirm={() => deleteSession(deleteTarget.id)}
+          onClose={() => setDeleteTarget(null)}
+        />
       )}
     </div>
   );

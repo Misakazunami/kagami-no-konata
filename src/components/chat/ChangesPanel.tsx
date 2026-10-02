@@ -9,6 +9,7 @@ import type {
 } from "../../types/events";
 import type { ToolInvocation } from "../../types/tools";
 import { copyText } from "../../utils/clipboard";
+import { IconCheck, IconChevronRight, IconFileText, IconX } from "../icons";
 
 /**
  * 改动与产物面板
@@ -104,7 +105,11 @@ export function ChangesPanel() {
         history,
         invocations,
       });
-      await copyText(text);
+      const ok = await copyText(text);
+      if (!ok) {
+        setHistoryNotice("复制失败：剪贴板不可用");
+        return;
+      }
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (e) {
@@ -117,7 +122,7 @@ export function ChangesPanel() {
   if (!currentSessionId || !hasAnything) return null;
 
   return (
-    <div className="changes-panel">
+    <div className="changes-panel panel">
       {snapshot && (
         <SnapshotBannerView
           snapshot={snapshot}
@@ -138,8 +143,9 @@ export function ChangesPanel() {
             className="snapshot-dismiss-btn"
             onClick={dismissSnapshot}
             title="知道了"
+            aria-label="知道了，关闭提示"
           >
-            ✕
+            <IconX />
           </button>
         </div>
       )}
@@ -151,15 +157,23 @@ export function ChangesPanel() {
           aria-expanded={historyOpen}
           title={historyOpen ? "收起改动记录" : "查看整个会话的改动记录"}
         >
-          🧷 改动记录{history.length > 0 ? ` (${history.length})` : ""}
-          <span className={`plan-arrow ${historyOpen ? "expanded" : ""}`}>▶</span>
+          <IconFileText /> 改动记录{history.length > 0 ? ` (${history.length})` : ""}
+          <span className={`panel-arrow ${historyOpen ? "expanded" : ""}`}>
+            <IconChevronRight />
+          </span>
         </button>
         <button
           className="changes-report-btn"
           onClick={copyReport}
           title="把计划进度、改动文件与执行过的验证命令整理成 Markdown 复制"
         >
-          {copied ? "已复制 ✓" : "复制任务报告"}
+          {copied ? (
+            <>
+              <IconCheck /> 已复制
+            </>
+          ) : (
+            "复制任务报告"
+          )}
         </button>
       </div>
 
@@ -195,9 +209,9 @@ export function ChangesPanel() {
                   {stream.files.length} 个文件 · {formatBackupSize(stream.total_bytes)}
                 </span>
                 <span
-                  className={`plan-arrow ${expandedStream === stream.stream_id ? "expanded" : ""}`}
+                  className={`panel-arrow ${expandedStream === stream.stream_id ? "expanded" : ""}`}
                 >
-                  ▶
+                  <IconChevronRight />
                 </span>
               </button>
               {expandedStream === stream.stream_id && (

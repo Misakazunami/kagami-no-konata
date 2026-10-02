@@ -7,6 +7,7 @@ import { FloatingClock } from "./FloatingClock";
 import { usePoke, type PokePersona } from "./usePoke";
 import type { PersonaSummary } from "../../types/persona";
 import { STREAM_EVENT, isSameStream, type StreamEventData } from "../../types/events";
+import { IconExpand, IconSend, IconX } from "../icons";
 
 interface FloatConfig {
   show_float_clock?: boolean;
@@ -249,7 +250,16 @@ export function FloatingWidget() {
           className="pet-inline-bubble"
           // 手动关闭：把"自动隐藏"设为 0 时气泡不会自己消失，
           // 没有这个入口它会永久盖住桌宠
+          role="button"
+          tabIndex={0}
+          aria-label="关闭气泡"
           onClick={() => setShowBubble(false)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setShowBubble(false);
+            }
+          }}
           title="点击关闭气泡"
         >
           <div className="bubble-text">
@@ -316,6 +326,7 @@ export function FloatingWidget() {
       <div className="pet-input-bar">
         <textarea
           value={input}
+          aria-label="消息输入框"
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           onFocus={() => {
@@ -344,15 +355,23 @@ export function FloatingWidget() {
           disabled={isSending}
           rows={1}
         />
-        <button onClick={handleSend} disabled={isSending || !input.trim()} style={{ color: '#0047AB' }}>
-          ➤
+        <button
+          onClick={handleSend}
+          disabled={isSending || !input.trim()}
+          aria-label="发送消息"
+        >
+          <IconSend />
         </button>
       </div>
 
       {/* 控制按钮 */}
       <div className="pet-controls-mini">
-        <button className="pet-ctrl-btn" onClick={() => invoke("show_main_window")} title="展开主窗口">⧉</button>
-        <button className="pet-ctrl-btn" onClick={() => invoke("hide_float_window")} title="隐藏桌宠">×</button>
+        <button className="pet-ctrl-btn" onClick={() => invoke("show_main_window")} title="展开主窗口">
+          <IconExpand />
+        </button>
+        <button className="pet-ctrl-btn" onClick={() => invoke("hide_float_window")} title="隐藏桌宠">
+          <IconX />
+        </button>
       </div>
     </div>
   );

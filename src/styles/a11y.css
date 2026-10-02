@@ -1,0 +1,171 @@
+/* ===== 全局可访问性与动效：焦点环、出现动画、动效降级 ===== */
+/* 由 App.css 按原顺序拆分而来：文件顺序即级联顺序，调整顺序会影响同权重覆盖 */
+
+/* ===== 全局可访问性与动效 ===== */
+/*
+ * 焦点环：键盘用户必须能看见焦点。放在文件末尾，保证在同权重选择器
+ * （如 .new-chat-btn）之后生效；输入类控件自带 focus 边框，不在此列。
+ */
+button:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 弹窗与面板的出现动画：条件渲染的节点没有过渡，用 keyframes 补上 */
+@keyframes overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes card-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes panel-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+.modal-overlay {
+  animation: overlay-in 0.15s ease-out;
+}
+
+.modal-overlay .modal-card {
+  animation: card-in 0.18s ease-out;
+}
+
+.plan-panel,
+.notes-panel,
+.changes-panel,
+.snapshot-banner {
+  animation: panel-in 0.18s ease-out;
+}
+
+/* ===== 全局 toast（一次性反馈：保存成功、复制失败……） ===== */
+.toast-viewport {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(480px, calc(100vw - 24px));
+  pointer-events: none;
+}
+
+.toast-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  font-size: var(--fs-md);
+  color: var(--text-primary);
+  pointer-events: auto;
+  animation: card-in 0.18s ease-out;
+}
+
+.toast-item.toast-success { border-left-color: var(--success); }
+.toast-item.toast-error { border-left-color: var(--danger); }
+
+.toast-icon {
+  flex-shrink: 0;
+  line-height: 1.5;
+}
+.toast-success .toast-icon { color: var(--success); }
+.toast-error .toast-icon { color: var(--danger); }
+.toast-info .toast-icon { color: var(--accent); }
+
+.toast-text {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.toast-close {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--fs-lg);
+  line-height: 1.2;
+  padding: 0 2px;
+  cursor: pointer;
+}
+.toast-close:hover { color: var(--text-primary); }
+
+/* ===== 渲染崩溃兜底（AppErrorBoundary） ===== */
+.crash-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.crash-card {
+  max-width: 560px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2xl);
+  padding: 24px;
+  box-shadow: var(--shadow-lg);
+}
+
+.crash-card h1 {
+  color: var(--danger);
+  font-size: var(--fs-2xl);
+  margin-bottom: 8px;
+}
+
+.crash-card p {
+  color: var(--text-secondary);
+  font-size: var(--fs-base);
+  margin-bottom: 12px;
+}
+
+.crash-detail {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  font-family: var(--tool-mono);
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: 16px;
+}
+
+.crash-actions {
+  display: flex;
+  gap: 12px;
+}
+.crash-actions button { flex: 1; }
+
+
+/*
+ * 动效降级：全站统一关闭动画与过渡。
+ * 只保留极短时长而非 none，确保 transitionend/animationend 依赖逻辑不悬挂。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

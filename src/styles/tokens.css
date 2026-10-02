@@ -1,0 +1,110 @@
+/* ===== 设计令牌：全局重置、暗/亮主题变量、字体与圆角/阴影/动效阶梯 ===== */
+/* 由 App.css 按原顺序拆分而来：文件顺序即级联顺序，调整顺序会影响同权重覆盖 */
+
+/* ===== 全局重置 ===== */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  /* ── 色板 · 暗色（默认，Tokyo Night）──
+   * 对比度均按 WCAG 复算过：正文/次要对主背景与次背景均 >= 4.5:1 */
+  --bg-primary: #1a1b26;
+  --bg-secondary: #24283b;
+  --bg-tertiary: #2f3348;
+  --text-primary: #c0caf5;
+  --text-secondary: #a9b1d6;
+  --text-muted: #939cc9;
+  --accent: #bb9af7;
+  --accent-hover: #9d7cd8;
+  --on-accent: #1a1b26;
+  --user-bubble: #7aa2f7;
+  --on-user-bubble: #1a1b26;
+  --assistant-bubble: #2f3348;
+  --border: #3b4261;
+  --danger: #f7768e;
+  --on-danger: #1a1b26;
+  --success: #9ece6a;
+  --on-success: #1a1b26;
+  /* 工具语义色（计划/笔记/改动面板、工具卡片、审批弹窗共用） */
+  --tool-warn: #e0af68;
+  --tool-ok: #9ece6a;
+  --tool-ok-bg: rgba(158, 206, 106, 0.14);
+  --tool-error-bg: rgba(247, 118, 142, 0.14);
+  --tool-warn-bg: rgba(224, 175, 104, 0.16);
+  --tool-running-bg: rgba(187, 154, 247, 0.12);
+  --tool-mono: ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+  /*
+   * ── 字体阶梯（rem）──
+   * 基准 1rem = 14px。全部字号都用 rem，设置页的"字号"才能整体缩放界面；
+   * 默认 14px 下这些值与原先的 px 渲染完全一致。
+   */
+  --fs-2xs: 0.714rem;  /* 10px */
+  --fs-xs: 0.786rem;   /* 11px */
+  --fs-sm: 0.857rem;   /* 12px */
+  --fs-md: 0.929rem;   /* 13px */
+  --fs-base: 1rem;     /* 14px */
+  --fs-lg: 1.143rem;   /* 16px */
+  --fs-xl: 1.286rem;   /* 18px */
+  --fs-2xl: 1.429rem;  /* 20px */
+  /* ── 圆角 ── */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+  --radius-pill: 999px;
+  /* ── 阴影 ── */
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+  /* ── 动效 ── */
+  --dur-fast: 0.15s;
+  --dur-base: 0.2s;
+  --ease-out: ease-out;
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  /* 根字号必须是绝对值：它是所有 rem 的换算基准（1rem = 14px），
+   * 运行时由 applyTheme 按用户设置覆盖；写成 1rem 会变成浏览器默认 16px */
+  font-size: 14px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+}
+
+/* ===== 亮色主题 ===== */
+[data-theme="light"] {
+  --bg-primary: #f5f5f7;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e8e8ed;
+  --text-primary: #1d1d1f;
+  --text-secondary: #6e6e73;
+  --text-muted: #6e6e73;
+  --accent: #7c3aed;
+  --accent-hover: #6d28d9;
+  --on-accent: #ffffff;
+  --user-bubble: #7c3aed;
+  --on-user-bubble: #ffffff;
+  --assistant-bubble: #f0f0f5;
+  --border: #d2d2d7;
+  --danger: #d92d20;
+  --on-danger: #ffffff;
+  --success: #22c55e;
+  --on-success: #1a1b26;
+  --tool-warn: #b45309;
+  --tool-ok: #15803d;
+  --tool-ok-bg: rgba(34, 197, 94, 0.12);
+  --tool-error-bg: rgba(239, 68, 68, 0.1);
+  --tool-warn-bg: rgba(180, 83, 9, 0.1);
+  --tool-running-bg: rgba(124, 58, 237, 0.1);
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+.app {
+  height: 100%;
+}

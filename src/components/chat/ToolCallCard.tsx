@@ -1,32 +1,46 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import {
   TOOL_STATUS_LABEL,
   formatToolDuration,
   type ToolCallView,
 } from "../../types/tools";
+import {
+  IconBrain,
+  IconCheck,
+  IconChevronRight,
+  IconFileText,
+  IconGlobe,
+  IconPencil,
+  IconSearch,
+  IconTerminal,
+  IconTrash,
+  IconWrench,
+  IconX,
+  type IconProps,
+} from "../icons";
 
 /**
  * 工具图标
  *
- * 纯装饰：按工具名关键字猜一个 emoji，猜不到就用通用图标，
+ * 纯装饰：按工具名关键字猜一个图标，猜不到就用通用图标，
  * 不依赖后端返回任何图标字段。
  */
-const ICON_RULES: Array<[RegExp, string]> = [
-  [/read|read_file|cat|open/, "📄"],
-  [/write|edit|patch|create|mkdir/, "✍"],
-  [/list|glob|search|grep|find/, "🔍"],
-  [/run|exec|shell|command|bash|terminal/, "⌨"],
-  [/http|fetch|web|url|download/, "🌐"],
-  [/memory|recall|remember/, "🧠"],
-  [/delete|remove|rm/, "🗑"],
+const ICON_RULES: Array<[RegExp, ComponentType<IconProps>]> = [
+  [/read|read_file|cat|open/, IconFileText],
+  [/write|edit|patch|create|mkdir/, IconPencil],
+  [/list|glob|search|grep|find/, IconSearch],
+  [/run|exec|shell|command|bash|terminal/, IconTerminal],
+  [/http|fetch|web|url|download/, IconGlobe],
+  [/memory|recall|remember/, IconBrain],
+  [/delete|remove|rm/, IconTrash],
 ];
 
-function toolIcon(tool: string): string {
+function toolIcon(tool: string): ReactNode {
   const name = tool.toLowerCase();
-  for (const [pattern, icon] of ICON_RULES) {
-    if (pattern.test(name)) return icon;
+  for (const [pattern, Icon] of ICON_RULES) {
+    if (pattern.test(name)) return <Icon />;
   }
-  return "🔧";
+  return <IconWrench />;
 }
 
 interface Props {
@@ -114,7 +128,9 @@ export function ToolCallCard({ call }: Props) {
         )}
         {duration && <span className="tool-call-duration">{duration}</span>}
         {call.truncated && <span className="tool-call-truncated">已截断</span>}
-        <span className={`tool-call-arrow ${expanded ? "expanded" : ""}`}>▶</span>
+        <span className={`tool-call-arrow ${expanded ? "expanded" : ""}`}>
+          <IconChevronRight />
+        </span>
       </button>
 
       {expanded && (
@@ -122,40 +138,35 @@ export function ToolCallCard({ call }: Props) {
           {call.subagentTasks && call.subagentTasks.length > 0 && (
             <div className="tool-call-section">
               <span className="tool-call-section-title">子代理并行状态</span>
-              <div style={{ display: "flex", flexDirection: "column", gap: "4px", marginTop: "4px" }}>
+              <div className="subagent-tasks">
                 {call.subagentTasks.map((task) => {
-                  const statusMap: Record<string, { label: string; color: string }> = {
-                    queued: { label: "排队中", color: "var(--text-muted, #888)" },
-                    running: { label: "● 运行中", color: "var(--accent, #3b82f6)" },
-                    done: { label: "✓ 已完成", color: "#10b981" },
-                    error: { label: "✗ 失败", color: "#ef4444" },
-                    cancelled: { label: "已取消", color: "#f59e0b" },
-                    skipped: { label: "超额跳过", color: "#6b7280" },
+                  const statusMap: Record<string, ReactNode> = {
+                    queued: "排队中",
+                    running: "运行中",
+                    done: (
+                      <>
+                        <IconCheck /> 已完成
+                      </>
+                    ),
+                    error: (
+                      <>
+                        <IconX /> 失败
+                      </>
+                    ),
+                    cancelled: "已取消",
+                    skipped: "超额跳过",
                   };
-                  const meta = statusMap[task.status] ?? { label: task.status, color: "#888" };
+                  const label = statusMap[task.status] ?? task.status;
                   // 跳过原因（名额不足 / 时间预算不足）比笼统的"超额跳过"更准确
-                  const label =
-                    task.status === "skipped" && task.reason ? task.reason : meta.label;
+                  const detail =
+                    task.status === "skipped" && task.reason ? task.reason : label;
                   return (
-                    <div
-                      key={task.taskId}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        fontSize: "0.82rem",
-                        padding: "4px 8px",
-                        background: "rgba(0,0,0,0.15)",
-                        borderRadius: "4px",
-                      }}
-                    >
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "70%" }}>
-                        {task.goalPreview}
-                      </span>
-                      <span style={{ color: meta.color, fontSize: "0.75rem", fontWeight: 500 }}>
+                    <div key={task.taskId} className="subagent-task">
+                      <span className="subagent-task-goal">{task.goalPreview}</span>
+                      <span className={`subagent-task-status ${task.status}`}>
                         {/* 自动选择时如实标注这条子任务用的子模型 */}
                         {task.model ? `${task.model} · ` : ""}
-                        {label}
+                        {detail}
                         {task.durationMs ? ` (${(task.durationMs / 1000).toFixed(1)}s)` : ""}
                       </span>
                     </div>

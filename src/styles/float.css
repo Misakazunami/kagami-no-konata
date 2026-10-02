@@ -1,0 +1,393 @@
+/* ===== 悬浮窗（桌面宠物） ===== */
+/* 由 App.css 按原顺序拆分而来：文件顺序即级联顺序，调整顺序会影响同权重覆盖 */
+
+/* ===== 桌面宠物 ===== */
+.float-app,
+.float-app html,
+.float-app body,
+html[data-window="float"],
+body[data-window="float"] {
+  background: transparent !important;
+  overflow: hidden !important;
+}
+
+.desktop-pet {
+  height: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: transparent;
+  position: relative;
+}
+
+/* 内嵌气泡（绝对定位，覆盖在 L2D 上方，不挤压输入框） */
+.pet-inline-bubble {
+  position: absolute;
+  top: 4px;
+  left: 5%;
+  right: 5%;
+  max-height: 80px;
+  overflow-y: auto;
+  padding: 6px 10px;
+  background: #1e2030;
+  border: 1px solid #3b4261;
+  border-radius: var(--radius-lg);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+  box-sizing: border-box;
+  z-index: 10;
+}
+
+.pet-inline-bubble .bubble-text {
+  font-size: 0.857rem;
+  line-height: 1.5;
+  color: #c0caf5;
+  word-break: break-word;
+}
+
+.pet-inline-bubble::-webkit-scrollbar {
+  width: 3px;
+}
+
+.pet-inline-bubble::-webkit-scrollbar-thumb {
+  background: #3b4261;
+  border-radius: 2px;
+}
+
+/* 悬浮时钟 */
+.float-clock {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 5;
+  padding: 3px 7px;
+  background: rgba(26, 27, 38, 0.7);
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+  user-select: none;
+  opacity: 0.8;
+
+}
+
+.float-clock-time {
+  font-size: 1.714rem;
+  font-weight: 800;
+  color: #c0caf5;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.float-clock-date {
+  font-size: 1rem;
+  color: #787c99;
+  line-height: 1.2;
+}
+
+/* 角色图片居中（占据主体） */
+.pet-image-wrap {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  width: 200px;
+  cursor: grab;
+  user-select: none;
+  position: relative;
+}
+
+.pet-image-wrap:active {
+  cursor: grabbing;
+}
+
+/* 输入栏（L2D 下方，常驻显示） */
+.pet-input-bar {
+  width: 100%;
+  height: 35px;
+  display: flex;
+  gap: 4px;
+  padding: 2px 8px 4px;
+  box-sizing: border-box;
+  flex-shrink: 0;
+}
+
+.pet-input-bar textarea {
+  flex: 1;
+  resize: none;
+  border: 1px solid rgba(59, 66, 97, 0.6);
+  border-radius: var(--radius-md);
+  padding: 4px 8px;
+  font-size: 0.857rem;
+  line-height: 1.4;
+  background: rgba(36, 40, 59, 0.9);
+  color: #c0caf5;
+  outline: none;
+  font-family: inherit;
+}
+
+.pet-input-bar textarea:focus {
+  border-color: #7aa2f7;
+}
+
+.pet-input-bar button {
+  background: rgba(0, 81, 255, 0.9);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 1.143rem;
+  cursor: pointer;
+  padding: 0 6px;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.pet-input-bar button:hover:not(:disabled) {
+  opacity: 1;
+}
+
+.pet-input-bar button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 控制按钮（叠加在宠物右上角） */
+.pet-controls-mini {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 6px;
+  z-index: 10;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.desktop-pet:hover .pet-controls-mini,
+.desktop-pet.hovered .pet-controls-mini,
+/* 键盘 Tab 进控制按钮时也必须看得见（opacity:0 仍可聚焦，只是隐形） */
+.desktop-pet:focus-within .pet-controls-mini {
+  opacity: 1;
+}
+
+/* 气泡（仅用于独立气泡窗口内的样式覆盖） */
+.pet-bubble {
+  position: absolute;
+  top: 8px;
+  left: 0;
+  right: 0;
+  margin: 0 auto;
+  z-index: 10;
+  width: fit-content;
+  max-width: 200px;
+  padding: 10px 14px;
+  background: #1e2030;
+  border: 1px solid #3b4261;
+  border-radius: 14px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  opacity: 0;
+  transform: translateY(8px) scale(0.95);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+  max-height: 0;
+  overflow: hidden;
+}
+
+.pet-bubble.visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.pet-bubble.visible::-webkit-scrollbar {
+  width: 4px;
+}
+
+.pet-bubble.visible::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pet-bubble.visible::-webkit-scrollbar-thumb {
+  background: #3b4261;
+  border-radius: 2px;
+}
+
+.bubble-content {
+  font-size: 0.929rem;
+  line-height: 1.7;
+  color: #c0caf5;
+  word-break: break-word;
+}
+
+.pet-bubble::after {
+  content: "";
+  position: absolute;
+  bottom: -7px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top: 7px solid #1e2030;
+}
+
+/* Live2D Canvas */
+.pet-image-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.pet-image {
+  width: 130px;
+  height: auto;
+  pointer-events: none;
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.4));
+}
+
+/* 底部面板（默认隐藏，hover 时显示） */
+.pet-panel {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+  max-height: 0;
+  overflow: hidden;
+}
+
+.pet-panel.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+  max-height: 100px;
+}
+
+/* 气泡独立窗口容器（仅消息） */
+.float-bubble-window {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  padding: 8px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.bubble-message-area {
+  width: 100%;
+  max-height: 100%;
+  padding: 10px 12px;
+  background: #1e2030;
+  border: 1px solid #3b4261;
+  border-radius: 14px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  font-size: 0.929rem;
+  line-height: 1.7;
+  color: #c0caf5;
+  overflow-y: auto;
+  box-sizing: border-box;
+  word-break: break-word;
+}
+
+.bubble-message-area::-webkit-scrollbar {
+  width: 4px;
+}
+
+.bubble-message-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.bubble-message-area::-webkit-scrollbar-thumb {
+  background: #3b4261;
+  border-radius: 2px;
+}
+
+/* 输入框 */
+.pet-input {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(36, 40, 59, 0.95);
+  border: 1px solid rgba(59, 66, 97, 0.6);
+  border-radius: var(--radius-lg);
+}
+
+.pet-input textarea {
+  flex: 1;
+  padding: 5px 8px;
+  background: transparent;
+  color: #e0e0e0;
+  border: none;
+  font-size: 0.857rem;
+  font-family: inherit;
+  resize: none;
+  outline: none;
+  max-height: 50px;
+  line-height: 1.4;
+}
+
+.pet-input textarea::placeholder {
+  color: #666;
+}
+
+.pet-input button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: var(--accent);
+  color: var(--on-accent);
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 0.857rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.pet-input button:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.pet-input button:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* 控件按钮 */
+.pet-controls {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+}
+
+.pet-ctrl-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: rgba(36, 40, 59, 0.85);
+  color: var(--text-muted);
+  border: 1px solid rgba(59, 66, 97, 0.5);
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 0.786rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+
+.pet-ctrl-btn:hover {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+}

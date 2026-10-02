@@ -1,4 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
+import { IconZap } from "../icons";
 
 interface AutoApproveConfirmProps {
   open: boolean;
@@ -21,6 +23,10 @@ export function AutoApproveConfirm({
   onConfirm,
   onCancel,
 }: AutoApproveConfirmProps) {
+  const cardRef = useRef<HTMLDivElement>(null);
+  // 焦点默认落在「取消」：与工具审批弹窗"最安全的动作先聚焦"保持一致
+  useFocusTrap(cardRef, open, { initialFocusSelector: ".modal-cancel-btn" });
+
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -45,9 +51,13 @@ export function AutoApproveConfirm({
     >
       <div
         className="modal-card auto-approve-card"
+        ref={cardRef}
+        tabIndex={-1}
         onClick={(event) => event.stopPropagation()}
       >
-        <h3>⚡ 开启本会话 AUTO</h3>
+        <h3>
+          <IconZap /> 开启本会话 AUTO
+        </h3>
         <p className="auto-approve-lead">
           开启后，本任务会话内
           <strong>所有需要审批的工具调用将自动放行</strong>，不再弹窗：
@@ -69,7 +79,7 @@ export function AutoApproveConfirm({
         </p>
         <div className="modal-actions">
           {/* 焦点默认落在「取消」：与工具审批弹窗"最安全的动作先聚焦"保持一致 */}
-          <button className="modal-cancel-btn" onClick={onCancel} autoFocus>
+          <button className="modal-cancel-btn" onClick={onCancel}>
             取消
           </button>
           <button className="modal-confirm-btn danger" onClick={onConfirm}>

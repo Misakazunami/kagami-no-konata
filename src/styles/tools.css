@@ -1,0 +1,787 @@
+/* ===== 工具调用与审批：工具卡片、审批弹窗、设置页工具与工作区 ===== */
+/* 由 App.css 按原顺序拆分而来：文件顺序即级联顺序，调整顺序会影响同权重覆盖 */
+
+/* ===== 工具调用（tool harness）===== */
+/*
+ * 工具语义色与 --on-accent 已统一到文件顶部的 :root / [data-theme="light"]，
+ * 此处不再重复声明。
+ */
+
+/* ── 卡片列表 ── */
+.tool-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+/* 流式气泡里只有工具卡片、正文还没到达时的外框 */
+.message-bubble.tool-live-bubble {
+  padding: 8px 10px;
+  /* 工具参数/结果是等宽长文本，比普通气泡放宽一些 */
+  max-width: 85%;
+}
+
+.message-bubble.tool-live-bubble .tool-call-list {
+  margin-bottom: 0;
+}
+
+/* ── 单条工具调用卡片 ── */
+.tool-call-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-primary);
+  overflow: hidden;
+  font-size: 0.857rem;
+}
+
+.tool-call-card.running {
+  border-color: var(--accent);
+}
+
+.tool-call-card.error,
+.tool-call-card.denied,
+.tool-call-card.cancelled,
+.tool-call-card.timeout {
+  border-color: var(--danger);
+}
+
+.tool-call-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.857rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.tool-call-head:hover {
+  background: var(--bg-tertiary);
+}
+
+.tool-call-icon {
+  flex-shrink: 0;
+  font-size: 0.929rem;
+}
+
+.tool-call-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 本次生成里的步数（第 N 步 / N/M）：让长任务能看到工具预算消耗 */
+.tool-call-step {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 0.714rem;
+  font-family: var(--tool-mono);
+}
+
+.tool-call-duration {
+  flex-shrink: 0;
+  font-size: 0.786rem;
+  color: var(--text-muted);
+  font-family: var(--tool-mono);
+}
+
+.tool-call-truncated {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  font-size: 0.714rem;
+  color: var(--tool-warn);
+  background: var(--tool-warn-bg);
+}
+
+.tool-call-arrow {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  transition: transform 0.2s;
+}
+
+.tool-call-arrow.expanded {
+  transform: rotate(90deg);
+}
+
+.tool-call-body {
+  padding: 0 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tool-call-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tool-call-section-title {
+  font-size: 0.786rem;
+  color: var(--text-muted);
+}
+
+/* 结果/参数一律按纯文本展示（不可信内容，不做 markdown 解析） */
+.tool-call-pre {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-family: var(--tool-mono);
+  font-size: 0.821rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-call-truncated-hint {
+  font-size: 0.75rem;
+  color: var(--tool-warn);
+}
+
+/*
+ * 执行中的实时输出
+ *
+ * 命令可以打印上千行：固定高度 + 内部滚动，卡片在流式期间不会不断变高，
+ * 也不会把消息列表顶得来回跳。
+ */
+.tool-call-live {
+  max-height: 160px;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+}
+
+/* 子代理活动计数：只读子代理的内部调用不单独成卡片，这里给一个总数 */
+.tool-call-subagents {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  background: var(--tool-running-bg);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+/* 展开后的子代理逐条状态（原先是一组内联样式，主题适配不了） */
+.subagent-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.subagent-task {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-xs);
+  font-size: 0.821rem;
+}
+
+.subagent-task-goal {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 70%;
+}
+
+.subagent-task-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.subagent-task-status.running { color: var(--accent); }
+.subagent-task-status.done { color: var(--tool-ok); }
+.subagent-task-status.error { color: var(--danger); }
+.subagent-task-status.cancelled { color: var(--tool-warn); }
+.subagent-task-status.queued,
+.subagent-task-status.skipped { color: var(--text-muted); }
+
+/* 折叠状态下的"最新一行输出"：给出实时感，但不撑开卡片 */
+.tool-call-live-tail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--tool-mono);
+  font-size: 0.786rem;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
+/* ── 状态胶囊 ── */
+.tool-status-chip {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  font-size: 0.786rem;
+  line-height: 1.6;
+}
+
+.tool-status-chip.running {
+  color: var(--accent);
+  background: var(--tool-running-bg);
+  border-color: var(--accent);
+  animation: tool-status-pulse 1.4s ease-in-out infinite;
+}
+
+.tool-status-chip.ok {
+  color: var(--success);
+  background: var(--tool-ok-bg);
+  border-color: var(--success);
+}
+
+.tool-status-chip.error {
+  color: var(--danger);
+  background: var(--tool-error-bg);
+  border-color: var(--danger);
+}
+
+.tool-status-chip.denied,
+.tool-status-chip.cancelled,
+.tool-status-chip.timeout {
+  color: var(--tool-warn);
+  background: var(--tool-warn-bg);
+  border-color: var(--tool-warn);
+}
+
+@keyframes tool-status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-status-chip.running {
+    animation: none;
+  }
+}
+
+/* ===== 工具审批弹窗 ===== */
+.tool-approval-overlay {
+  z-index: 1100;
+}
+
+.tool-approval-card {
+  display: flex;
+  flex-direction: column;
+  width: 480px;
+  max-width: 92vw;
+  max-height: 82vh;
+  padding: 20px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2xl);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.tool-approval-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 1.071rem;
+  color: var(--accent);
+}
+
+.tool-approval-icon {
+  font-size: 1.143rem;
+}
+
+.tool-approval-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.tool-approval-tool {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.tool-approval-risk,
+.tool-approval-permission {
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  font-size: 0.786rem;
+  color: var(--text-secondary);
+}
+
+.tool-approval-risk.low {
+  color: var(--success);
+  border-color: var(--success);
+  background: var(--tool-ok-bg);
+}
+
+.tool-approval-risk.medium {
+  color: var(--tool-warn);
+  border-color: var(--tool-warn);
+  background: var(--tool-warn-bg);
+}
+
+.tool-approval-risk.high {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--tool-error-bg);
+}
+
+.tool-approval-args-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+}
+
+.tool-approval-args-title {
+  font-size: 0.786rem;
+  color: var(--text-muted);
+}
+
+/* ── 审批摘要（工具自算的"将要执行什么"） ── */
+.tool-approval-summary-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+}
+
+.tool-approval-summary-title {
+  font-size: 0.786rem;
+  color: var(--text-muted);
+}
+
+.tool-approval-summary {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 180px;
+  overflow: auto;
+  background: var(--tool-running-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-family: var(--tool-mono);
+  font-size: 0.857rem;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 有摘要时参数退居次要：绝大多数用户只需要看摘要 */
+.tool-approval-summary-wrap + .tool-approval-args-wrap .tool-approval-args {
+  max-height: 120px;
+  font-size: 0.786rem;
+  color: var(--text-muted);
+}
+
+.tool-approval-args {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-family: var(--tool-mono);
+  font-size: 0.857rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-approval-countdown {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
+}
+
+.tool-approval-countdown-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.tool-approval-countdown-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s linear;
+}
+
+.tool-approval-countdown.urgent .tool-approval-countdown-fill {
+  background: var(--danger);
+}
+
+.tool-approval-countdown-text {
+  font-size: 0.786rem;
+  color: var(--text-muted);
+}
+
+.tool-approval-countdown.urgent .tool-approval-countdown-text {
+  color: var(--danger);
+}
+
+.tool-approval-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.tool-approval-btn {
+  flex: 1;
+  padding: 10px 8px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  font-family: inherit;
+  font-size: 0.929rem;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+}
+
+.tool-approval-btn.allow-once {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.tool-approval-btn.allow-once:hover {
+  background: var(--accent-hover);
+}
+
+.tool-approval-btn.allow-session {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.tool-approval-btn.allow-session:hover {
+  background: var(--border);
+}
+
+.tool-approval-btn.deny {
+  background: transparent;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.tool-approval-btn.deny:hover {
+  background: var(--tool-error-bg);
+}
+
+.tool-approval-hint {
+  margin-top: 10px;
+  font-size: 0.786rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* ===== 设置页：工具与工作区 ===== */
+.tool-list,
+.workspace-list {
+  margin: 4px 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.tool-list-empty {
+  padding: 12px;
+  font-size: 0.857rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.tool-item {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tool-item:last-child {
+  border-bottom: none;
+}
+
+.tool-item.disabled {
+  opacity: 0.55;
+}
+
+.tool-item-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tool-item-label {
+  font-size: 0.929rem;
+  font-weight: 500;
+}
+
+.tool-item-name {
+  font-family: var(--tool-mono);
+  font-size: 0.786rem;
+  color: var(--text-muted);
+}
+
+.tool-item-desc {
+  margin-top: 3px;
+  font-size: 0.821rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.tool-item-tag {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  font-size: 0.714rem;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+}
+
+.tool-item-tag.off {
+  color: var(--tool-warn);
+  background: var(--tool-warn-bg);
+}
+
+.tool-permission-badge {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border);
+  font-size: 0.714rem;
+  color: var(--text-secondary);
+}
+
+.tool-permission-badge.read {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.tool-permission-badge.write_app,
+.tool-permission-badge.write_fs {
+  color: var(--tool-warn);
+  border-color: var(--tool-warn);
+}
+
+.tool-permission-badge.execute,
+.tool-permission-badge.network {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.tool-subsection-title {
+  margin: 16px 0 6px;
+  font-size: 0.929rem;
+  color: var(--text-primary);
+}
+
+.workspace-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.workspace-item:last-child {
+  border-bottom: none;
+}
+
+.workspace-item.unavailable {
+  opacity: 0.7;
+}
+
+.workspace-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.workspace-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workspace-label {
+  font-size: 0.929rem;
+}
+
+.workspace-tag {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  font-size: 0.714rem;
+  color: var(--accent);
+  background: var(--tool-running-bg);
+}
+
+.workspace-path {
+  font-family: var(--tool-mono);
+  font-size: 0.786rem;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.workspace-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.workspace-availability {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  font-size: 0.714rem;
+}
+
+.workspace-availability.ok {
+  color: var(--success);
+  background: var(--tool-ok-bg);
+}
+
+.workspace-availability.bad {
+  color: var(--danger);
+  background: var(--tool-error-bg);
+}
+
+.workspace-writable-btn {
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.786rem;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+
+.workspace-writable-btn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--tool-running-bg);
+}
+
+.workspace-writable-btn:hover {
+  background: var(--border);
+}
+
+.workspace-remove-btn {
+  padding: 0 4px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.143rem;
+  cursor: pointer;
+}
+
+.workspace-remove-btn:hover {
+  color: var(--danger);
+}
+
+/* 添加工作区表单 */
+.workspace-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.settings-section .workspace-path-input {
+  flex: 3;
+  min-width: 0;
+  font-family: var(--tool-mono);
+  font-size: 0.857rem;
+}
+
+.settings-section .workspace-label-input {
+  flex: 1.2;
+  min-width: 0;
+}
+
+.settings-section .workspace-writable-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 0;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.settings-section .workspace-writable-check span {
+  min-width: 0;
+  font-size: 0.857rem;
+}
+
+.settings-section .workspace-writable-check input {
+  flex: none;
+  width: auto;
+  padding: 0;
+}
+
+.workspace-add-btn {
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-family: inherit;
+  font-size: 0.929rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.workspace-add-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.workspace-add-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.workspace-error {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--danger);
+  background: var(--tool-error-bg);
+  color: var(--danger);
+  font-size: 0.857rem;
+  line-height: 1.5;
+  word-break: break-word;
+}

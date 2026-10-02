@@ -1,7 +1,17 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import type { PlanItem } from "../../types/events";
-import { PLAN_STATUS_ICON, PLAN_STATUS_LABEL } from "../../types/tools";
+import { PLAN_STATUS_LABEL } from "../../types/tools";
+import type { PlanStatus } from "../../types/events";
+import {
+  IconAlert,
+  IconCheck,
+  IconChevronRight,
+  IconCircle,
+  IconClipboardList,
+  IconLoader,
+  IconX,
+} from "../icons";
 
 /**
  * 任务计划面板
@@ -43,6 +53,14 @@ export function PlanPanel() {
     />
   );
 }
+
+/** 状态图标：待办=空心圆、进行中=旋转指示、完成=对勾、受阻=警示 */
+const STATUS_ICON: Record<PlanStatus, ReactNode> = {
+  pending: <IconCircle />,
+  doing: <IconLoader />,
+  done: <IconCheck />,
+  blocked: <IconAlert />,
+};
 
 /** 展开时显示的一行摘要（未进行中时退化为"受阻原因 / 全部完成 / 下一项"） */
 export function planHeadline(plan: PlanItem[]): string {
@@ -132,26 +150,28 @@ export function PlanPanelView({
   };
 
   return (
-    <div className={`plan-panel ${blocked > 0 ? "has-blocked" : ""}`}>
+    <div className={`plan-panel panel ${blocked > 0 ? "has-blocked" : ""}`}>
       <button
-        className="plan-head"
+        className="plan-head panel-head"
         onClick={() => setExpanded((prev) => !prev)}
         aria-expanded={expanded}
         title={expanded ? "收起计划" : "展开计划"}
       >
-        <span className="plan-icon" aria-hidden="true">
-          🗒
+        <span className="plan-icon panel-icon" aria-hidden="true">
+          <IconClipboardList />
         </span>
-        <span className="plan-progress">
+        <span className="plan-progress chip">
           {done}/{plan.length}
         </span>
-        <span className="plan-headline">{headline}</span>
+        <span className="plan-headline panel-headline">{headline}</span>
         {blocked > 0 && <span className="plan-blocked-chip">受阻 {blocked}</span>}
-        <span className={`plan-arrow ${expanded ? "expanded" : ""}`}>▶</span>
+        <span className={`panel-arrow ${expanded ? "expanded" : ""}`}>
+          <IconChevronRight />
+        </span>
       </button>
 
       {expanded && (
-        <div className="plan-body">
+        <div className="plan-body panel-body">
           <ol className="plan-items">
             {plan.map((item, index) => (
               <li key={`${index}-${item.title}`} className={`plan-item ${item.status}`}>
@@ -160,6 +180,7 @@ export function PlanPanelView({
                     className="plan-item-edit"
                     value={draft}
                     autoFocus
+                    aria-label="编辑计划项标题"
                     onChange={(e) => setDraft(e.target.value)}
                     onBlur={() => saveTitle(index)}
                     onKeyDown={(e) => {
@@ -182,11 +203,11 @@ export function PlanPanelView({
                         }
                         aria-label={`切换「${item.title}」的状态`}
                       >
-                        {PLAN_STATUS_ICON[item.status] ?? "○"}
+                        {STATUS_ICON[item.status] ?? <IconCircle />}
                       </button>
                     ) : (
                       <span className="plan-item-icon" aria-hidden="true">
-                        {PLAN_STATUS_ICON[item.status] ?? "○"}
+                        {STATUS_ICON[item.status] ?? <IconCircle />}
                       </span>
                     )}
                     <span
@@ -226,7 +247,7 @@ export function PlanPanelView({
                         title="删除该条"
                         aria-label={`删除「${item.title}」`}
                       >
-                        ×
+                        <IconX />
                       </button>
                     )}
                   </>
@@ -243,6 +264,7 @@ export function PlanPanelView({
                 className="plan-add-input"
                 value={newTitle}
                 placeholder="添加一条计划…"
+                aria-label="新计划项标题"
                 disabled={busy}
                 onChange={(e) => setNewTitle(e.target.value)}
                 onKeyDown={(e) => {
@@ -251,7 +273,7 @@ export function PlanPanelView({
               />
               <button
                 type="button"
-                className="plan-add-btn"
+                className="btn-ghost"
                 onClick={addItem}
                 disabled={busy || !newTitle.trim()}
               >
@@ -260,7 +282,7 @@ export function PlanPanelView({
             </div>
           )}
 
-          <div className="plan-actions">
+          <div className="panel-actions">
             {onApprove && (
               <button
                 type="button"
@@ -269,12 +291,12 @@ export function PlanPanelView({
                 disabled={busy}
                 title="切换到执行模式，并按这份计划开始执行"
               >
-                ✓ 批准并执行
+                <IconCheck /> 批准并执行
               </button>
             )}
             <button
               type="button"
-              className="plan-clear-btn"
+              className="btn-ghost danger plan-clear-btn"
               onClick={onClear}
               disabled={busy}
             >

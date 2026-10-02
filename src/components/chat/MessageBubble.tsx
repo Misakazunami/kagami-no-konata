@@ -1,11 +1,36 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useChatStore, type Message } from "../../stores/chatStore";
 import { toToolCallView, type ToolCallView } from "../../types/tools";
 import { ToolCallList } from "./ToolCallCard";
 import { MarkdownContent } from "./MarkdownContent";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
+import { useUiStore } from "../../stores/uiStore";
 import { extractThinkTags, visibleAssistantContent } from "../../utils/messageText";
 import { copyText } from "../../utils/clipboard";
+import {
+  IconBrain,
+  IconCheck,
+  IconChevronRight,
+  IconCopy,
+  IconPencil,
+  IconRetry,
+  IconRewind,
+} from "../icons";
+
+/**
+ * 计算"重试 / 编辑"会连带**永久删除**的后续消息数
+ *
+ * 与 `chatStore.startGeneration` 的乐观截断保持同一套语义：目标消息本身
+ * （用户提问或待重试的回复）会被保留/重新生成，它之后的全部消息不可恢复地消失。
+ * 返回 0 表示截断不丢任何既有内容，无需打扰用户确认。
+ */
+function lostMessageCount(messageId: string): number {
+  const { messages } = useChatStore.getState();
+  const index = messages.findIndex((m) => m.id === messageId);
+  if (index < 0) return 0;
+  return Math.max(0, messages.length - index - 1);
+}
 
 interface Props {
   message: Message;
@@ -38,6 +63,7 @@ const MessageActions = memo(function MessageActions({
   canRetry,
   editing,
   onEdit,
+  onRetry,
   onRewind,
 }: {
   message: Message;
@@ -45,6 +71,7 @@ const MessageActions = memo(function MessageActions({
   canRetry: boolean;
   editing: boolean;
   onEdit: () => void;
+  onRetry: () => void;
   onRewind?: (message: Message) => void;
 }) {
   const isStreaming = useChatStore((s) => s.isStreaming);
@@ -55,7 +82,11 @@ const MessageActions = memo(function MessageActions({
     // 助手消息复制干净正文（有 thinking 字段时正文已剥离思考；旧数据降级解析）
     const text = isUser ? message.content : visibleAssistantContent(message);
     if (!text.trim()) return;
-    await copyText(text);
+    const ok = await copyText(text);
+    if (!ok) {
+      useUiStore.getState().pushToast("复制失败：剪贴板不可用", "error");
+      return;
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };
@@ -70,7 +101,7 @@ const MessageActions = memo(function MessageActions({
         title={isUser ? "复制这条消息" : "复制回复正文（Markdown）"}
         aria-label="复制消息"
       >
-        {copied ? "✓" : "⧉"}
+        {copied ? <IconCheck /> : <IconCopy />}
       </button>
       {isUser && (
         <button
@@ -81,7 +112,7 @@ const MessageActions = memo(function MessageActions({
           title="编辑并重新生成"
           aria-label="编辑并重新生成"
         >
-          ✎
+          <IconPencil />
         </button>
       )}
       {canRetry && (
@@ -89,11 +120,11 @@ const MessageActions = memo(function MessageActions({
           type="button"
           className="message-action-btn"
           disabled={disabled}
-          onClick={() => void useChatStore.getState().retryMessage(message.id)}
+          onClick={onRetry}
           title="重试：删除这条回复及其后内容，用原提问重新生成"
           aria-label="重试"
         >
-          ↻
+          <IconRetry />
         </button>
       )}
       <button
@@ -104,7 +135,7 @@ const MessageActions = memo(function MessageActions({
         title="回退到此处：删除这条消息及其之后的全部消息"
         aria-label="回退到此处"
       >
-        ⤺
+        <IconRewind />
       </button>
     </div>
   );
@@ -123,6 +154,16 @@ function MessageBubbleImpl({
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  /*
+   * 破坏性操作的二次确认
+   *
+   * 重试 / 编辑会截断目标之后的全部消息（不可恢复）。既有内容会被删掉时
+   * 先弹统一确认框（与"回退到此处"同一标准）；不丢内容则直接执行，
+   * 不为"重新生成最后一条"这种日常操作加摩擦。
+   */
+  const [pendingAction, setPendingAction] = useState<
+    { kind: "retry" } | { kind: "edit"; content: string } | null
+  >(null);
 
   // 历史工具记录：按 message_id 归组，未命中时为 undefined（引用稳定，不会引起额外重渲染）
   const persistedCalls = useChatStore((s) => s.toolsByMessage[message.id]);
@@ -169,8 +210,20 @@ function MessageBubbleImpl({
     const next = draft.trim();
     setEditing(false);
     if (!next || next === message.content.trim()) return;
+    if (lostMessageCount(message.id) > 0) {
+      setPendingAction({ kind: "edit", content: next });
+      return;
+    }
     // 事件回调里用 getState()：气泡本体不订阅 store，避免整列表跟着重渲染
     void useChatStore.getState().editMessage(message.id, next);
+  };
+
+  const handleRetry = () => {
+    if (lostMessageCount(message.id) > 0) {
+      setPendingAction({ kind: "retry" });
+      return;
+    }
+    void useChatStore.getState().retryMessage(message.id);
   };
 
   const handleEditKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -189,6 +242,31 @@ function MessageBubbleImpl({
   // 重试入口：助手回复总是可以重试；用户消息只在"还没有回复"（最后一条）时出现
   const canRetry = !isUser || isLast === true;
 
+  // 确认框的执行与取消（取消"编辑"确认时回到编辑态，不丢用户刚敲的内容）
+  const confirmedRef = useRef(false);
+  const runPending = async () => {
+    const action = pendingAction;
+    if (!action) return;
+    confirmedRef.current = true;
+    if (action.kind === "retry") {
+      await useChatStore.getState().retryMessage(message.id);
+    } else {
+      await useChatStore.getState().editMessage(message.id, action.content);
+    }
+  };
+  const closePending = () => {
+    const action = pendingAction;
+    const confirmed = confirmedRef.current;
+    confirmedRef.current = false;
+    setPendingAction(null);
+    if (!confirmed && action?.kind === "edit") {
+      setDraft(action.content);
+      setEditing(true);
+    }
+  };
+
+  const lost = pendingAction ? lostMessageCount(message.id) : 0;
+
   return (
     <div className={`message-row ${isUser ? "user" : "assistant"}`} id={anchorId}>
       <div className="message-bubble">
@@ -200,10 +278,12 @@ function MessageBubbleImpl({
               onClick={() => setThinkingExpanded(!thinkingExpanded)}
               aria-expanded={thinkingExpanded}
             >
-              <span className="thinking-icon">🧠</span>
+              <span className="thinking-icon">
+                <IconBrain />
+              </span>
               <span>思考过程</span>
               <span className={`thinking-arrow ${thinkingExpanded ? "expanded" : ""}`}>
-                ▶
+                <IconChevronRight />
               </span>
             </button>
             {thinkingExpanded && (
@@ -281,8 +361,31 @@ function MessageBubbleImpl({
         canRetry={canRetry}
         editing={editing}
         onEdit={startEdit}
+        onRetry={handleRetry}
         onRewind={onRewind}
       />
+      {/* 重试/编辑会删除后续消息：与"回退"同一套确认标准（不丢内容时不打扰） */}
+      {pendingAction && (
+        <ConfirmDialog
+          title={pendingAction.kind === "retry" ? "确认重试" : "确认编辑并重新生成"}
+          description={
+            pendingAction.kind === "retry" ? (
+              <>
+                将重新生成这条回复，并删除其后的 <strong>{lost}</strong> 条消息，且无法恢复。
+              </>
+            ) : (
+              <>
+                将用编辑后的内容重新生成回复，并删除这条提问之后的{" "}
+                <strong>{lost}</strong> 条消息，且无法恢复。
+              </>
+            )
+          }
+          confirmLabel={pendingAction.kind === "retry" ? "确认重试" : "保存并重新生成"}
+          danger
+          onConfirm={runPending}
+          onClose={closePending}
+        />
+      )}
     </div>
   );
 }

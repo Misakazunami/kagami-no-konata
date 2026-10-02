@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../../stores/chatStore";
+import { IconLink, IconRefresh, IconSparkles } from "../icons";
 
 interface LlmProvider {
   id: string;
@@ -104,7 +105,13 @@ export function OnboardingPage() {
     }
   };
 
-  if (!config || !activeProvider) return <div className="onboarding-page">加载中...</div>;
+  if (!config || !activeProvider) {
+    return (
+      <div className="onboarding-page">
+        <p role="status">加载中…</p>
+      </div>
+    );
+  }
 
   return (
     <div className="onboarding-page">
@@ -112,7 +119,9 @@ export function OnboardingPage() {
         {/* Step 0: 欢迎 */}
         {step === 0 && (
           <div className="onboarding-step">
-            <div className="onboarding-icon">✦</div>
+            <div className="onboarding-icon">
+              <IconSparkles />
+            </div>
             <h2>欢迎使用 Kagami no Konata</h2>
             <p className="onboarding-desc">一个基于 LLM 的桌面 AI 聊天助手，支持角色扮演和记忆系统。</p>
             <p className="onboarding-hint">让我们花一分钟完成基础设置。</p>
@@ -141,7 +150,9 @@ export function OnboardingPage() {
         {/* Step 1: API + 模型配置（合并为一页） */}
         {step === 1 && (
           <div className="onboarding-step">
-            <h2>🔗 配置 LLM 服务</h2>
+            <h2>
+              <IconLink /> 配置 LLM 服务
+            </h2>
             <p className="onboarding-desc">请填入 API 配置，获取模型列表后选择要使用的模型。</p>
             <label>
               <span>API Base URL</span>
@@ -158,7 +169,7 @@ export function OnboardingPage() {
             <div className="onboarding-actions">
               <button className="onboarding-fetch-btn" onClick={handleFetchModels}
                 disabled={fetchingModels || !activeProvider.api_key || !activeProvider.api_base_url}>
-                {fetchingModels ? "获取中..." : "🔄 获取模型列表"}
+                {fetchingModels ? "获取中..." : <><IconRefresh /> 获取模型列表</>}
               </button>
             </div>
             <label>
@@ -178,7 +189,7 @@ export function OnboardingPage() {
             <div className="onboarding-actions">
               <button className="onboarding-test-btn" onClick={handleTestConnection}
                 disabled={testing || !activeProvider.api_key || !activeProvider.model.trim()}>
-                {testing ? "测试中..." : "🔗 测试连接"}
+                {testing ? "测试中..." : <><IconLink /> 测试连接</>}
               </button>
             </div>
             {testResult && <div className="onboarding-result">{testResult}</div>}
@@ -195,7 +206,9 @@ export function OnboardingPage() {
         {/* Step 2: 完成 */}
         {step === 2 && (
           <div className="onboarding-step">
-            <div className="onboarding-icon">✦</div>
+            <div className="onboarding-icon">
+              <IconSparkles />
+            </div>
             <h2>设置完成！</h2>
             <p className="onboarding-desc">你好，{config.user.nickname}！此方已经准备好和你聊天了。</p>
             <div className="onboarding-summary">
@@ -206,7 +219,7 @@ export function OnboardingPage() {
             <div className="onboarding-nav">
               <button className="onboarding-back-btn" onClick={() => setStep(1)}>← 上一步</button>
               <button className="onboarding-finish-btn" onClick={handleFinish} disabled={saving}>
-                {saving ? "保存中..." : "✦ 开始聊天"}
+                {saving ? "保存中..." : <><IconSparkles /> 开始聊天</>}
               </button>
             </div>
           </div>

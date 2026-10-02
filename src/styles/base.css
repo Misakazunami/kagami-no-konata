@@ -1,0 +1,155 @@
+/* ===== 基础组件类：通用按钮、胶囊、图标对齐（新组件从这里取样式） ===== */
+/* 由 App.css 按原顺序拆分而来：文件顺序即级联顺序，调整顺序会影响同权重覆盖 */
+
+/* ===== 基础组件类 ===== */
+/*
+ * 新增按钮/胶囊统一从这里取基础样式，避免又出现一批"长得一样但各写一遍"的规则。
+ * 现有组件按需逐步迁移；迁移时基础类 + 语义类叠加（如 "btn-ghost plan-clear-btn"）。
+ */
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color var(--dur-fast), border-color var(--dur-fast),
+    background var(--dur-fast);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.btn-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-ghost.danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* 计数/进度类小胶囊 */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+/* 大尺寸装饰图标：48-64px 下 2px 描边会显得粗重，降为 1.5（CSS 覆盖 SVG 属性） */
+.empty-icon svg,
+.no-session-icon svg,
+.onboarding-icon svg {
+  stroke-width: 1.5;
+}
+
+/* 进行中的计划条目：旋转指示（reduced-motion 时全局降级为静止） */
+@keyframes plan-spin {
+  to { transform: rotate(360deg); }
+}
+
+.plan-spin {
+  animation: plan-spin 1.2s linear infinite;
+  transform-origin: center;
+}
+
+/* 含 SVG 图标的按钮/徽标：图标与文字垂直居中（替换字符图标后统一补齐） */
+.new-chat-btn,
+.header-action-btn,
+.settings-btn,
+.back-btn,
+.task-modal-mode-btn,
+span.task-status-chip,
+.task-status-mode,
+.task-status-action,
+.session-type-badge,
+.model-auto-btn,
+.model-refresh-btn,
+.send-btn,
+.pet-input-bar button,
+.modal-confirm-btn,
+.modal-cancel-btn,
+.onboarding-next-btn,
+.onboarding-finish-btn,
+.onboarding-back-btn,
+.onboarding-test-btn,
+.onboarding-fetch-btn,
+.persona-new-btn,
+.provider-add-btn,
+.provider-activate-btn,
+.settings-actions button,
+.provider-editor-actions button,
+.model-select-btn,
+.memory-delete-btn,
+.provider-delete-btn,
+.persona-editor-btn,
+.stats-reset-btn,
+.backup-btn,
+.memory-clear-btn,
+.workspace-add-btn,
+.workspace-remove-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.workspace-error {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 侧栏品牌行：星标与标题一起居中 */
+.sidebar-header h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 带图标的标题行 */
+.settings-header h2,
+.persona-header h2,
+.settings-section h3,
+.settings-section h4,
+.tool-subsection-title,
+.modal-card h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.modal-card h3 {
+  justify-content: center;
+}
+
+.onboarding-step h2 {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.onboarding-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}

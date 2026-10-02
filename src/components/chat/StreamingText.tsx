@@ -4,6 +4,7 @@ import { useChatStore } from "../../stores/chatStore";
 import { STREAM_EVENT, isSameStream, type StreamEventData } from "../../types/events";
 import { MarkdownContent } from "./MarkdownContent";
 import { splitStableBlocks } from "./streamBlocks";
+import { IconBrain, IconChevronRight } from "../icons";
 
 interface Props {
   /** 流式结束回调（可选） */
@@ -108,7 +109,12 @@ export function StreamingText({ onFinished }: Props) {
   if (!hasContent && !hasThinking) {
     return (
       <div className="message-row assistant">
-        <div className="message-bubble streaming thinking">
+        <div
+          className="message-bubble streaming thinking"
+          role="status"
+          aria-live="polite"
+          aria-label="正在思考"
+        >
           <div className="thinking-dots">
             <span className="dot">.</span>
             <span className="dot">.</span>
@@ -121,7 +127,8 @@ export function StreamingText({ onFinished }: Props) {
 
   return (
     <div className="message-row assistant">
-      <div className="message-bubble streaming">
+      {/* 流式正文对读屏器实时播报：只播增量，不整段重读 */}
+      <div className="message-bubble streaming" aria-live="polite" aria-atomic="false">
         {/* 思考内容（可折叠） */}
         {hasThinking && (
           <ThinkingSection thinking={display.thinking} />
@@ -179,9 +186,13 @@ function ThinkingSection({ thinking }: { thinking: string }) {
         onClick={() => setExpanded(!expanded)}
         aria-expanded={expanded}
       >
-        <span className="thinking-icon">🧠</span>
+        <span className="thinking-icon">
+          <IconBrain />
+        </span>
         <span>思考过程</span>
-        <span className={`thinking-arrow ${expanded ? "expanded" : ""}`}>▶</span>
+        <span className={`thinking-arrow ${expanded ? "expanded" : ""}`}>
+          <IconChevronRight />
+        </span>
       </button>
       {expanded && <div className="thinking-content">{thinking}</div>}
     </div>

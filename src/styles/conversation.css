@@ -1,0 +1,304 @@
+/* ===== 会话操作：消息操作按钮、右侧时间轴、代码块复制、回退确认弹窗 ===== */
+/* 由 App.css 按原顺序拆分而来：文件顺序即级联顺序，调整顺序会影响同权重覆盖 */
+
+/* ===== 消息操作（复制 / 编辑 / 重试 / 回退）===== */
+.message-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  /* 位于气泡下方：默认低调常驻（不做 hover 显隐，避免鼠标扫过时布局跳动）。
+   * 0.6 是下限：再低会让按钮在暗色下低于 3:1 非文本对比要求 */
+  margin: 4px 2px 0;
+  opacity: 0.6;
+  transition: opacity 0.15s ease;
+}
+
+.message-row:hover .message-actions,
+.message-row:focus-within .message-actions {
+  opacity: 1;
+}
+
+.message-action-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 0.929rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.message-action-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.message-action-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.message-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+}
+
+.message-edit-textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.964rem;
+  line-height: 1.6;
+  outline: none;
+}
+
+.message-edit-textarea:focus {
+  border-color: var(--accent);
+}
+
+.message-edit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.message-edit-hint {
+  margin-right: auto;
+  font-size: 0.786rem;
+  color: var(--text-muted);
+}
+
+.message-edit-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.857rem;
+  cursor: pointer;
+}
+
+.message-edit-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.message-edit-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.message-edit-btn.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: var(--on-accent);
+}
+
+.message-edit-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ===== 右侧消息时间轴 ===== */
+.message-list-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.message-list-wrap .message-list {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  /* 给右侧轨道留出空间，避免轨道压住正文 */
+  padding-right: 40px;
+}
+
+/* 消息内容块：ResizeObserver 的观察目标（滚动容器自身高度固定，观察它不会触发） */
+.message-list-content {
+  display: block;
+}
+
+/*
+ * "回到底部"浮层：上翻阅读时新内容到达的唯一入口。
+ * 露出未读条数，流式结束的新回复不再无声无息。
+ */
+.scroll-bottom-btn {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  box-shadow: var(--shadow-md);
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+.scroll-bottom-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.message-timeline {
+  position: absolute;
+  top: 16px;
+  bottom: 16px;
+  right: 10px;
+  width: 14px;
+  z-index: 5;
+  pointer-events: none; /* 只有刻度可点，其余区域不挡滚动条 */
+}
+
+.timeline-tick {
+  position: absolute;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+  display: block;
+}
+
+.timeline-tick::before {
+  content: "";
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  opacity: 0.45;
+  transition: opacity 0.15s, transform 0.15s, background 0.15s;
+}
+
+.timeline-tick.assistant::before {
+  width: 5px;
+  height: 5px;
+}
+
+.timeline-tick.user::before {
+  width: 8px;
+  height: 8px;
+  background: var(--accent);
+  opacity: 0.8;
+}
+
+.timeline-tick:hover::before {
+  opacity: 1;
+  transform: scale(1.5);
+}
+
+.timeline-tick.active::before {
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--bg-primary), 0 0 0 3px var(--accent);
+}
+
+/* ===== 代码块复制按钮 ===== */
+.code-block {
+  position: relative;
+}
+
+.code-copy-btn {
+  position: absolute;
+  top: 14px;
+  right: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-secondary);
+  font-size: 0.786rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+  z-index: 1;
+}
+
+.code-block:hover .code-copy-btn,
+.code-copy-btn:focus-visible {
+  opacity: 1;
+}
+
+.code-copy-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ===== 回退确认弹窗 ===== */
+.rewind-modal {
+  max-width: 440px;
+}
+
+.rewind-desc {
+  margin: 8px 0;
+  font-size: 0.929rem;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+.rewind-desc strong {
+  color: var(--accent);
+}
+
+.rewind-error {
+  color: var(--danger);
+}
+
+.rewind-quote {
+  margin: 6px 0 12px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--border);
+  border-radius: 0 6px 6px 0;
+  background: var(--bg-tertiary);
+  font-size: 0.893rem;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.rewind-restore {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 0;
+  font-size: 0.893rem;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.rewind-restore input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.rewind-hint {
+  margin: 8px 0 0;
+  font-size: 0.857rem;
+  color: var(--text-muted);
+}

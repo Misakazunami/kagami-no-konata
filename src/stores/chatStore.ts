@@ -79,8 +79,31 @@ interface ChatState {
   isStreaming: boolean;
   /** 当前进行中生成的唯一标识（用于流式事件过滤与取消） */
   activeStreamId: string | null;
+  /**
+   * 用户已点「停止」，正在等待后端收尾
+   *
+   * `stop_generation` 只是投递取消标志就返回，真正的收尾（补写部分内容、
+   * 发 `stream-end`）还在进行中。此期间保持 `isStreaming` 为 true 并展示
+   * 「停止中…」，避免用户立刻再发一条撞上尚未结束的上一轮。
+   */
+  stopping: boolean;
+  /**
+   * 每个会话仍在进行中的生成（sessionId → streamId）
+   *
+   * 用于两件事：① 切走后侧栏仍能看到"该会话生成中"；② 切回该会话时
+   * 恢复 `isStreaming` / `activeStreamId`，让同一轮的事件与停止按钮继续有效。
+   * 与 `isStreaming`（只描述**当前会话**）刻意分开。
+   */
+  backgroundStreams: Record<string, string>;
   /** 最近一次错误（供界面展示，避免只打 console 用户无感） */
   errorMessage: string | null;
+  /**
+   * 会话列表加载状态
+   *
+   * 区分"还没加载"与"确实没有会话"：否则启动瞬间侧栏会闪现"暂无会话"，
+   * 用户以为数据丢了。
+   */
+  sessionsStatus: "idle" | "loading" | "ready" | "error";
   initialized: boolean;
 
   /**
@@ -265,6 +288,7 @@ export const emptyGenerationState = (): Pick<
   ChatState,
   | "isStreaming"
   | "activeStreamId"
+  | "stopping"
   | "liveToolCalls"
   | "toolsByMessage"
   | "pendingApproval"
@@ -280,6 +304,7 @@ export const emptyGenerationState = (): Pick<
 > => ({
   isStreaming: false,
   activeStreamId: null,
+  stopping: false,
   liveToolCalls: [],
   toolsByMessage: {},
   pendingApproval: null,
@@ -358,6 +383,14 @@ const bindPlanEvents = (set: (partial: Partial<ChatState>) => void, get: () => C
  */
 let lastLocalStreamId: string | null = null;
 
+/**
+ * `switchSession` 的请求序号
+ *
+ * 快速连点两个会话时，`get_messages` 的响应顺序不保证与点击顺序一致；
+ * 没有序号校验的话，慢的那次返回会把界面拉回用户已经离开的会话。
+ */
+let switchSessionSeq = 0;
+
 /** 本窗口最近发起的 stream_id（供 App 的事件监听判断"是不是自己"） */
 export const getLastLocalStreamId = (): string | null => lastLocalStreamId;
 
@@ -426,16 +459,34 @@ async function startGeneration(
    * 脏事件混进来），且我们仍然停在这个会话上。
    */
   const sessionId = currentSessionId;
+  /** 事件是否属于本轮生成（不管用户切到哪个会话） */
+  const isOurStream = (payload: {
+    session_id: string;
+    stream_id: string;
+  }): boolean => isSameStream(payload, streamId) && payload.session_id === sessionId;
+  const isCurrentSession = () => get().currentSessionId === sessionId;
+  /** 只有"属于本轮 **且** 用户仍停在这个会话"的事件才允许改动界面 */
   const isCurrentGeneration = (payload: {
     session_id: string;
     stream_id: string;
-  }): boolean =>
-    isSameStream(payload, streamId) &&
-    payload.session_id === sessionId &&
-    get().currentSessionId === sessionId;
+  }): boolean => isOurStream(payload) && isCurrentSession();
+
+  /** 登记"这个会话有一轮生成在跑"（切走后仍可见、可切回继续接管） */
+  const markBackground = () =>
+    set((state) => ({
+      backgroundStreams: { ...state.backgroundStreams, [sessionId]: streamId },
+    }));
+  const unmarkBackground = () =>
+    set((state) => {
+      if (state.backgroundStreams[sessionId] !== streamId) return {};
+      const next = { ...state.backgroundStreams };
+      delete next[sessionId];
+      return { backgroundStreams: next };
+    });
 
   // ── 乐观状态：先把界面改成"这一轮结束后应有的样子" ──
   let optimisticUserId: string | undefined;
+  markBackground();
   if (mode.kind === "send") {
     const userMsg: Message = {
       id: crypto.randomUUID(),
@@ -451,6 +502,7 @@ async function startGeneration(
       messages: [...state.messages, userMsg],
       isStreaming: true,
       activeStreamId: streamId,
+      stopping: false,
       errorMessage: null,
       // 新一轮生成开始：清空上一轮的工具调用与残留审批，并复位中断标记
       liveToolCalls: [],
@@ -482,6 +534,7 @@ async function startGeneration(
       toolsByMessage,
       isStreaming: true,
       activeStreamId: streamId,
+      stopping: false,
       errorMessage: null,
       liveToolCalls: [],
       pendingApproval: null,
@@ -523,8 +576,17 @@ async function startGeneration(
     const unlistenEnd = await listen<StreamEventData>(
       STREAM_EVENT.end,
       (event) => {
-        if (!isCurrentGeneration(event.payload)) return;
+        if (!isOurStream(event.payload)) return;
         finished = true;
+        /*
+         * 用户已经切到别的会话：这轮的内容交给"切回时的回读"补上，
+         * 这里只清掉后台生成标记（侧栏的生成中圆点随之消失）。
+         */
+        if (!isCurrentSession()) {
+          unmarkBackground();
+          return;
+        }
+        unmarkBackground();
         const assistantMsg: Message = {
           id: crypto.randomUUID(),
           role: "assistant",
@@ -569,7 +631,7 @@ async function startGeneration(
           // 审批弹窗不能继续挂着，否则没人能处理它
           pendingApproval: null,
           ...(state.activeStreamId === streamId
-            ? { isStreaming: false, activeStreamId: null }
+            ? { isStreaming: false, activeStreamId: null, stopping: false }
             : {}),
         }));
       }
@@ -579,14 +641,17 @@ async function startGeneration(
     const unlistenError = await listen<StreamErrorData>(
       STREAM_EVENT.error,
       (event) => {
-        if (!isCurrentGeneration(event.payload)) return;
+        if (!isOurStream(event.payload)) return;
         finished = true;
+        unmarkBackground();
+        // 后台会话的失败不打扰当前会话；切回去时回读会看到真实状态
+        if (!isCurrentSession()) return;
         set((state) => ({
           errorMessage: event.payload.message,
           // 失败同样保留已有的工具调用，方便用户判断是哪一步出的问题
           pendingApproval: null,
           ...(state.activeStreamId === streamId
-            ? { isStreaming: false, activeStreamId: null }
+            ? { isStreaming: false, activeStreamId: null, stopping: false }
             : {}),
         }));
         // 失败路径不会发 session-updated：用户消息已经落库，回读一次把本地乐观
@@ -807,14 +872,26 @@ async function startGeneration(
   } catch (e) {
     console.error("Failed to generate:", e);
     set({ errorMessage: `${GENERATION_LABEL[mode.kind]}失败：${toMessage(e)}` });
+    /*
+     * 发送失败：把原文填回输入框
+     *
+     * 输入框在发送那一刻已经清空，紧接着的回读又会用数据库快照抹掉乐观消息
+     * （后端可能在落库前就拒绝了）——不回填的话用户打的一大段话就没了。
+     * 重试/编辑没有输入框这一层，不适用。
+     */
+    if (mode.kind === "send" && mode.content.trim()) {
+      set({ composerPrefill: { text: mode.content, seq: Date.now() } });
+    }
     // 重试/编辑在本地做过乐观截断：命令被拒绝（例如会话正忙）时由 finally 里的
     // 回读对齐数据库状态（`!finished` 分支），这里不重复回读
   } finally {
     unlisteners.forEach((fn) => fn());
+    // 这一轮已经彻底结束：侧栏的"生成中"标记随之消失
+    unmarkBackground();
 
     // 兜底复位：即使事件全部丢失，也必须让输入框可用
     if (isCurrentStream()) {
-      set({ isStreaming: false, activeStreamId: null });
+      set({ isStreaming: false, activeStreamId: null, stopping: false });
     }
 
     // 本次生成已经结束（无论正常与否），属于它的审批弹窗不能继续挂着
@@ -841,7 +918,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
   isStreaming: false,
   activeStreamId: null,
+  stopping: false,
+  backgroundStreams: {},
   errorMessage: null,
+  sessionsStatus: "idle",
   stepLimitHit: false,
   toolSteps: 0,
   liveToolCalls: [],
@@ -863,12 +943,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
   clearError: () => set({ errorMessage: null }),
 
   loadSessions: async () => {
+    const hadData = get().sessions.length > 0;
+    // 已有数据时刷新不必退回"加载中"：闪一下空态比重列表更糟
+    if (!hadData) set({ sessionsStatus: "loading" });
     try {
       const sessions = await invoke<Session[]>("get_sessions");
-      set({ sessions });
+      set({ sessions, sessionsStatus: "ready" });
     } catch (e) {
       console.error("Failed to load sessions:", e);
-      set({ errorMessage: `加载会话列表失败：${toMessage(e)}` });
+      set({ sessionsStatus: "error", errorMessage: `加载会话列表失败：${toMessage(e)}` });
     }
   },
 
@@ -1041,14 +1124,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   switchSession: async (sessionId) => {
+    // 快速连点：只有最后一次点击的会话允许落地，否则慢的那个响应会把界面拉回旧会话
+    const seq = ++switchSessionSeq;
     try {
       const messages = await invoke<Message[]>("get_messages", { sessionId });
+      if (seq !== switchSessionSeq) return;
       // 切换会话时不能沿用上一个会话的流式状态、工具状态与错误提示
+      const background = get().backgroundStreams[sessionId];
       set({
         currentSessionId: sessionId,
         messages,
         errorMessage: null,
         ...emptyGenerationState(),
+        // 目标会话还有一轮生成在跑：接管它的流标识，停止按钮与流式事件继续有效
+        ...(background ? { isStreaming: true, activeStreamId: background } : {}),
       });
       void get().loadToolInvocations(sessionId);
       void get().loadPlan(sessionId);
@@ -1056,13 +1145,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
       void get().loadSessionGrants(sessionId);
     } catch (e) {
       console.error("Failed to switch session:", e);
-      set({ errorMessage: `切换会话失败：${toMessage(e)}` });
+      if (seq === switchSessionSeq) {
+        set({ errorMessage: `切换会话失败：${toMessage(e)}` });
+      }
     }
   },
 
   deleteSession: async (sessionId) => {
     try {
       await invoke("delete_session", { sessionId });
+      // 被删会话若还有后台生成，标记一并清掉（事件到达时会自行忽略）
+      set((state) => {
+        if (!(sessionId in state.backgroundStreams)) return {};
+        const next = { ...state.backgroundStreams };
+        delete next[sessionId];
+        return { backgroundStreams: next };
+      });
       if (get().currentSessionId === sessionId) {
         set({
           currentSessionId: null,
@@ -1081,11 +1179,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   renameSession: async (sessionId, title) => {
+    // 与后端 `update_session_title` 同一套归一化（去首尾空白 + 截 64 字）：
+    // 否则本地显示的标题会与库里存的不一致，重启后又变回另一个样子。
+    // 按"码点"截断（`[...title]`）才与 Rust 的 `chars()` 对齐，emoji 不会被截半。
+    const normalized = [...title.trim()].slice(0, 64).join("");
+    // 空标题后端会拒绝（"标题不能为空"）：这里直接不动，别让界面显示成空的
+    if (!normalized) return;
     try {
-      await invoke("update_session_title", { sessionId, title });
+      await invoke("update_session_title", { sessionId, title: normalized });
       set((state) => ({
         sessions: state.sessions.map((s) =>
-          s.id === sessionId ? { ...s, title } : s
+          s.id === sessionId ? { ...s, title: normalized } : s
         ),
       }));
     } catch (e) {
@@ -1238,10 +1342,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   consumeComposerPrefill: () => set({ composerPrefill: null }),
 
-  /** 停止当前会话正在进行的生成（已生成的部分内容会被保留） */
+  /**
+   * 停止当前会话正在进行的生成（已生成的部分内容会被保留）
+   *
+   * 后端只投递取消标志就返回，真正的收尾还在进行中：此期间保持
+   * `isStreaming` 并进入 `stopping` 中间态（按钮显示"停止中…"），
+   * 等 `stream-end` / 命令返回带来的复位，避免用户立刻再发一条撞上
+   * 尚未结束的上一轮。10 秒兜底把 `stopping` 摘掉，允许再次点击停止。
+   */
   stopGeneration: async () => {
-    const { currentSessionId, activeStreamId, isStreaming } = get();
-    if (!isStreaming) return;
+    const { currentSessionId, activeStreamId, isStreaming, stopping } = get();
+    if (!isStreaming || stopping) return;
+    set({ stopping: true });
     try {
       await invoke<boolean>("stop_generation", {
         streamId: activeStreamId ?? null,
@@ -1249,10 +1361,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     } catch (e) {
       console.error("Failed to stop generation:", e);
-    } finally {
-      // 无论后端是否成功接收到取消指令，都先恢复界面可交互状态
-      set({ isStreaming: false, activeStreamId: null });
+      // 取消指令没送达：立刻解除"停止中"，用户可以再点一次
+      set({ stopping: false });
+      return;
     }
+    const token = activeStreamId;
+    setTimeout(() => {
+      const state = get();
+      if (state.stopping && state.activeStreamId === token) {
+        // 10 秒还没等到收尾信号：只解除"停止中"，允许再次点击停止；
+        // isStreaming 仍交给生成流程自己的 finally 兜底，不冒险放行新发送
+        console.warn("stop_generation timed out waiting for stream end");
+        set({ stopping: false });
+      }
+    }, 10_000);
   },
 
   /**

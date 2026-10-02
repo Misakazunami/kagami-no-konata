@@ -143,19 +143,12 @@ export const TOOL_MODE_LABEL: Record<string, string> = {
   full: "完整",
 };
 
-/** 计划项状态 → 中文文案与图标（进度面板用） */
+/** 计划项状态 → 中文文案（进度面板用；图标见 PlanPanel 的 STATUS_ICON） */
 export const PLAN_STATUS_LABEL: Record<PlanStatus, string> = {
   pending: "待办",
   doing: "进行中",
   done: "已完成",
   blocked: "受阻",
-};
-
-export const PLAN_STATUS_ICON: Record<PlanStatus, string> = {
-  pending: "○",
-  doing: "◐",
-  done: "●",
-  blocked: "✕",
 };
 
 /**

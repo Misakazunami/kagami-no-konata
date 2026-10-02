@@ -1,6 +1,38 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../../stores/chatStore";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
+import {
+  IconAlert,
+  IconBot,
+  IconBrain,
+  IconChart,
+  IconCheck,
+  IconChevronDown,
+  IconChevronLeft,
+  IconChevronUp,
+  IconDownload,
+  IconFolder,
+  IconHand,
+  IconLayout,
+  IconLink,
+  IconMessage,
+  IconPalette,
+  IconPlug,
+  IconPlus,
+  IconRefresh,
+  IconRoute,
+  IconSave,
+  IconSearch,
+  IconSettings,
+  IconSparkles,
+  IconStar,
+  IconUpload,
+  IconUserCircle,
+  IconWrench,
+  IconX,
+} from "../icons";
 import {
   TOOL_PERMISSION_LABEL,
   normalizePermission,
@@ -236,6 +268,10 @@ function parseOptionalClamped(raw: string, min: number, max: number): number | n
 export function SettingsPage() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
+  // 三个列表在首帧都是空数组：不区分"加载中"就会闪一句"暂无…"再突然填满
+  const [memoriesLoading, setMemoriesLoading] = useState(true);
+  const [toolsLoading, setToolsLoading] = useState(true);
+  const [workspacesLoading, setWorkspacesLoading] = useState(true);
   const [stats, setStats] = useState<UsageStats | null>(null);
   const [testResult, setTestResult] = useState<string>("");
   const [testing, setTesting] = useState(false);
@@ -264,6 +300,28 @@ export function SettingsPage() {
 
   const setCurrentPage = useChatStore((s) => s.setCurrentPage);
 
+  /**
+   * 统一确认弹窗（替代原生 `confirm()`）
+   *
+   * 原生 confirm 无法定制文案/危险态、无法做焦点管理，且在 WebView 里样式
+   * 不可控。这里用一个 pending 请求驱动共享的 `ConfirmDialog`。
+   */
+  const [confirmRequest, setConfirmRequest] = useState<{
+    title: string;
+    description: ReactNode;
+    children?: ReactNode;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    danger?: boolean;
+    onConfirm: () => void | Promise<void>;
+    onCancel?: () => void | Promise<void>;
+  } | null>(null);
+  const askConfirm = (req: NonNullable<typeof confirmRequest>) => setConfirmRequest(req);
+
+  // 添加提供商弹窗：Tab 循环 + 初始焦点（与其它 aria-modal 弹窗同一套焦点策略）
+  const addModalRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(addModalRef, showAddModal, { initialFocusSelector: "input" });
+
   // 未保存修改检测：user / memory / ui / tools 四段只有点"保存全局配置"才会落盘，
   // 提供商相关的改动则由各自命令即时保存，因此分开跟踪。
   const configSnapshotRef = useRef<string>("");
@@ -287,7 +345,8 @@ export function SettingsPage() {
     invoke<UsageStats>("get_usage_stats").then(setStats).catch(console.error);
     invoke<ToolInfo[]>("list_tools")
       .then(setTools)
-      .catch((e) => console.error("Failed to load tools:", e));
+      .catch((e) => console.error("Failed to load tools:", e))
+      .finally(() => setToolsLoading(false));
     void loadWorkspaces();
   }, []);
 
@@ -299,8 +358,38 @@ export function SettingsPage() {
   const hasUnsavedChanges = configDirty || providerDirty;
 
   const handleBack = () => {
-    if (hasUnsavedChanges && !confirm("有尚未保存的修改，确认离开设置页？")) return;
+    if (hasUnsavedChanges) {
+      askConfirm({
+        title: "离开设置页",
+        description: "有尚未保存的修改，离开后这些修改会丢失。",
+        confirmLabel: "放弃修改并离开",
+        danger: true,
+        onConfirm: () => setCurrentPage("chat"),
+      });
+      return;
+    }
     setCurrentPage("chat");
+  };
+
+  /**
+   * 把刚被后端写盘的 `llm` 段同步回本地
+   *
+   * 「测试连接 / 获取模型」会先调用 `update_provider` 把编辑中的提供商落盘，
+   * 但本地 `config.llm` 仍是旧值——而「保存全局配置」是**整份** `update_config`，
+   * 不同步的话会用过期的 llm 段把刚才的改动静默覆盖回去（还显示"已保存"）。
+   * 只刷新 llm 段与脏检查基线，不动 `editingProvider`，避免吞掉用户测试期间的新输入。
+   */
+  const syncLlmFromBackend = async () => {
+    try {
+      const c = await invoke<AppConfig>("get_config");
+      setConfig((prev) => (prev ? { ...prev, llm: c.llm } : c));
+      if (editingProvider) {
+        const saved = c.llm.providers.find((p) => p.id === editingProvider.id);
+        if (saved) providerSnapshotRef.current = JSON.stringify(saved);
+      }
+    } catch (e) {
+      console.error("Failed to sync llm config:", e);
+    }
   };
 
   const loadMemories = async () => {
@@ -309,6 +398,8 @@ export function SettingsPage() {
       setMemories(list);
     } catch (e) {
       console.error("Failed to load memories:", e);
+    } finally {
+      setMemoriesLoading(false);
     }
   };
 
@@ -322,14 +413,21 @@ export function SettingsPage() {
   };
 
   const handleClearMemories = async () => {
-    if (!confirm("确认清空所有记忆？此操作不可撤销。")) return;
-    try {
-      await invoke("clear_memories");
-      setMemories([]);
-      setTestResult("✅ 已清空所有记忆");
-    } catch (e) {
-      setTestResult(`❌ 清空失败: ${e}`);
-    }
+    askConfirm({
+      title: "清空所有记忆",
+      description: "确认清空所有记忆？此操作不可撤销。",
+      confirmLabel: "全部清空",
+      danger: true,
+      onConfirm: async () => {
+        try {
+          await invoke("clear_memories");
+          setMemories([]);
+          setTestResult("✅ 已清空所有记忆");
+        } catch (e) {
+          setTestResult(`❌ 清空失败: ${e}`);
+        }
+      },
+    });
   };
 
   // ─── 提供商管理 ─────────────────────────
@@ -364,20 +462,27 @@ export function SettingsPage() {
       setTestResult("❌ 至少需要保留一个提供商，无法删除最后一个");
       return;
     }
-    if (!confirm("确认删除此提供商？")) return;
-    try {
-      await invoke("delete_provider", { providerId: id });
-      const c = await invoke<AppConfig>("get_config");
-      // 只合并 llm 段，避免覆盖用户在其他分区尚未保存的编辑
-      setConfig((prev) => (prev ? { ...prev, llm: c.llm } : c));
-      const active = c.llm.providers.find((p) => p.id === c.llm.active_provider_id);
-      setEditingProvider(active ? { ...active } : null);
-      providerSnapshotRef.current = active ? JSON.stringify(active) : "";
-      setProviderModels([]);
-      setTestResult("✅ 已删除");
-    } catch (e) {
-      setTestResult(`❌ 删除失败: ${e}`);
-    }
+    askConfirm({
+      title: "删除提供商",
+      description: "确认删除此提供商？其 API Key 会一并从配置中移除。",
+      confirmLabel: "删除",
+      danger: true,
+      onConfirm: async () => {
+        try {
+          await invoke("delete_provider", { providerId: id });
+          const c = await invoke<AppConfig>("get_config");
+          // 只合并 llm 段，避免覆盖用户在其他分区尚未保存的编辑
+          setConfig((prev) => (prev ? { ...prev, llm: c.llm } : c));
+          const active = c.llm.providers.find((p) => p.id === c.llm.active_provider_id);
+          setEditingProvider(active ? { ...active } : null);
+          providerSnapshotRef.current = active ? JSON.stringify(active) : "";
+          setProviderModels([]);
+          setTestResult("✅ 已删除");
+        } catch (e) {
+          setTestResult(`❌ 删除失败: ${e}`);
+        }
+      },
+    });
   };
 
   const handleSetActiveProvider = async (id: string) => {
@@ -426,6 +531,8 @@ export function SettingsPage() {
         providerId: editingProvider.id,
         provider: editingProvider,
       });
+      // 落盘后同步本地 llm 段，防止随后"保存全局配置"用过期数据覆盖它
+      await syncLlmFromBackend();
       const result = await invoke<string>("test_provider_connection", {
         providerId: editingProvider.id,
       });
@@ -446,6 +553,7 @@ export function SettingsPage() {
         providerId: editingProvider.id,
         provider: editingProvider,
       });
+      await syncLlmFromBackend();
       const list = await invoke<ModelInfo[]>("fetch_provider_models", {
         providerId: editingProvider.id,
       });
@@ -559,6 +667,8 @@ export function SettingsPage() {
     } catch (e) {
       console.error("Failed to load workspaces:", e);
       setWorkspaceError(`加载工作区失败：${errorText(e)}`);
+    } finally {
+      setWorkspacesLoading(false);
     }
   };
 
@@ -629,15 +739,23 @@ export function SettingsPage() {
 
   const handleRemoveWorkspace = async (w: WorkspaceView) => {
     if (w.is_default) return; // 默认工作区不可删除（后端也会拒绝）
-    if (!confirm(`确认移除工作区「${w.label}」？\n${w.path}`)) return;
-    setWorkspaceError("");
-    try {
-      await invoke("remove_workspace", { id: w.id });
-      await loadWorkspaces();
-      await syncToolsFromBackend();
-    } catch (e) {
-      setWorkspaceError(errorText(e));
-    }
+    askConfirm({
+      title: "移除工作区",
+      description: `确认移除工作区「${w.label}」？只移除登记，不会删除磁盘上的文件。`,
+      children: <p className="rewind-desc">{w.path}</p>,
+      confirmLabel: "移除",
+      danger: true,
+      onConfirm: async () => {
+        setWorkspaceError("");
+        try {
+          await invoke("remove_workspace", { id: w.id });
+          await loadWorkspaces();
+          await syncToolsFromBackend();
+        } catch (e) {
+          setWorkspaceError(errorText(e));
+        }
+      },
+    });
   };
 
   const handleAddWorkspace = async () => {
@@ -696,23 +814,47 @@ export function SettingsPage() {
     input.onchange = async () => {
       const file = input.files?.[0];
       if (!file) return;
+      let content = "";
       try {
-        const content = await file.text();
-        // 覆盖式导入是不可撤销的破坏性操作，必须让用户显式选择，
-        // 不能再把"取消"当作"清空后导入"（用户按 Esc / 点掉弹窗就会丢掉全部记忆）
-        const replaceAll = confirm(
-          "点「确定」将【清空现有记忆】后导入。\n" +
-            "点「取消」则合并到现有记忆中（推荐）。"
-        );
-        const report = await invoke<ImportReport>("import_memories", {
-          jsonContent: content,
-          merge: !replaceAll,
-        });
-        setTestResult(`✅ ${describeReport(report, "条记忆")}`);
-        loadMemories();
+        content = await file.text();
       } catch (e) {
-        setTestResult(`❌ 导入失败: ${e}`);
+        setTestResult(`❌ 读取文件失败: ${e}`);
+        return;
       }
+
+      const runImport = async (merge: boolean) => {
+        try {
+          const report = await invoke<ImportReport>("import_memories", {
+            jsonContent: content,
+            merge,
+          });
+          setTestResult(`✅ ${describeReport(report, "条记忆")}`);
+          void loadMemories();
+        } catch (e) {
+          setTestResult(`❌ 导入失败: ${e}`);
+        }
+      };
+
+      /*
+       * 覆盖式导入是不可撤销的破坏性操作，必须让用户显式选择。
+       * 弹窗的 Esc / 点遮罩 = 取消 = 合并导入（非破坏性、推荐路径），
+       * 所以"取消"绝不会触发清空。
+       */
+      askConfirm({
+        title: "导入记忆",
+        description: "选择导入方式：",
+        children: (
+          <p className="rewind-desc">
+            「合并导入」把文件里的记忆追加到现有记忆（推荐，可重复导入）；
+            「清空后导入」会先删除全部现有记忆再写入，<strong>不可撤销</strong>。
+          </p>
+        ),
+        confirmLabel: "清空后导入",
+        cancelLabel: "合并导入（推荐）",
+        danger: true,
+        onConfirm: () => runImport(false),
+        onCancel: () => runImport(true),
+      });
     };
     input.click();
   };
@@ -745,7 +887,15 @@ export function SettingsPage() {
     input.click();
   };
 
-  if (!config) return <div className="settings-page">加载中...</div>;
+  if (!config) {
+    return (
+      <div className="settings-page">
+        <p className="settings-loading" role="status">
+          加载中…
+        </p>
+      </div>
+    );
+  }
 
   const activeProvider = editingProvider;
   // 与默认值合并：即使后端返回的 tools 段缺字段也不会让输入框变成非受控
@@ -753,14 +903,41 @@ export function SettingsPage() {
 
   return (
     <div className="settings-page">
+      {/*
+        操作结果反馈：固定在顶部，不受长表单滚动影响。
+        （原来它渲染在页面最底部——保存/删除的结果用户根本看不见）
+      */}
+      {testResult && (
+        <div
+          className="test-result"
+          role={testResult.includes("❌") ? "alert" : "status"}
+        >
+          <span className="test-result-text">{testResult}</span>
+          <button
+            type="button"
+            className="test-result-close"
+            onClick={() => setTestResult("")}
+            aria-label="关闭提示"
+          >
+            <IconX />
+          </button>
+        </div>
+      )}
+
       <div className="settings-header">
-        <button className="back-btn" onClick={handleBack}>← 返回</button>
-        <h2>⚙ 设置</h2>
+        <button className="back-btn" onClick={handleBack}>
+          <IconChevronLeft /> 返回
+        </button>
+        <h2>
+          <IconSettings /> 设置
+        </h2>
       </div>
 
       {/* ─── 用户信息 ─── */}
       <div className="settings-section">
-        <h3>👤 用户信息</h3>
+        <h3>
+          <IconUserCircle /> 用户信息
+        </h3>
         <label>
           <span>昵称</span>
           <input value={config.user.nickname}
@@ -795,7 +972,9 @@ export function SettingsPage() {
 
       {/* ─── LLM 提供商 ─── */}
       <div className="settings-section">
-        <h3>🤖 LLM 提供商</h3>
+        <h3>
+          <IconBot /> LLM 提供商
+        </h3>
 
         {/* 提供商列表 */}
         <div className="provider-list">
@@ -803,12 +982,33 @@ export function SettingsPage() {
             <div
               key={p.id}
               className={`provider-item ${p.id === config.llm.active_provider_id ? "active" : ""} ${p.id === editingProvider?.id ? "editing" : ""}`}
-              onClick={() => setEditingProvider({ ...p })}
             >
-              <div className="provider-info">
-                {p.id === config.llm.active_provider_id && <span className="provider-star">★</span>}
-                <span className="provider-name">{p.name}</span>
-                <span className="provider-model">{p.model}</span>
+              {/*
+                可点击区域与「激活/删除」按钮**分开**：把 role="button" 放在
+                整行上会让嵌套按钮变成无效结构，键盘用户也分不清焦点在哪。
+              */}
+              <div
+                className="provider-item-main"
+                role="button"
+                tabIndex={0}
+                aria-label={`编辑提供商 ${p.name}`}
+                onClick={() => setEditingProvider({ ...p })}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setEditingProvider({ ...p });
+                  }
+                }}
+              >
+                <div className="provider-info">
+                  {p.id === config.llm.active_provider_id && (
+                    <span className="provider-star">
+                      <IconStar />
+                    </span>
+                  )}
+                  <span className="provider-name">{p.name}</span>
+                  <span className="provider-model">{p.model}</span>
+                </div>
               </div>
               <div className="provider-actions">
                 {p.id !== config.llm.active_provider_id && (
@@ -816,8 +1016,12 @@ export function SettingsPage() {
                     激活
                   </button>
                 )}
-                <button className="provider-delete-btn" onClick={(e) => { e.stopPropagation(); handleDeleteProvider(p.id); }}>
-                  ×
+                <button
+                  className="provider-delete-btn"
+                  onClick={(e) => { e.stopPropagation(); handleDeleteProvider(p.id); }}
+                  aria-label={`删除提供商 ${p.name}`}
+                >
+                  <IconX />
                 </button>
               </div>
             </div>
@@ -876,9 +1080,9 @@ export function SettingsPage() {
             </label>
 
             <div className="provider-editor-actions">
-              <button onClick={handleSaveProvider} disabled={saving}>{saving ? "保存中..." : "💾 保存"}</button>
-              <button onClick={handleTestProvider} disabled={testing}>{testing ? "测试中..." : "🔗 测试连接"}</button>
-              <button onClick={handleFetchModels} disabled={fetching}>{fetching ? "获取中..." : "🔄 获取模型"}</button>
+              <button onClick={handleSaveProvider} disabled={saving}>{saving ? "保存中..." : <><IconSave /> 保存</>}</button>
+              <button onClick={handleTestProvider} disabled={testing}>{testing ? "测试中..." : <><IconLink /> 测试连接</>}</button>
+              <button onClick={handleFetchModels} disabled={fetching}>{fetching ? "获取中..." : <><IconRefresh /> 获取模型</>}</button>
             </div>
 
             {/* 模型列表 */}
@@ -911,7 +1115,7 @@ export function SettingsPage() {
                         深度思考
                       </label>
                       <button className="model-select-btn" onClick={() => handleSetActiveModel(m.id)} disabled={isActive}>
-                        {isActive ? "✓" : "设为当前"}
+                        {isActive ? <IconCheck /> : "设为当前"}
                       </button>
                     </div>
                   );
@@ -924,7 +1128,9 @@ export function SettingsPage() {
 
       {/* ─── 模型路由（自动选择） ─── */}
       <div className="settings-section">
-        <h3>🧭 模型路由（自动选择）</h3>
+        <h3>
+          <IconRoute /> 模型路由（自动选择）
+        </h3>
         <p className="settings-hint">
           任务会话里可以选「自动」：<b>Plan 模式与子代理优先用子模型</b>，
           <b>Work 模式优先用主模型</b>。配置只作用于选择了自动的会话 ——
@@ -933,7 +1139,7 @@ export function SettingsPage() {
 
         {selectableModels.length === 0 && (
           <p className="settings-hint">
-            ⚠ 目前还没有「已启用」的模型：先在上面的提供商里点「🔄 获取模型」，
+            <IconAlert /> 目前还没有「已启用」的模型：先在上面的提供商里点「获取模型」，
             勾选要用的模型并保存，这里才有可选的主/子模型。
           </p>
         )}
@@ -987,18 +1193,28 @@ export function SettingsPage() {
                     ）
                   </span>
                 </span>
-                <button type="button" onClick={() => moveSubModel(index, -1)} disabled={index === 0}>
-                  ↑
+                <button
+                  type="button"
+                  onClick={() => moveSubModel(index, -1)}
+                  disabled={index === 0}
+                  aria-label="上移该子模型"
+                >
+                  <IconChevronUp />
                 </button>
                 <button
                   type="button"
                   onClick={() => moveSubModel(index, 1)}
                   disabled={index === modelSettings.subs.length - 1}
+                  aria-label="下移该子模型"
                 >
-                  ↓
+                  <IconChevronDown />
                 </button>
-                <button type="button" onClick={() => removeSubModel(index)}>
-                  ✕
+                <button
+                  type="button"
+                  onClick={() => removeSubModel(index)}
+                  aria-label="移除该子模型"
+                >
+                  <IconX />
                 </button>
               </li>
             ))}
@@ -1041,7 +1257,9 @@ export function SettingsPage() {
 
       {/* ─── 记忆系统 ─── */}
       <div className="settings-section">
-        <h3>🧠 记忆系统</h3>
+        <h3>
+          <IconBrain /> 记忆系统
+        </h3>
         <label>
           <span>启用记忆</span>
           <input type="checkbox" checked={config.memory.enabled}
@@ -1057,7 +1275,11 @@ export function SettingsPage() {
           <input type="number" min="0" max="100" value={config.memory.max_context_memories}
             onChange={(e) => setConfig({ ...config, memory: { ...config.memory, max_context_memories: clampNumber(e.target.value, 0, 100, 5) } })} />
         </label>
-        {memories.length > 0 && (
+        {memoriesLoading ? (
+          <p className="list-loading" role="status">
+            加载中…
+          </p>
+        ) : memories.length > 0 ? (
           <div className="memory-list">
             <div className="memory-list-header">
               <span>已存储 {memories.length} 条记忆</span>
@@ -1070,19 +1292,26 @@ export function SettingsPage() {
                   <span className="memory-type">{m.memory_type}</span>
                   <span className="memory-importance">重要性: {(m.importance * 100).toFixed(0)}%</span>
                 </div>
-                <button className="memory-delete-btn" onClick={() => handleDeleteMemory(m.id)}>×</button>
+                <button
+                  className="memory-delete-btn"
+                  onClick={() => handleDeleteMemory(m.id)}
+                  aria-label="删除这条记忆"
+                >
+                  <IconX />
+                </button>
               </div>
             ))}
           </div>
-        )}
-        {memories.length === 0 && config.memory.enabled && (
+        ) : config.memory.enabled ? (
           <div className="memory-empty">暂无记忆，对话后将自动提取</div>
-        )}
+        ) : null}
       </div>
 
       {/* ─── 工具 ─── */}
       <div className="settings-section">
-        <h3>🛠 工具</h3>
+        <h3>
+          <IconWrench /> 工具
+        </h3>
         <label>
           <span>启用工具</span>
           <input
@@ -1247,7 +1476,11 @@ export function SettingsPage() {
 
         {/* 工具清单：让用户知道 agent 到底能做什么 */}
         <div className="tool-list">
-          {tools.length === 0 ? (
+          {toolsLoading ? (
+            <div className="list-loading" role="status">
+              加载中…
+            </div>
+          ) : tools.length === 0 ? (
             <div className="tool-list-empty">暂无可用工具</div>
           ) : (
             tools.map((t) => (
@@ -1273,7 +1506,9 @@ export function SettingsPage() {
         </div>
 
         {/* 联网检索 */}
-        <h4 className="tool-subsection-title">🔎 联网检索</h4>
+        <h4 className="tool-subsection-title">
+          <IconSearch /> 联网检索
+        </h4>
         <label>
           <span>启用联网检索</span>
           <input
@@ -1349,7 +1584,9 @@ export function SettingsPage() {
         </label>
 
         {/* MCP 服务器 */}
-        <h4 className="tool-subsection-title">🔌 MCP 服务器</h4>
+        <h4 className="tool-subsection-title">
+          <IconPlug /> MCP 服务器
+        </h4>
         <p className="settings-hint">
           外部工具生态：服务器命令写在 <code>config.json</code> 的 <code>tools.mcp.servers</code> 里，
           必须同时打开 <code>enabled</code> 与 <code>trusted</code> 才会被启动（加配置不等于授权）。
@@ -1406,12 +1643,18 @@ export function SettingsPage() {
         </div>
 
         {/* 工作区 */}
-        <h4 className="tool-subsection-title">📁 工作区</h4>
+        <h4 className="tool-subsection-title">
+          <IconFolder /> 工作区
+        </h4>
         <p className="settings-hint">
           工具只能在这些根目录内读写文件；「已失效」表示路径当前不可用
         </p>
         <div className="workspace-list">
-          {workspaces.length === 0 ? (
+          {workspacesLoading ? (
+            <div className="list-loading" role="status">
+              加载中…
+            </div>
+          ) : workspaces.length === 0 ? (
             <div className="tool-list-empty">暂无工作区</div>
           ) : (
             workspaces.map((w) => (
@@ -1449,9 +1692,10 @@ export function SettingsPage() {
                       className="workspace-remove-btn"
                       onClick={() => handleRemoveWorkspace(w)}
                       title="移除该工作区"
+                      aria-label={`移除工作区 ${w.label}`}
                     >
-                      ×
-                    </button>
+                  <IconX />
+                </button>
                   )}
                 </div>
               </div>
@@ -1466,6 +1710,7 @@ export function SettingsPage() {
             value={newWorkspacePath}
             onChange={(e) => setNewWorkspacePath(e.target.value)}
             placeholder="绝对路径，如 D:\projects\demo"
+            aria-label="工作区绝对路径"
             spellCheck={false}
           />
           <input
@@ -1473,6 +1718,7 @@ export function SettingsPage() {
             value={newWorkspaceLabel}
             onChange={(e) => setNewWorkspaceLabel(e.target.value)}
             placeholder="备注名（可选）"
+            aria-label="工作区备注名（可选）"
           />
           <label className="workspace-writable-check">
             <input
@@ -1492,13 +1738,17 @@ export function SettingsPage() {
         </div>
 
         {workspaceError && (
-          <div className="workspace-error">⚠ {workspaceError}</div>
+          <div className="workspace-error" role="alert">
+            <IconAlert /> {workspaceError}
+          </div>
         )}
       </div>
 
       {/* ─── 外观 ─── */}
       <div className="settings-section">
-        <h3>🎨 外观</h3>
+        <h3>
+          <IconPalette /> 外观
+        </h3>
         <label>
           <span>主题</span>
           <select value={config.ui.theme} onChange={(e) => {
@@ -1534,7 +1784,9 @@ export function SettingsPage() {
 
       {/* ─── 页面逻辑 ─── */}
       <div className="settings-section">
-        <h3>🪟 页面逻辑</h3>
+        <h3>
+          <IconLayout /> 页面逻辑
+        </h3>
         <label>
           <span>悬浮窗时钟</span>
           <input type="checkbox" checked={config.ui.show_float_clock ?? false}
@@ -1574,7 +1826,9 @@ export function SettingsPage() {
 
       {/* ─── 戳一下设置 ─── */}
       <div className="settings-section">
-        <h3>👆 戳一下</h3>
+        <h3>
+          <IconHand /> 戳一下
+        </h3>
         <label>
           <span>启用戳一下</span>
           <input type="checkbox" checked={config.ui.poke_enabled ?? true}
@@ -1599,7 +1853,9 @@ export function SettingsPage() {
 
       {/* ─── 气泡设置 ─── */}
       <div className="settings-section">
-        <h3>💬 气泡设置</h3>
+        <h3>
+          <IconMessage /> 气泡设置
+        </h3>
         <label>
           <span>自动隐藏时间</span>
           <input type="number" min="0" max="3600" step="1"
@@ -1611,20 +1867,30 @@ export function SettingsPage() {
 
       {/* ─── 人格管理 ─── */}
       <div className="settings-section">
-        <h3>🎭 人格管理</h3>
+        <h3>
+          <IconSparkles /> 人格管理
+        </h3>
         <p className="settings-hint">编辑角色设定、系统提示词和性格特征</p>
-        <button className="persona-editor-btn" onClick={() => setCurrentPage("persona")}>✦ 打开人格编辑器</button>
+        <button className="persona-editor-btn" onClick={() => setCurrentPage("persona")}>
+          <IconSparkles /> 打开人格编辑器
+        </button>
       </div>
 
       {/* ─── 备份与导入 ─── */}
       <div className="settings-section">
-        <h3>💾 备份与导入</h3>
+        <h3>
+          <IconDownload /> 备份与导入
+        </h3>
         <p className="settings-hint">导出数据用于迁移或备份，导入时可选择合并或替换</p>
         <div className="backup-actions">
           <div className="backup-group">
             <span className="backup-label">记忆数据</span>
-            <button className="backup-btn" onClick={handleExportMemories}>📤 导出记忆</button>
-            <button className="backup-btn" onClick={handleImportMemories}>📥 导入记忆</button>
+            <button className="backup-btn" onClick={handleExportMemories}>
+              <IconUpload /> 导出记忆
+            </button>
+            <button className="backup-btn" onClick={handleImportMemories}>
+              <IconDownload /> 导入记忆
+            </button>
           </div>
           <div className="backup-group">
             <span className="backup-label">人格配置</span>
@@ -1636,7 +1902,9 @@ export function SettingsPage() {
 
       {/* ─── 使用统计 ─── */}
       <div className="settings-section">
-        <h3>📊 使用统计</h3>
+        <h3>
+          <IconChart /> 使用统计
+        </h3>
         {stats ? (
           <div className="stats-grid">
             <div className="stats-item"><span className="stats-value">{stats.total_requests}</span><span className="stats-label">请求次数</span></div>
@@ -1647,13 +1915,24 @@ export function SettingsPage() {
             <div className="stats-item"><span className="stats-value">{stats.total_requests > 0 ? Math.round(stats.total_tokens / stats.total_requests) : 0}</span><span className="stats-label">平均 Token/次</span></div>
           </div>
         ) : (
-          <div className="stats-loading">加载中...</div>
+          <div className="stats-loading" role="status">
+            加载中…
+          </div>
         )}
-        <button className="stats-reset-btn" onClick={async () => {
-          if (!confirm("确认重置所有统计数据？")) return;
-          await invoke("reset_usage_stats");
-          invoke<UsageStats>("get_usage_stats").then(setStats);
-        }}>🔄 重置统计</button>
+        <button className="stats-reset-btn" onClick={() => {
+          askConfirm({
+            title: "重置统计",
+            description: "确认重置所有统计数据？累计请求次数与 Token 用量会清零，且不可恢复。",
+            confirmLabel: "重置",
+            danger: true,
+            onConfirm: async () => {
+              await invoke("reset_usage_stats");
+              invoke<UsageStats>("get_usage_stats").then(setStats);
+            },
+          });
+        }}>
+          <IconRefresh /> 重置统计
+        </button>
       </div>
 
       {/* ─── 保存/测试 ─── */}
@@ -1662,22 +1941,47 @@ export function SettingsPage() {
           if (!config) return;
           setSaving(true);
           try {
-            await invoke("update_config", { newConfig: config });
-            configSnapshotRef.current = sections(config);
+            /*
+             * 保存前把 llm 段换成后端的最新值
+             *
+             * llm 段从不通过这个按钮编辑（提供商各自即时落盘），本地副本却可能
+             * 因为别的窗口/别的命令而过期；整份回写会把过期值盖回磁盘。
+             * 这里以磁盘为准合并，其他分段仍保存用户在本页的编辑。
+             */
+            let payload = config;
+            try {
+              const fresh = await invoke<AppConfig>("get_config");
+              payload = { ...config, llm: fresh.llm };
+              setConfig(payload);
+            } catch (e) {
+              console.error("Failed to refresh llm before save:", e);
+            }
+            await invoke("update_config", { newConfig: payload });
+            configSnapshotRef.current = sections(payload);
             setTestResult("✅ 配置已保存");
           } catch (e) { setTestResult(`❌ 保存失败: ${e}`); }
           finally { setSaving(false); }
-        }} disabled={saving}>{saving ? "保存中..." : "💾 保存全局配置"}</button>
+        }} disabled={saving}>
+          {saving ? "保存中..." : <><IconSave /> 保存全局配置</>}
+        </button>
         {configDirty && <span className="settings-unsaved-hint">● 有未保存的修改</span>}
       </div>
-
-      {testResult && <div className="test-result">{testResult}</div>}
 
       {/* ─── 添加提供商弹窗 ─── */}
       {showAddModal && (
         <div className="modal-overlay" onClick={() => setShowAddModal(false)}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-            <h3>➕ 添加 API 提供商</h3>
+          <div
+            className="modal-card"
+            ref={addModalRef}
+            tabIndex={-1}
+            role="dialog"
+            aria-modal="true"
+            aria-label="添加 API 提供商"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>
+            <IconPlus /> 添加 API 提供商
+          </h3>
             <label>
               <span>名称</span>
               <input
@@ -1717,6 +2021,11 @@ export function SettingsPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* 统一确认弹窗（替代原生 confirm） */}
+      {confirmRequest && (
+        <ConfirmDialog {...confirmRequest} onClose={() => setConfirmRequest(null)} />
       )}
     </div>
   );

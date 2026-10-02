@@ -6,6 +6,8 @@ import {
   TOOL_PERMISSION_RISK,
   normalizePermission,
 } from "../../types/tools";
+import { IconClock, IconLock } from "../icons";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 
 /**
  * 把工具参数格式化成可读文本
@@ -104,41 +106,13 @@ export function ToolApprovalDialog() {
   }, [pendingApproval]);
 
   /*
-   * 焦点管理
-   *
-   * - 打开时聚焦"拒绝"（最安全的默认动作），而不是让焦点留在背景页面上；
-   * - Tab 在弹窗内循环，不把键盘用户带到遮罩后面的控件；
-   * - 关闭时把焦点还给打开前的元素（通常是输入框）。
+   * 焦点管理：打开时聚焦"拒绝"（最安全的默认动作），Tab 在弹窗内循环，
+   * 关闭时把焦点还给打开前的元素（通常是输入框）。统一走共享的焦点陷阱。
    */
   const cardRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!pendingApproval) return;
-    const previous = document.activeElement as HTMLElement | null;
-    const card = cardRef.current;
-    card?.querySelector<HTMLElement>(".tool-approval-btn.deny")?.focus();
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Tab" || !card) return;
-      const nodes = Array.from(
-        card.querySelectorAll<HTMLElement>("button:not([disabled])")
-      );
-      if (nodes.length === 0) return;
-      const first = nodes[0];
-      const last = nodes[nodes.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    card?.addEventListener("keydown", onKeyDown);
-    return () => {
-      card?.removeEventListener("keydown", onKeyDown);
-      previous?.focus?.();
-    };
-  }, [pendingApproval]);
+  useFocusTrap(cardRef, !!pendingApproval, {
+    initialFocusSelector: ".tool-approval-btn.deny",
+  });
 
   if (!pendingApproval) return null;
 
@@ -164,7 +138,7 @@ export function ToolApprovalDialog() {
       <div className="tool-approval-card" ref={cardRef} onClick={(e) => e.stopPropagation()}>
         <div className="tool-approval-title">
           <span className="tool-approval-icon" aria-hidden="true">
-            🔐
+            <IconLock />
           </span>
           <span>请求调用工具</span>
         </div>
@@ -206,7 +180,7 @@ export function ToolApprovalDialog() {
               />
             </div>
             <span className="tool-approval-countdown-text">
-              ⏳ 剩余 {seconds} 秒，超时将自动拒绝
+              <IconClock /> 剩余 {seconds} 秒，超时将自动拒绝
             </span>
           </div>
         )}

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useChatStore } from "../../stores/chatStore";
 import type { SessionNote } from "../../types/events";
+import { IconBrain, IconChevronRight } from "../icons";
 
 /**
  * 工作记忆面板
@@ -37,23 +38,25 @@ export function NotesPanelView({
   if (notes.length === 0) return null;
 
   return (
-    <div className="notes-panel">
+    <div className="notes-panel panel">
       <button
-        className="notes-head"
+        className="notes-head panel-head"
         onClick={() => setExpanded((prev) => !prev)}
         aria-expanded={expanded}
         title={expanded ? "收起工作记忆" : "展开工作记忆"}
       >
-        <span className="notes-icon" aria-hidden="true">
-          🧠
+        <span className="notes-icon panel-icon" aria-hidden="true">
+          <IconBrain />
         </span>
-        <span className="notes-count">工作记忆 {notes.length}</span>
-        <span className="notes-headline">{notesHeadline(notes)}</span>
-        <span className={`notes-arrow ${expanded ? "expanded" : ""}`}>▶</span>
+        <span className="notes-count chip">工作记忆 {notes.length}</span>
+        <span className="notes-headline panel-headline">{notesHeadline(notes)}</span>
+        <span className={`panel-arrow ${expanded ? "expanded" : ""}`}>
+          <IconChevronRight />
+        </span>
       </button>
 
       {expanded && (
-        <div className="notes-body">
+        <div className="notes-body panel-body">
           <p className="notes-hint">
             模型主动记下的结论，会在之后几轮作为背景资料注入（带「不可信」标记）。
             它们只影响模型的措辞与判断，不会改变工具权限或审批。
@@ -68,8 +71,8 @@ export function NotesPanelView({
               </li>
             ))}
           </ul>
-          <div className="notes-actions">
-            <button className="notes-clear-btn" onClick={onClear}>
+          <div className="panel-actions">
+            <button className="btn-ghost danger notes-clear-btn" onClick={onClear}>
               清空工作记忆
             </button>
           </div>

@@ -7,6 +7,7 @@ import { MessageTimeline } from "./MessageTimeline";
 import { RewindConfirmDialog } from "./RewindConfirmDialog";
 import { StreamingText } from "./StreamingText";
 import { ToolCallList } from "./ToolCallCard";
+import { IconChevronDown, IconSparkles } from "../icons";
 
 /** 距底部小于该值时视为"位于底部"，才启用自动滚动跟随 */
 const NEAR_BOTTOM_THRESHOLD = 80;
@@ -83,10 +84,45 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  const isNearBottom = () => {
+  /*
+   * 贴底跟随（stick-to-bottom）
+   *
+   * `stickRef` 只由**用户滚动**更新：内容自己长高不会触发 scroll 事件，
+   * 因此工具卡片撑高之后不会被误判成"用户上翻了"而停止跟随
+   * （旧实现每帧问一次 isNearBottom，卡片一长高就跟丢了）。
+   * `atBottom` 是给"回到底部"按钮用的可订阅镜像。
+   */
+  const stickRef = useRef(true);
+  const [atBottom, setAtBottom] = useState(true);
+  /** 上翻期间新到的回复条数（按钮上的计数） */
+  const [unread, setUnread] = useState(0);
+  const lastSeenRef = useRef(0);
+  const messagesCountRef = useRef(messages.length);
+  messagesCountRef.current = messages.length;
+
+  useEffect(() => {
     const el = containerRef.current;
-    if (!el) return true;
-    return el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_THRESHOLD;
+    if (!el) return;
+    const onScroll = () => {
+      const near =
+        el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_THRESHOLD;
+      stickRef.current = near;
+      setAtBottom(near);
+      if (near) {
+        lastSeenRef.current = messagesCountRef.current;
+        setUnread(0);
+      }
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    stickRef.current = true;
+    setAtBottom(true);
+    setUnread(0);
+    lastSeenRef.current = messagesCountRef.current;
+    bottomRef.current?.scrollIntoView({ block: "end", behavior });
   };
 
   // 切换会话 / 首次挂载：无条件滚到最新消息
@@ -97,15 +133,23 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
   useEffect(() => {
     if (prevSessionRef.current === currentSessionId) return;
     prevSessionRef.current = currentSessionId;
+    stickRef.current = true;
+    setAtBottom(true);
+    setUnread(0);
+    lastSeenRef.current = messages.length;
     requestAnimationFrame(() => {
       bottomRef.current?.scrollIntoView({ block: "end" });
     });
   }, [currentSessionId, messages]);
 
-  // 新消息到达时：仅当用户位于底部附近才自动滚动（上翻阅读历史时不打扰）
+  // 新消息到达时：贴底才自动滚动（上翻阅读历史时不打扰），同时累计未读计数
   useEffect(() => {
-    if (isNearBottom()) {
+    if (stickRef.current) {
       bottomRef.current?.scrollIntoView({ block: "end" });
+      lastSeenRef.current = messages.length;
+      setUnread(0);
+    } else {
+      setUnread(Math.max(0, messages.length - lastSeenRef.current));
     }
   }, [messages, liveToolCalls.length]);
 
@@ -115,22 +159,52 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
   // scrollHeight/scrollTop/clientHeight（强制同步布局）+ 每帧写入滚动位置，
   // 是典型的 layout thrashing；而绝大多数帧并没有新内容。
   // 现在改为 100ms 一次的定时器：流式文本本身也是按块到达的，观感足够。
+  // 跟随条件用 stickRef（用户滚动驱动），内容长高不会打断它。
   useEffect(() => {
     if (!isStreaming) return;
     const timer = setInterval(() => {
-      if (isNearBottom()) {
+      if (stickRef.current) {
         bottomRef.current?.scrollIntoView({ block: "end" });
       }
     }, 100);
     return () => clearInterval(timer);
   }, [isStreaming]);
 
+  // 内容高度变化（工具卡片长高 / 展开折叠）时：只要用户原本贴底就跟上
+  const hasContent = messages.length > 0 || isStreaming;
+  useEffect(() => {
+    if (!hasContent || typeof ResizeObserver === "undefined") return;
+    const content = containerRef.current?.querySelector<HTMLElement>(".message-list-content");
+    if (!content) return;
+    const observer = new ResizeObserver(() => {
+      if (stickRef.current) {
+        bottomRef.current?.scrollIntoView({ block: "end" });
+      }
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [hasContent]);
+
   return (
     <div className="message-list-wrap">
-      <div className="message-list" ref={containerRef}>
+      {/*
+        role="log"：屏幕阅读器自动播报新增的回复（只报新增节点，
+        流式文本在同一节点内更新，不会刷屏）。
+        tabIndex=0：滚动容器本身可聚焦，键盘用户能用方向键/PgUp 翻阅历史
+        （容器内没有可聚焦内容时，WCAG 2.1.1 要求提供键盘滚动途径）。
+      */}
+      <div
+        className="message-list"
+        ref={containerRef}
+        role="log"
+        aria-label="对话消息"
+        tabIndex={0}
+      >
         {messages.length === 0 && !isStreaming && (
           <div className="empty-state">
-            <div className="empty-icon">✦</div>
+            <div className="empty-icon">
+              <IconSparkles />
+            </div>
             {isTaskSession ? (
               <>
                 <p>描述你的目标，Plan 阶段会先只读调查并给出计划</p>
@@ -144,41 +218,63 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
             )}
           </div>
         )}
-        {messages.map((msg, index) => (
-          <MessageBubble
-            key={msg.id}
-            message={msg}
-            showStats={showStats}
-            anchorId={`msg-${msg.id}`}
-            isLast={index === messages.length - 1}
-            onRewind={setRewindTarget}
-            // 尾部回复还没拿到落库记录时，用内存中的记录兜底渲染（避免卡片闪一下就没）
-            liveToolCalls={
-              attachToTailAssistant && msg.id === tailAssistantId
-                ? liveToolCalls
-                : undefined
-            }
-          />
-        ))}
-        {/* 进行中的工具调用：显示在流式气泡上方（悬浮窗不会收到工具事件） */}
-        {isStreaming && liveToolCalls.length > 0 && (
-          <div className="message-row assistant">
-            <div className="message-bubble streaming tool-live-bubble">
-              <ToolCallList calls={liveToolCalls} />
-            </div>
+        {/*
+          内容块：ResizeObserver 观察它来感知"卡片长高"这类**不触发 scroll 事件**的
+          高度变化（滚动容器自身高度固定，观察容器本身不会有任何回调）。
+          空状态不放进来：它靠 `height:100%` 在滚动容器里垂直居中。
+        */}
+        {(messages.length > 0 || isStreaming) && (
+          <div className="message-list-content">
+            {messages.map((msg, index) => (
+              <MessageBubble
+                key={msg.id}
+                message={msg}
+                showStats={showStats}
+                anchorId={`msg-${msg.id}`}
+                isLast={index === messages.length - 1}
+                onRewind={setRewindTarget}
+                // 尾部回复还没拿到落库记录时，用内存中的记录兜底渲染（避免卡片闪一下就没）
+                liveToolCalls={
+                  attachToTailAssistant && msg.id === tailAssistantId
+                    ? liveToolCalls
+                    : undefined
+                }
+              />
+            ))}
+            {/* 进行中的工具调用：显示在流式气泡上方（悬浮窗不会收到工具事件） */}
+            {isStreaming && liveToolCalls.length > 0 && (
+              <div className="message-row assistant">
+                <div className="message-bubble streaming tool-live-bubble">
+                  <ToolCallList calls={liveToolCalls} />
+                </div>
+              </div>
+            )}
+            {isStreaming && <StreamingText />}
+            {/* 没有对应回复的工具记录（生成失败/被取消） */}
+            {orphanToolCalls && (
+              <div className="message-row assistant">
+                <div className="message-bubble tool-live-bubble">
+                  <ToolCallList calls={liveToolCalls} />
+                </div>
+              </div>
+            )}
+            <div ref={bottomRef} />
           </div>
         )}
-        {isStreaming && <StreamingText />}
-        {/* 没有对应回复的工具记录（生成失败/被取消） */}
-        {orphanToolCalls && (
-          <div className="message-row assistant">
-            <div className="message-bubble tool-live-bubble">
-              <ToolCallList calls={liveToolCalls} />
-            </div>
-          </div>
-        )}
-        <div ref={bottomRef} />
+        {!isStreaming && messages.length === 0 && <div ref={bottomRef} />}
       </div>
+      {/* 上翻阅读时的"回到底部"入口：流式结束的新内容不再无声无息 */}
+      {!atBottom && (
+        <button
+          type="button"
+          className="scroll-bottom-btn"
+          onClick={() => scrollToBottom()}
+          aria-label={unread > 0 ? `回到底部，${unread} 条新消息` : "回到底部"}
+        >
+          <IconChevronDown />
+          {unread > 0 ? `${unread} 条新消息` : "回到底部"}
+        </button>
+      )}
       {/* 右侧消息时间轴：按消息实际位置打点，点击跳转、滚动高亮 */}
       <MessageTimeline messages={messages} containerRef={containerRef} />
       {rewindTarget && (

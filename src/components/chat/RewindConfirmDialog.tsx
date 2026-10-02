@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useChatStore, type Message } from "../../stores/chatStore";
 import type { RewindPreviewView } from "../../types/events";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
+import { IconRewind } from "../icons";
 
 interface Props {
   message: Message;
@@ -43,10 +45,8 @@ export function RewindConfirmDialog({ message, onClose }: Props) {
     };
   }, [message.id, previewRewind]);
 
-  // 焦点进入弹窗：Esc / 点击遮罩关闭才对键盘用户可用
-  useEffect(() => {
-    dialogRef.current?.focus();
-  }, []);
+  // 焦点陷阱：Tab 不会跑到遮罩背后，关闭时焦点归还给触发它的消息操作按钮
+  useFocusTrap(dialogRef, true, { initialFocusSelector: ".modal-cancel-btn" });
 
   const totalFiles =
     preview?.affected_streams.reduce((sum, stream) => sum + stream.files, 0) ?? 0;
@@ -84,7 +84,9 @@ export function RewindConfirmDialog({ message, onClose }: Props) {
           if (e.key === "Escape" && !submitting) onClose();
         }}
       >
-        <h3>⤺ 回退到此处</h3>
+        <h3>
+          <IconRewind /> 回退到此处
+        </h3>
         {loading ? (
           <p className="rewind-desc">正在计算影响范围…</p>
         ) : loadError ? (

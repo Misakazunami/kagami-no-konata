@@ -9,6 +9,7 @@ import {
   type ModelRef,
   type SessionModelPref,
 } from "../../types/models";
+import { IconPlus, IconZap } from "../icons";
 
 /** 未设置模型时的占位（"跟随全局提供商"） */
 const INHERIT_VALUE = "__inherit__";
@@ -142,7 +143,7 @@ export function ModelBar() {
               : "自动选择：按设置里的主/子模型路由（只对任务会话生效）"
           }
         >
-          ⚡ 自动
+          <IconZap /> 自动
         </button>
       )}
 
@@ -163,6 +164,7 @@ export function ModelBar() {
           value={manualValue}
           onChange={(e) => handleModelChange(e.target.value)}
           title="本会话使用的模型（只影响下一轮，不会打断正在生成的回复）"
+          aria-label="本会话使用的模型"
         >
           <option value={INHERIT_VALUE}>
             跟随全局：{activeProviderModels(catalog)?.current_model || "未配置"}
@@ -226,7 +228,7 @@ export function ModelBar() {
         onClick={() => setCurrentPage("settings")}
         title="下拉框只列出「已在设置里启用」的模型；点这里去设置页拉取并启用更多模型"
       >
-        ＋
+        <IconPlus />
       </button>
     </div>
   );

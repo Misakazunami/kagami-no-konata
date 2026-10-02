@@ -11,7 +11,17 @@ import { PersonaEditor } from "./components/persona/PersonaEditor";
 import { OnboardingPage } from "./components/onboarding/OnboardingPage";
 import { FloatingWidget } from "./components/float/FloatingWidget";
 import { ToolApprovalDialog } from "./components/chat/ToolApprovalDialog";
-import "./App.css";
+import { AppErrorBoundary } from "./components/ui/AppErrorBoundary";
+import { ToastViewport } from "./components/ui/ToastViewport";
+import "./styles/tokens.css";
+import "./styles/base.css";
+import "./styles/chat.css";
+import "./styles/settings.css";
+import "./styles/float.css";
+import "./styles/tools.css";
+import "./styles/panels.css";
+import "./styles/conversation.css";
+import "./styles/a11y.css";
 import "highlight.js/styles/github-dark.css";
 
 function applyTheme(theme: string, fontSize: number) {
@@ -219,6 +229,7 @@ function App() {
     return (
       <div className="app float-app">
         <FloatingWidget />
+        <ToastViewport />
       </div>
     );
   }
@@ -227,7 +238,7 @@ function App() {
   if (!appReady) {
     return (
       <div className="app" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", color: "var(--text-secondary, #a9b1d6)" }}>
-        加载中...
+        <span role="status" aria-live="polite">加载中…</span>
       </div>
     );
   }
@@ -241,8 +252,19 @@ function App() {
       {currentPage === "persona" && <PersonaEditor />}
       {/* 工具审批弹窗：跨页面都要能看到，且只在主窗口渲染（悬浮窗在上方已提前返回） */}
       <ToolApprovalDialog />
+      <ToastViewport />
     </div>
   );
 }
 
-export default App;
+/**
+ * 根错误边界：任何组件渲染期抛错都兜在这里，而不是把 WebView 变成白屏。
+ * 放在导出层而非 App 内部，两个窗口（含桌宠）都被覆盖。
+ */
+export default function Root() {
+  return (
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
+  );
+}
