@@ -26,6 +26,13 @@ const CONTEXT_SUMMARIZE_THRESHOLD: i64 = 20;
 /// 摘要生成失败时的降级窗口上限（宁可多带一些历史，也不让消息凭空消失）
 const CONTEXT_FALLBACK_MAX: i64 = 40;
 
+/// 自动标题的字数上限
+///
+/// prompt 里的"不超过 N 个字"与代码里的硬截断必须共用这一个数：写成两处
+/// （历史实现 prompt 写 15、截断按 20）模型偶尔给出 16-20 字时，标题就与
+/// 提示里的约束对不上，而且侧栏一行也放不下。
+const AUTO_TITLE_MAX_CHARS: usize = 15;
+
 /// 估算 token 数量（粗略兜底，仅用于统计展示）
 ///
 /// 统一委托给 `harness::traits::estimate_tokens`：历史上这里与工具运行时
@@ -53,6 +60,40 @@ fn build_retrieval_query(user_input: &str, conversation: &[Message]) -> String {
     let mut parts: Vec<&str> = recent.into_iter().rev().collect();
     parts.push(user_input);
     parts.join(" ")
+}
+
+/// 会话的占位标题：仍是这两个之一，说明标题从未被设置过
+///
+/// 普通会话建出来是"新会话"，任务会话是"新任务"（见 `create_session`）。
+/// 自动标题据此判断"该不该起名"，因此两者都算占位——历史实现只比对
+/// "新会话"，任务会话的标题便永远停在"新任务"（界面上只能手动改名）。
+fn is_default_session_title(title: &str) -> bool {
+    matches!(title, "新会话" | "新任务")
+}
+
+/// 清洗模型返回的标题；清洗后为空返回 `None`（宁可不改名，也不写空标题）
+///
+/// 即使 prompt 明确要求"一句话、不加标点、不加引号"，模型仍会给出多行、
+/// 带引号或句号收尾的结果，这里统一兜住：
+/// - 只取第一行非空内容（多行标题在侧栏里只会显示成一团）；
+/// - 去掉首尾成对的引号（中英文都去）与空白；
+/// - 去掉末尾的中文句号；
+/// - 最后按 `AUTO_TITLE_MAX_CHARS` 截断。
+///
+/// 这些清洗只作用于**展示用的短标题**，不涉及任何文件路径或提示注入面。
+fn sanitize_generated_title(raw: &str) -> Option<String> {
+    let first_line = raw.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let unquoted = first_line
+        .trim_matches(|c| matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’'))
+        .trim();
+    let trimmed = match unquoted.strip_suffix('。') {
+        Some(rest) => rest.trim_end(),
+        None => unquoted,
+    };
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(AUTO_TITLE_MAX_CHARS).collect())
 }
 
 /// 把"写库失败"翻译成用户能看懂的话
@@ -943,46 +984,59 @@ async fn run_generation(
     // 标题与记忆都不该再写。`add_message` 的失败兜底只覆盖了正文，这里
     // 必须在继续之前确认会话仍然存在，否则记忆会以悬空的 source_session
     // 落库、标题写入也会静默失败。
-    let session_alive = {
+    // 会话只读一次：下面"是否已被删除"与"是否还是占位标题"用的是同一份快照
+    // （历史实现读了两次，两次之间会话还可能被删掉）。
+    let current_title = {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-        store.get_session(&session_id).is_ok()
+        store.get_session(&session_id).ok().map(|s| s.title)
     };
-    if !session_alive {
+    let Some(current_title) = current_title else {
         eprintln!(
             "[chat] 会话已被删除，跳过标题与记忆提取 session={} stream={}",
             session_id, stream_id
         );
         return Ok(());
-    }
-
-    let should_generate_title = {
-        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-        match store.get_session(&session_id) {
-            Ok(session) => session.title == "新会话",
-            Err(_) => false,
-        }
     };
 
-    if should_generate_title {
+    // 占位标题说明"还没有人给它起过名"：普通会话建出来是"新会话"，任务会话是
+    // "新任务"，两者都算。历史实现只比对"新会话"，任务会话的标题便永远停在
+    // "新任务"（界面上只能手动改名）。
+    //
+    // 已知边界：标题是纯字符串判定，用户若把标题手动改成恰好等于默认名的
+    // "新会话"/"新任务"，下一条消息会被自动标题覆盖。库里没有"是否被改过名"
+    // 的标志位，而误覆盖一个恰好等于默认名的标题，代价远小于让任务会话
+    // 永远拿不到标题。
+    if is_default_session_title(&current_title) {
         let title_prompt = format!(
-            "请用一句话概括以下对话主题，不超过15个字，不要加标点，不要加引号：\n用户：{}",
-            content
+            "请用一句话概括以下对话主题，不超过{}个字，不要加标点，不要加引号：\n用户：{}",
+            AUTO_TITLE_MAX_CHARS, content
         );
         let title_msgs = vec![LlmMessage::user(title_prompt)];
 
         let title_proxy = LlmProxy::new(&llm_provider);
-        if let Ok(title) = title_proxy.chat(title_msgs).await {
-            let title = title.trim().trim_matches('"').trim_matches('\'');
-            let title = if title.chars().count() > 20 {
-                title.chars().take(20).collect::<String>()
-            } else {
-                title.to_string()
-            };
-            if !title.is_empty() {
-                let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-                let _ = store.update_session_title(&session_id, &title);
-                let _ = app.emit("session-title-updated", (&session_id, &title));
+        match title_proxy.chat(title_msgs).await {
+            Ok(raw) => {
+                match sanitize_generated_title(&raw) {
+                    Some(title) => {
+                        let store = state.chat_store.lock().map_err(|e| e.to_string())?;
+                        match store.update_session_title(&session_id, &title) {
+                            // 先落库再广播：否则界面显示的是库里没有的标题，
+                            // 重启后又变回占位标题（用户会以为改名没生效）
+                            Ok(()) => {
+                                let _ = app.emit("session-title-updated", (&session_id, &title));
+                            }
+                            Err(e) => eprintln!(
+                                "[chat] 标题写入失败，保留占位标题 session={}: {}",
+                                session_id, e
+                            ),
+                        }
+                    }
+                    // 模型只回了空白/引号：保留占位标题，下一条消息会再试一次
+                    None => eprintln!("[chat] 标题清洗后为空，保留占位标题 session={}", session_id),
+                }
             }
+            // 标题是锦上添花：生成失败不打扰用户，也不该把这一轮变成失败
+            Err(e) => eprintln!("[chat] 标题生成失败 session={}: {}", session_id, e),
         }
     }
 
@@ -1685,6 +1739,46 @@ mod tests {
         assert_eq!(estimate_tokens(""), 1);
         // 中英混合是分别加权后的和，不再共用同一个分支
         assert!(estimate_tokens(&"此".repeat(70)) > estimate_tokens(&"a".repeat(70)));
+    }
+
+    /// 任务会话的默认标题也必须算"占位"：否则它永远拿不到自动标题
+    #[test]
+    fn default_titles_cover_task_sessions() {
+        assert!(is_default_session_title("新会话"));
+        assert!(is_default_session_title("新任务"));
+        // 已经起过名的标题不能被自动标题覆盖
+        assert!(!is_default_session_title("FTP 部署脚本测试"));
+        assert!(!is_default_session_title(""));
+        // 只是"包含"默认字样的标题同样是用户起的名
+        assert!(!is_default_session_title("新会话归档"));
+    }
+
+    /// 标题清洗：多行、引号、句号都要兜住，且与 prompt 里的字数上限一致
+    #[test]
+    fn generated_title_is_sanitized_and_capped() {
+        // 清洗结果的简写（None = 放弃改名，保留占位标题）
+        let clean = super::sanitize_generated_title;
+
+        assert_eq!(clean("FTP 部署脚本").as_deref(), Some("FTP 部署脚本"));
+        // 首尾引号（中英文）与空白
+        assert_eq!(clean("\"部署脚本\"").as_deref(), Some("部署脚本"));
+        assert_eq!(clean("“部署脚本”").as_deref(), Some("部署脚本"));
+        assert_eq!(clean("  '  部署脚本  '  ").as_deref(), Some("部署脚本"));
+        // 句号收尾
+        assert_eq!(clean("部署脚本测试。").as_deref(), Some("部署脚本测试"));
+        // 多行只取第一行非空内容（空行在前也不影响）
+        assert_eq!(
+            clean("\n部署脚本测试\n说明：补充").as_deref(),
+            Some("部署脚本测试")
+        );
+        // 硬截断与 prompt 里的上限是同一个数
+        let long = "一".repeat(AUTO_TITLE_MAX_CHARS + 8);
+        assert_eq!(clean(&long).unwrap().chars().count(), AUTO_TITLE_MAX_CHARS);
+        // 只有空白 / 引号 / 句号时返回 None：调用方据此保留占位标题
+        assert!(clean("").is_none());
+        assert!(clean("   \n  ").is_none());
+        assert!(clean("\"\"").is_none());
+        assert!(clean("。").is_none());
     }
 
     /// 旧库缺列时，摘要读取必须降级为"无摘要"而不是让发送失败
