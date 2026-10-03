@@ -10,10 +10,12 @@ name = "kagami_no_konata_lib"
 crate-type = ["staticlib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+# tauri >= 2.12（tao >= 0.36）修复了 Linux Wayland 下标题栏按钮
+# 首启无响应、必须先最大化才能点关闭的 bug（tao#1218 / tauri#13440）。
+tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico"] }
+tauri = { version = "2.12", features = ["tray-icon", "image-png", "image-ico"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
