@@ -316,6 +316,7 @@ export function SettingsPage() {
 
   const setCurrentPage = useChatStore((s) => s.setCurrentPage);
   const platform = useUiStore((s) => s.platform);
+  const globalShortcutStatus = useUiStore((s) => s.globalShortcutStatus);
   // 能力尚未加载时按“支持”处理，避免设置页刚打开就闪一下禁用态
   const floatPositioningSupported = platform?.windowPositioning ?? true;
   const closeActionDefault = platform?.closeActionDefault ?? "hide";
@@ -1925,8 +1926,23 @@ export function SettingsPage() {
                 置顶：{platform.alwaysOnTop ? "可用" : "不保证"}
               </span>
               <span className="platform-diagnostic-item">
-                全局快捷键：{platform.globalShortcut ? "可用" : "不可用"}
+                全局快捷键：
+                {platform.globalShortcutBackend === "portal"
+                  ? globalShortcutStatus?.available
+                    ? "可用（系统门户，实验）"
+                    : globalShortcutStatus
+                      ? "门户未就绪（实验）"
+                      : "正在请求门户授权…"
+                  : platform.globalShortcut
+                    ? "可用"
+                    : "不可用"}
               </span>
+              {platform.globalShortcutBackend === "portal" &&
+                globalShortcutStatus?.trigger && (
+                  <span className="platform-diagnostic-item">
+                    门户触发方式：{globalShortcutStatus.trigger}
+                  </span>
+                )}
               <span className="platform-diagnostic-item">
                 截图：
                 {platform.screenCapture
@@ -1942,6 +1958,13 @@ export function SettingsPage() {
                 托盘：{platform.trayMenu ? (platform.trayReliable ? "可用" : "可用但不保证可见") : "不可用"}
               </span>
             </div>
+            {platform.globalShortcutBackend === "portal" && (
+              <p className="settings-hint">
+                Wayland 全局快捷键通过 XDG 门户申请（实验）：首次使用可能需要在系统弹窗中确认，
+                绑定成功前不会显示“可用”；实际按键由桌面环境管理。若桌面不支持该门户，
+                请改用 X11/Xorg 会话或托盘菜单。
+              </p>
+            )}
             {platform.notes.map((note) => (
               <p className="settings-hint" key={note}>
                 {note}

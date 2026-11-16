@@ -18,6 +18,10 @@ mod unsupported;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 use unsupported as imp;
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -40,6 +44,21 @@ pub enum SessionType {
     Unknown,
 }
 
+/// 全局快捷键使用的后端。
+///
+/// - `Native`：Windows / X11，由前端 `tauri-plugin-global-shortcut` 注册；
+/// - `Portal`：Wayland 下通过 `org.freedesktop.portal.GlobalShortcuts`
+///   申请，绑定成功前 `PlatformCapabilities::global_shortcut` 保持 false；
+/// - `None`：当前会话没有可用后端。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlobalShortcutBackend {
+    Native,
+    Portal,
+    None,
+}
+
 /// 当前平台的能力集合。
 ///
 /// 前端通过 `get_platform_capabilities` 读取同一份数据，避免设置页写死
@@ -57,7 +76,10 @@ pub struct PlatformCapabilities {
     pub tray_reliable: bool,
     pub window_positioning: bool,
     pub always_on_top: bool,
+    /// 当前是否已经有一个“可用”的全局快捷键后端（门户绑定成功后才为 true）
     pub global_shortcut: bool,
+    /// 全局快捷键后端类型；前端据此选择插件注册或等待后端事件
+    pub global_shortcut_backend: GlobalShortcutBackend,
     pub screen_capture: bool,
     /// 截图可用，但只用于“看”，不能注入键鼠（Wayland 实验模式）
     pub screen_capture_only: bool,
@@ -75,6 +97,59 @@ pub struct PlatformCapabilities {
 pub fn capabilities() -> &'static PlatformCapabilities {
     static CAPS: OnceLock<PlatformCapabilities> = OnceLock::new();
     CAPS.get_or_init(imp::detect)
+}
+
+/// Wayland 门户快捷键是否已经绑定成功。
+///
+/// 只有 Linux 会写入这个状态；其它平台恒为 false。门户绑定是异步的，
+/// 因此不能把它塞进 `detect()` 的一次性结果里。
+#[cfg(target_os = "linux")]
+static PORTAL_SHORTCUT_READY: AtomicBool = AtomicBool::new(false);
+
+/// 门户快捷键最近一次成功/失败的说明，供设置页展示。
+#[cfg(target_os = "linux")]
+static PORTAL_SHORTCUT_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+/// 更新门户快捷键的运行时状态（仅 Linux 门户服务调用）。
+#[cfg(target_os = "linux")]
+pub(crate) fn set_portal_shortcut_status(ready: bool, note: Option<String>) {
+    PORTAL_SHORTCUT_READY.store(ready, Ordering::Relaxed);
+    if let Ok(mut slot) = PORTAL_SHORTCUT_NOTE.lock() {
+        *slot = note;
+    }
+}
+
+/// 返回“此刻”的平台能力。
+///
+/// 静态部分来自 `capabilities()`；Wayland 门户快捷键是异步绑定的，
+/// 这里叠加最新的运行时状态，避免前端拿到启动瞬间的旧值。
+pub fn current_capabilities() -> PlatformCapabilities {
+    let caps = capabilities().clone();
+
+    // 非 Linux 构建没有动态门户状态，保持 detect() 的结果即可。
+    #[cfg(target_os = "linux")]
+    let caps = {
+        let mut caps = caps;
+        if caps.global_shortcut_backend == GlobalShortcutBackend::Portal {
+            caps.global_shortcut = PORTAL_SHORTCUT_READY.load(Ordering::Relaxed);
+            if let Ok(note) = PORTAL_SHORTCUT_NOTE.lock() {
+                if let Some(note) = note.as_ref() {
+                    caps.notes.push(note.clone());
+                }
+            }
+        }
+        caps
+    };
+
+    caps
+}
+
+/// 启动需要平台后端的全局快捷键服务。
+///
+/// Windows / X11 由前端插件注册，这里不做事；Wayland 门户由 Linux 实现
+/// 在后台线程中创建会话并监听 `Activated`。
+pub fn start_global_shortcut_service(app: tauri::AppHandle) {
+    imp::start_global_shortcut_service(app);
 }
 
 /// 在 Tauri/GTK 初始化之前设置必要的环境变量。

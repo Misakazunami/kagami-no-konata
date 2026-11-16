@@ -53,6 +53,9 @@ windows = { version = "0.51", features = ["Win32_Foundation", "Win32_UI_WindowsA
 # X11 光标定位 / 绝对移动 / EWMH 窗口激活。
 # 不依赖 xdotool/wmctrl，避免把外部命令变成运行时依赖。
 x11rb = "0.13"
+# Wayland 全局快捷键：org.freedesktop.portal.GlobalShortcuts。
+# 只在显式 opt-in 的 Wayland 会话中启动，X11 仍走前端原生插件。
+ashpd = { version = "0.14", features = ["global_shortcuts"] }
 
 [target.'cfg(unix)'.dependencies]
 # 进程组回收（run_command 超时/取消时杀掉整个子进程树）。

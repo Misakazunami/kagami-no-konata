@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kagami no Konata
+Comment=Kagami no Konata — a local-first desktop AI companion
+Exec=kagami-no-konata
+Icon=kagami-no-konata
+Terminal=false
+Categories=Utility;
+NoDisplay=true

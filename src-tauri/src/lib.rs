@@ -216,6 +216,12 @@ pub fn run() {
                 eprintln!("[tray] 初始化失败，应用继续运行：{e}");
             }
 
+            // ─── Wayland 全局快捷键门户（实验，默认关闭） ───
+            // Windows/X11 走前端 tauri-plugin-global-shortcut；只有显式
+            // KONATA_WAYLAND_GLOBAL_SHORTCUTS=1 的 Wayland 会话才会真正启动
+            // 后台门户服务。绑定结果通过 global-shortcut-status 事件回报。
+            platform::start_global_shortcut_service(app.handle().clone());
+
             // ─── 窗口关闭拦截（根据配置决定行为） ───────
             let main_window = app.get_webview_window("main").unwrap();
             let window_clone = main_window.clone();

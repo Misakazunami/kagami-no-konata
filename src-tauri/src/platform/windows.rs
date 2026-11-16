@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, SetCursorPos, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
-use super::{PlatformCapabilities, SessionType};
+use super::{GlobalShortcutBackend, PlatformCapabilities, SessionType};
 
 pub fn detect() -> PlatformCapabilities {
     PlatformCapabilities {
@@ -23,6 +23,7 @@ pub fn detect() -> PlatformCapabilities {
         window_positioning: true,
         always_on_top: true,
         global_shortcut: true,
+        global_shortcut_backend: GlobalShortcutBackend::Native,
         screen_capture: true,
         screen_capture_only: false,
         input_injection: true,
@@ -35,6 +36,10 @@ pub fn detect() -> PlatformCapabilities {
 
 pub fn apply_startup_env() {
     // Windows 不需要 GTK/WebKitGTK 的 Linux 兼容环境变量。
+}
+
+pub fn start_global_shortcut_service(_app: tauri::AppHandle) {
+    // Windows 使用前端 `tauri-plugin-global-shortcut`，无需后端服务。
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

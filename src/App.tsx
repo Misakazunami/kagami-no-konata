@@ -5,7 +5,12 @@ import { register } from "@tauri-apps/plugin-global-shortcut";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emptyGenerationState, getLastLocalStreamId, useChatStore } from "./stores/chatStore";
 import { useUiStore } from "./stores/uiStore";
-import type { HarnessNoticeData, SessionUpdatedData } from "./types/events";
+import {
+  PLATFORM_EVENT,
+  type GlobalShortcutStatusData,
+  type HarnessNoticeData,
+  type SessionUpdatedData,
+} from "./types/events";
 import type { PlatformCapabilities } from "./types/platform";
 import { ChatWindow } from "./components/chat/ChatWindow";
 import { SettingsPage } from "./components/settings/SettingsPage";
@@ -135,14 +140,23 @@ function App() {
         useUiStore.getState().setPlatformCapabilities(caps);
         if (isFloatWindow || caps.sessionType !== "wayland") return;
 
-        const notice = caps.screenCaptureOnly
-          ? "Wayland 会话：已启用只读截图（实验），可以查看屏幕，但仍不能点击、输入或切换窗口；" +
-            "窗口绝对定位、置顶和全局快捷键也不可用。需要完整桌面能力请注销并选择 X11/Xorg 会话。"
-          : "Wayland 会话：窗口绝对定位、置顶、全局快捷键、屏幕截图和桌面控制不可用。" +
-            "需要完整桌面能力请注销并选择 X11/Xorg 会话。";
-        const key = caps.screenCaptureOnly
-          ? "konata-wayland-readonly-notice-shown"
-          : "konata-wayland-notice-shown";
+        const notice =
+          caps.globalShortcutBackend === "portal"
+            ? caps.globalShortcut
+              ? "Wayland 会话：全局快捷键已通过系统门户启用（实验）；窗口绝对定位、置顶和桌面控制仍不可用。"
+              : "Wayland 会话：已请求通过系统门户绑定 Ctrl+Shift+K（实验），首次可能需要在系统弹窗中确认；" +
+                "绑定成功前快捷键不可用。窗口绝对定位、置顶和桌面控制仍不可用。"
+            : caps.screenCaptureOnly
+              ? "Wayland 会话：已启用只读截图（实验），可以查看屏幕，但仍不能点击、输入或切换窗口；" +
+                "窗口绝对定位、置顶和全局快捷键也不可用。需要完整桌面能力请注销并选择 X11/Xorg 会话。"
+              : "Wayland 会话：窗口绝对定位、置顶、全局快捷键、屏幕截图和桌面控制不可用。" +
+                "需要完整桌面能力请注销并选择 X11/Xorg 会话。";
+        const key =
+          caps.globalShortcutBackend === "portal"
+            ? "konata-wayland-portal-shortcut-notice-shown"
+            : caps.screenCaptureOnly
+              ? "konata-wayland-readonly-notice-shown"
+              : "konata-wayland-notice-shown";
         try {
           if (sessionStorage.getItem(key)) return;
           sessionStorage.setItem(key, "1");
@@ -240,6 +254,19 @@ function App() {
               6000
             );
         }),
+        // Wayland 门户快捷键：绑定/失效都是异步的，必须按后端回报更新能力。
+        listen<GlobalShortcutStatusData>(PLATFORM_EVENT.globalShortcutStatus, (event) => {
+          const payload = event.payload;
+          if (!payload?.message) return;
+          useUiStore.getState().setGlobalShortcutStatus(payload);
+          useUiStore
+            .getState()
+            .pushToast(
+              payload.message,
+              payload.available ? "success" : "info",
+              payload.available ? 6000 : 9000
+            );
+        }),
       ]);
 
       if (disposed) {
@@ -255,6 +282,14 @@ function App() {
           console.error("Failed to subscribe window event:", result.reason);
         }
       }
+
+      // 监听装好后再读一次能力：门户绑定可能在上面的 IPC 往返期间完成，
+      // 那一条事件会错过；补一次快照，后续变化仍由事件驱动。
+      invoke<PlatformCapabilities>("get_platform_capabilities")
+        .then((caps) => {
+          if (!disposed) useUiStore.getState().setPlatformCapabilities(caps);
+        })
+        .catch((e) => console.error("Failed to refresh platform capabilities:", e));
     })();
 
     return () => {
@@ -274,7 +309,16 @@ function App() {
    * Wayland 下 global-hotkey 不保证可用，能力探测为 false 时直接跳过。
    */
   useEffect(() => {
-    if (isFloatWindow || !platform?.globalShortcut || mainShortcutRegistered) return;
+    if (
+      isFloatWindow ||
+      !platform ||
+      // 门户后端由后端直接监听 Activated 并切换窗口；前端再注册会重复触发。
+      platform.globalShortcutBackend === "portal" ||
+      !platform.globalShortcut ||
+      mainShortcutRegistered
+    ) {
+      return;
+    }
     mainShortcutRegistered = true;
     register("CmdOrCtrl+Shift+K", () => {
       invoke("toggle_main_window");

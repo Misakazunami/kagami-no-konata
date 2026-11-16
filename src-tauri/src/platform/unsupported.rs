@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
-use super::{PlatformCapabilities, SessionType};
+use super::{GlobalShortcutBackend, PlatformCapabilities, SessionType};
 
 pub fn detect() -> PlatformCapabilities {
     PlatformCapabilities {
@@ -16,6 +16,7 @@ pub fn detect() -> PlatformCapabilities {
         window_positioning: false,
         always_on_top: false,
         global_shortcut: false,
+        global_shortcut_backend: GlobalShortcutBackend::None,
         screen_capture: false,
         screen_capture_only: false,
         input_injection: false,
@@ -27,6 +28,8 @@ pub fn detect() -> PlatformCapabilities {
 }
 
 pub fn apply_startup_env() {}
+
+pub fn start_global_shortcut_service(_app: tauri::AppHandle) {}
 
 pub fn cursor_position() -> Option<(i32, i32)> {
     None

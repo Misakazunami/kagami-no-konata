@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { GlobalShortcutStatusData } from "../types/events";
 import type { PlatformCapabilities } from "../types/platform";
 
 export type ToastKind = "success" | "error" | "info";
@@ -16,6 +17,9 @@ interface UiState {
   /** 平台能力（启动时由 App 调用 `get_platform_capabilities` 填充） */
   platform: PlatformCapabilities | null;
   setPlatformCapabilities: (platform: PlatformCapabilities) => void;
+  /** Wayland 门户快捷键最近一次状态（仅 portal 后端会收到） */
+  globalShortcutStatus: GlobalShortcutStatusData | null;
+  setGlobalShortcutStatus: (status: GlobalShortcutStatusData) => void;
   /** 推一条 toast；同一文本只保留最新一条（避免重复点击刷屏） */
   pushToast: (text: string, kind?: ToastKind, duration?: number) => void;
   dismissToast: (id: string) => void;
@@ -38,8 +42,25 @@ const DEFAULT_DURATION: Record<ToastKind, number> = {
 export const useUiStore = create<UiState>((set, get) => ({
   toasts: [],
   platform: null,
+  globalShortcutStatus: null,
 
   setPlatformCapabilities: (platform) => set({ platform }),
+
+  setGlobalShortcutStatus: (status) =>
+    set((state) => ({
+      globalShortcutStatus: status,
+      // 门户绑定是异步的：把最新结果合并回能力，设置页与快捷键注册
+      // 都读取同一份状态，避免“启动时 false、绑定后仍显示不可用”。
+      platform: state.platform
+        ? {
+            ...state.platform,
+            globalShortcut: status.available,
+            notes: state.platform.notes.includes(status.message)
+              ? state.platform.notes
+              : [...state.platform.notes, status.message],
+          }
+        : null,
+    })),
 
   pushToast: (text, kind = "info", duration) => {
     const trimmed = text.trim();

@@ -121,7 +121,7 @@
 - **Main Window** (900×680, resizable, minimum 600×400): full chat and settings interface
 - **Floating Window** (220×340): transparent, borderless, always on top, skipped in the taskbar
 - System tray menu (open main window / open floating window / settings / quit)
-- Global shortcut `Ctrl+Shift+K` toggles the main window; the close button behaviour is configurable (hide / hide and show pet / quit)
+- Global shortcut `Ctrl+Shift+K` toggles the main window (on Wayland, set `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` to use the XDG portal; experimental); the close button behaviour is configurable (hide / hide and show pet / quit)
 - The main window stays usable from its minimum size up to full screen: the sidebar collapses, the conversation keeps a reading measure, and dialogs are height-capped with internal scrolling
 
 ---
@@ -144,7 +144,7 @@
 - **Node.js**: 20.19+ or 22.12+ (required by Vite 7; 22 LTS recommended)
 - **pnpm**: Package manager
 - **Rust**: 1.87+
-- **System Dependencies** (Linux): [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) (WebKitGTK, `libxdo-dev`, etc.; `libxdo` powers enigo keyboard/mouse control). See [docs/linux.md](docs/linux.md) for the Wayland support matrix and the read-only screenshot opt-in.
+- **System Dependencies** (Linux): [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) (WebKitGTK, `libxdo-dev`, etc.; `libxdo` powers enigo keyboard/mouse control). See [docs/linux.md](docs/linux.md) for the Wayland support matrix, the read-only screenshot opt-in, and the experimental XDG portal global-shortcut opt-in.
 
 ### Installation
 

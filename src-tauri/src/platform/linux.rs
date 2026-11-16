@@ -11,12 +11,17 @@ use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt, EventMask, Window,
 };
 
-use super::{PlatformCapabilities, SessionType};
+mod global_shortcuts;
+
+use super::{capabilities, GlobalShortcutBackend, PlatformCapabilities, SessionType};
 
 const CURRENT_TIME: u32 = 0;
 
 /// Wayland 只读截图的显式 opt-in 开关
 const WAYLAND_SCREENSHOT_ENV: &str = "KONATA_WAYLAND_SCREENSHOT";
+
+/// Wayland 全局快捷键（XDG 门户）的显式 opt-in 开关
+const WAYLAND_GLOBAL_SHORTCUTS_ENV: &str = "KONATA_WAYLAND_GLOBAL_SHORTCUTS";
 
 /// 解析环境变量开关：空值与 "0" 视为关闭，其余非空值视为开启
 fn env_flag(value: Option<&std::ffi::OsStr>) -> bool {
@@ -31,6 +36,27 @@ fn env_flag(value: Option<&std::ffi::OsStr>) -> bool {
 
 fn wayland_screenshot_opt_in() -> bool {
     env_flag(std::env::var_os(WAYLAND_SCREENSHOT_ENV).as_deref())
+}
+
+fn wayland_global_shortcuts_opt_in() -> bool {
+    env_flag(std::env::var_os(WAYLAND_GLOBAL_SHORTCUTS_ENV).as_deref())
+}
+
+/// 纯逻辑：根据会话类型与运行时条件选择全局快捷键后端。
+///
+/// X11 始终走原生插件；Wayland 只有在显式 opt-in 且存在 DBus 会话时
+/// 才尝试门户。门户接口本身是否存在、用户是否授权，要到异步绑定阶段
+/// 才能知道，因此这里返回 `Portal` 只代表“可以尝试”，不代表可用。
+fn shortcut_backend(
+    session: SessionType,
+    opt_in: bool,
+    has_dbus_session: bool,
+) -> GlobalShortcutBackend {
+    match session {
+        SessionType::X11 => GlobalShortcutBackend::Native,
+        SessionType::Wayland if opt_in && has_dbus_session => GlobalShortcutBackend::Portal,
+        _ => GlobalShortcutBackend::None,
+    }
 }
 
 /// Wayland 只读截图是否具备运行条件。
@@ -67,13 +93,19 @@ pub fn detect() -> PlatformCapabilities {
 
     let x11 = session == SessionType::X11;
     let wayland_screenshot = session == SessionType::Wayland && wayland_screenshot_available();
+    let has_dbus_session = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
+    let global_shortcut_backend =
+        shortcut_backend(session, wayland_global_shortcuts_opt_in(), has_dbus_session);
+    let wayland_shortcuts = global_shortcut_backend == GlobalShortcutBackend::Portal;
+
     match session {
         SessionType::X11 if !forced_x11 => {
             notes.push("X11 会话：窗口定位、置顶、截图和桌面控制可用。".to_string());
         }
         SessionType::Wayland => {
             notes.push(
-                "Wayland 会话：窗口绝对定位、置顶、全局快捷键和桌面控制不可用；\
+                "Wayland 会话：窗口绝对定位、置顶和桌面控制不可用；\
+                 全局快捷键只有在显式启用 XDG 门户实验后才可能可用；\
                  需要完整桌面能力请改用 X11/Xorg 会话。"
                     .to_string(),
             );
@@ -82,6 +114,28 @@ pub fn detect() -> PlatformCapabilities {
             notes.push("未检测到 DISPLAY/WAYLAND_DISPLAY：桌面能力不可用。".to_string());
         }
         _ => {}
+    }
+
+    if session == SessionType::Wayland {
+        if wayland_shortcuts {
+            notes.push(
+                "Wayland 全局快捷键已请求（实验）：将通过 XDG 门户绑定 Ctrl+Shift+K；\
+                 首次可能要求系统确认，绑定成功前不视为可用。实际按键可能由桌面调整。"
+                    .to_string(),
+            );
+        } else if wayland_global_shortcuts_opt_in() {
+            notes.push(
+                "已设置 KONATA_WAYLAND_GLOBAL_SHORTCUTS=1，但缺少 \
+                 DBUS_SESSION_BUS_ADDRESS：Wayland 全局快捷键依赖 XDG 桌面门户，当前不可用。"
+                    .to_string(),
+            );
+        } else {
+            notes.push(
+                "Wayland 全局快捷键默认关闭；设置 KONATA_WAYLAND_GLOBAL_SHORTCUTS=1 并重启\
+                 可尝试通过 XDG 门户启用（实验，需要桌面环境支持并经过用户确认）。"
+                    .to_string(),
+            );
+        }
     }
 
     if session == SessionType::Wayland {
@@ -117,7 +171,9 @@ pub fn detect() -> PlatformCapabilities {
         tray_reliable: tray_reliable(),
         window_positioning: x11,
         always_on_top: x11,
+        // 门户路径要等异步绑定成功后才由 current_capabilities() 置为 true。
         global_shortcut: x11,
+        global_shortcut_backend,
         screen_capture: x11 || wayland_screenshot,
         screen_capture_only: wayland_screenshot,
         input_injection: x11,
@@ -159,6 +215,12 @@ pub fn apply_startup_env() {
         eprintln!("[platform] KONATA_WAYLAND_SCREENSHOT=1：请求启用 Wayland 只读截图（实验）");
     }
 
+    if session == SessionType::Wayland && wayland_global_shortcuts_opt_in() {
+        eprintln!(
+            "[platform] KONATA_WAYLAND_GLOBAL_SHORTCUTS=1：请求启用 Wayland 全局快捷键（XDG 门户，实验）"
+        );
+    }
+
     let safe_mode = std::env::var_os("KONATA_WEBKIT_SAFE").is_some();
     let nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists();
 
@@ -179,6 +241,13 @@ fn set_env_if_absent(key: &str, value: &str) {
     if std::env::var_os(key).is_none() {
         std::env::set_var(key, value);
     }
+}
+
+pub fn start_global_shortcut_service(app: tauri::AppHandle) {
+    if capabilities().global_shortcut_backend != GlobalShortcutBackend::Portal {
+        return;
+    }
+    global_shortcuts::start(app);
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {
@@ -400,5 +469,35 @@ mod tests {
         assert!(!env_flag(Some(OsStr::new(""))));
         assert!(!env_flag(Some(OsStr::new("  "))));
         assert!(!env_flag(None));
+    }
+
+    /// X11 永远走原生插件；Wayland 只有 opt-in + DBus 才尝试门户。
+    /// 缺少任一条件都必须返回 None，不能“看起来支持”。
+    #[test]
+    fn shortcut_backend_requires_wayland_opt_in_and_dbus() {
+        assert_eq!(
+            shortcut_backend(SessionType::X11, false, false),
+            GlobalShortcutBackend::Native
+        );
+        assert_eq!(
+            shortcut_backend(SessionType::X11, true, true),
+            GlobalShortcutBackend::Native
+        );
+        assert_eq!(
+            shortcut_backend(SessionType::Wayland, false, true),
+            GlobalShortcutBackend::None
+        );
+        assert_eq!(
+            shortcut_backend(SessionType::Wayland, true, false),
+            GlobalShortcutBackend::None
+        );
+        assert_eq!(
+            shortcut_backend(SessionType::Wayland, true, true),
+            GlobalShortcutBackend::Portal
+        );
+        assert_eq!(
+            shortcut_backend(SessionType::Unknown, true, true),
+            GlobalShortcutBackend::None
+        );
     }
 }

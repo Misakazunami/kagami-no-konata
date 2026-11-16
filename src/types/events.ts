@@ -325,12 +325,33 @@ export interface HarnessNoticeData {
   message: string;
 }
 
+/**
+ * `global-shortcut-status` 事件载荷：Wayland 门户快捷键的异步绑定结果。
+ *
+ * `available` 只有在门户确认绑定后才为 true；用户取消、桌面拒绝或会话
+ * 关闭都会推一条 `available: false`，界面不能把“已请求”当成“已可用”。
+ */
+export interface GlobalShortcutStatusData {
+  available: boolean;
+  backend: "native" | "portal" | "none";
+  /** 应用期望的快捷键，例如 `Ctrl+Shift+K` */
+  shortcut: string;
+  /** 桌面环境实际分配的触发方式（可能被用户在系统设置中修改） */
+  trigger?: string;
+  message: string;
+}
+
 export const STREAM_EVENT = {
   chunk: "stream-chunk",
   thinking: "stream-thinking-chunk",
   end: "stream-end",
   error: "stream-error",
   stats: "message-stats",
+} as const;
+
+/** 平台/桌面集成事件名（与后端 `app.emit` 的字面量一一对应） */
+export const PLATFORM_EVENT = {
+  globalShortcutStatus: "global-shortcut-status",
 } as const;
 
 /** 工具调用事件名（与后端 `app.emit` 的字面量一一对应） */

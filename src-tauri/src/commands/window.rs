@@ -74,18 +74,28 @@ pub async fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 切换主窗口显示/隐藏（同步版本，供托盘/门户后台线程直接调用）。
+///
+/// 主窗口被最小化时先 `unminimize` 再聚焦；否则 Wayland 合成器可能只把
+/// 最小化窗口标记为“可见”，用户却看不到窗口。
+pub fn toggle_main_window_now(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    if window.is_visible().unwrap_or(false) {
+        window.hide().map_err(|e| e.to_string())?;
+    } else {
+        window.show().map_err(|e| e.to_string())?;
+        window.unminimize().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// 切换主窗口显示/隐藏
 #[tauri::command]
 pub async fn toggle_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or(false) {
-            window.hide().map_err(|e| e.to_string())?;
-        } else {
-            window.show().map_err(|e| e.to_string())?;
-            window.set_focus().map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
+    toggle_main_window_now(&app)
 }
 
 /// 显示悬浮窗

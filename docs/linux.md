@@ -7,8 +7,8 @@
 | 会话类型 | 支持等级 | 说明 |
 |---|---|---|
 | X11 / Xorg | 正式支持 | 悬浮窗定位、置顶、托盘菜单、全局快捷键、屏幕截图、鼠标键盘控制均按设计工作 |
-| Wayland（GNOME / KDE） | 实验 / 降级 | 应用可启动，聊天、人设、记忆、文件工具和 Live2D 可用；窗口绝对定位、置顶、全局快捷键和桌面控制不可用或不保证；可选启用只读截图（实验） |
-| Wayland（wlroots：Sway / Hyprland） | 实验 / 降级 | 可选只读截图依赖 wlr-screencopy，仍需显式 opt-in；桌面控制仍不可用 |
+| Wayland（GNOME / KDE） | 实验 / 降级 | 应用可启动，聊天、人设、记忆、文件工具和 Live2D 可用；窗口绝对定位、置顶和桌面控制不可用或不保证；可选启用只读截图与 XDG 门户全局快捷键（均为实验） |
+| Wayland（wlroots：Sway / Hyprland） | 实验 / 降级 | 可选只读截图依赖 wlr-screencopy，仍需显式 opt-in；全局快捷键取决于桌面是否实现 `org.freedesktop.portal.GlobalShortcuts`；桌面控制仍不可用 |
 
 > 如果你需要完整的桌面宠物体验，请在登录界面选择 **X11 / Xorg** 会话。Wayland 下应用会显示兼容性提示，不会把“不支持”伪装成“执行成功”。
 
@@ -144,7 +144,7 @@ Wayland 不允许应用随意设置窗口绝对位置，也不提供通用的全
 | 悬浮窗绝对定位 | ❌ 由合成器决定 |
 | 悬浮窗置顶 | ❌ 不保证 |
 | 托盘菜单 | ⚠️ 取决于桌面环境 |
-| 全局快捷键 | ❌ 不保证 |
+| 全局快捷键 | ⚠️ 可选：`KONATA_WAYLAND_GLOBAL_SHORTCUTS=1`（XDG 门户，实验） |
 | 屏幕截图 | ⚠️ 可选：`KONATA_WAYLAND_SCREENSHOT=1`（只读，实验） |
 | 按需查看屏幕（`look_at_screen`） | ⚠️ 仅在只读截图启用时可用 |
 | 桌面控制（os_control） | ❌ 已禁用 |
@@ -164,6 +164,21 @@ KONATA_WAYLAND_SCREENSHOT=1 ./kagami-no-konata
 - 首次截图可能弹出系统授权框；单次截图 20 秒超时。超时、拒绝或后端失败都会明确报错，不会返回黑屏或旧图。
 - 多显示器和分数缩放下，XWayland 的显示器几何信息可能与合成器实际布局不一致，截图/选屏可能不准确；X11 仍是正式支持基线。
 - 同一时间只允许一个截图请求在途；上一次未结束时再次调用会被明确拒绝。
+
+### Wayland 全局快捷键（实验，P3.2）
+
+默认关闭。显式设置 `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` 并重启后，应用会尝试通过 `org.freedesktop.portal.GlobalShortcuts` 绑定 `Ctrl+Shift+K`（显示/隐藏主窗口）：
+
+```bash
+KONATA_WAYLAND_GLOBAL_SHORTCUTS=1 ./kagami-no-konata
+```
+
+- 需要 Wayland 会话、`DBUS_SESSION_BUS_ADDRESS`，以及桌面环境实现 GlobalShortcuts 门户（GNOME / KDE Plasma 6 的较新版本；Sway / Hyprland 取决于 `xdg-desktop-portal` 后端）。
+- 首次绑定通常会在系统弹窗中请求确认；**只有门户确认绑定后**，设置页才显示“可用（系统门户，实验）”。用户取消、桌面拒绝或会话关闭都会明确提示，不会假装成功。
+- 实际触发方式由桌面环境管理，可能被用户在系统快捷键设置中修改；设置页会显示门户返回的触发描述。
+- 绑定成功后由 Rust 后端直接监听 `Activated` 并切换主窗口，前端不再调用 `tauri-plugin-global-shortcut`，避免重复注册。
+- 非沙箱应用需要向 `org.freedesktop.host.portal.Registry` 注册应用 ID。deb / rpm 包会安装隐藏的 `com.konata-mirror.main.desktop`，供 GNOME 50+/xdg-desktop-portal 1.21+ 解析应用身份；AppImage 内也包含该文件，但不会写入宿主机的 `/usr/share/applications`，若门户要求宿主桌面文件，请通过 AppImageLauncher 集成或手动复制。直接 `cargo tauri dev` 或手动运行未安装的二进制时同理。
+- 门户不可用时，托盘菜单仍然可用；需要完整快捷键支持请改用 X11 / Xorg 会话。
 
 ### XWayland（可选）
 
@@ -223,6 +238,14 @@ sudo apt-get install libxdo3
 - KDE / XFCE：确认状态通知器（StatusNotifierWatcher）正在运行；
 - 也可以直接使用全局快捷键或重新启动应用恢复窗口。
 
+### Wayland 全局快捷键不可用
+
+- 确认启动时设置了 `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1`，且当前是 Wayland 会话、存在 `DBUS_SESSION_BUS_ADDRESS`；
+- 确认桌面环境实现了 `org.freedesktop.portal.GlobalShortcuts`（GNOME / KDE Plasma 6 的较新版本；Sway / Hyprland 取决于 xdg-desktop-portal 后端）；
+- 首次绑定需要在系统弹窗中确认；设置页显示“门户未就绪”时，查看平台说明里的具体失败原因；
+- GNOME 50+/xdg-desktop-portal 1.21+ 需要应用 ID 对应已安装的 `.desktop` 文件。deb / rpm 包会安装 `com.konata-mirror.main.desktop`；AppImage 与未安装的二进制需要 AppImageLauncher 集成或手动复制该文件到 `/usr/share/applications/`；
+- 仍不可用时请改用 X11/Xorg 会话，或使用托盘菜单显示/隐藏主窗口。
+
 ### 悬浮窗透明区域是黑色
 
 - 确认当前会话是 X11；
@@ -245,7 +268,7 @@ sudo apt-get install fonts-noto-cjk
 
 - `src-tauri/tauri.conf.json`：跨平台公共配置，`bundle.targets` 为 `"all"`。
 - `src-tauri/tauri.windows.conf.json`：Windows 覆盖为 NSIS，并打包 `WebView2Loader.dll`。
-- `src-tauri/tauri.linux.conf.json`：Linux 覆盖为 deb / AppImage / rpm，并声明运行依赖。
+- `src-tauri/tauri.linux.conf.json`：Linux 覆盖为 deb / AppImage / rpm，声明运行依赖，并额外安装 `com.konata-mirror.main.desktop`（隐藏条目，供 XDG 门户解析应用身份）。
 
 平台配置文件由 Tauri CLI 根据目标平台自动合并，不需要手动切换。
 
@@ -255,6 +278,7 @@ sudo apt-get install fonts-noto-cjk
 |---|---|---|
 | `KONATA_FORCE_X11=1` | Wayland 会话下强制本应用使用 XWayland（设置 `GDK_BACKEND=x11`）。窗口定位、置顶、桌面控制按 X11 语义；截图后端是否跟随取决于 `XDG_SESSION_TYPE` / `WAYLAND_DISPLAY` | 关闭 |
 | `KONATA_WAYLAND_SCREENSHOT=1` | Wayland 会话下启用只读实验截图（`look_at_screen`），需要 XWayland（`DISPLAY`）与 `DBUS_SESSION_BUS_ADDRESS`；不提供键鼠注入 | 关闭 |
+| `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` | Wayland 会话下尝试通过 XDG 门户绑定 `Ctrl+Shift+K`；需要 `DBUS_SESSION_BUS_ADDRESS`、桌面环境支持 GlobalShortcuts，并经过用户确认 | 关闭 |
 | `KONATA_WEBKIT_SAFE=1` | WebKitGTK 兼容模式：`WEBKIT_DISABLE_DMABUF_RENDERER=1`、`WEBKIT_DISABLE_COMPOSITING_MODE=1`、`__NV_DISABLE_EXPLICIT_SYNC=1` | 关闭 |
 | `KONATA_SMOKE_TEST=1` | 启动 2 秒后自动退出，供 CI / 打包冒烟测试使用 | 关闭 |
 
@@ -272,10 +296,10 @@ sudo apt-get install fonts-noto-cjk
 P3 采用 Cargo feature + 运行时能力探测，默认关闭；X11 仍是正式支持基线。
 
 - **截图（P3.1，已实现，实验）**：`KONATA_WAYLAND_SCREENSHOT=1` 启用只读截图，新增 `look_at_screen` 工具；只解决“看”，不解决键鼠注入。需要 XWayland 与 DBus 会话，首次可能要求系统授权。
-- **全局快捷键（P3.2，未实现）**：`org.freedesktop.portal.GlobalShortcuts`，需要桌面环境支持并经过用户确认。
+- **全局快捷键（P3.2，已实现，实验）**：`KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` 启用 `org.freedesktop.portal.GlobalShortcuts`；绑定成功后才把能力标为可用，失败/取消/会话关闭都会明确提示。
 - **悬浮窗定位 / 置顶（P3.3，未实现）**：`wlr-layer-shell` / `gtk-layer-shell`；GNOME 不支持，需要按桌面环境探测。
 - **键鼠注入（P3.4，未实现）**：`libei` / EIS，需要合成器与门户同时支持。
 
-P3.2–P3.4 依赖 Linux 实机验证，当前版本不会做“看起来成功”的降级。
+P3.2–P3.4 依赖 Linux 实机验证，当前版本不会做“看起来成功”的降级。GNOME / KDE Wayland 与 Sway 的实际门户支持情况仍需在对应实机上验证。
 
 

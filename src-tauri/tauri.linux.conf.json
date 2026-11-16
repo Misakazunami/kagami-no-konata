@@ -2,7 +2,15 @@
   "bundle": {
     "targets": ["deb", "appimage", "rpm"],
     "linux": {
+      "appimage": {
+        "files": {
+          "/usr/share/applications/com.konata-mirror.main.desktop": "assets/com.konata-mirror.main.desktop"
+        }
+      },
       "deb": {
+        "files": {
+          "/usr/share/applications/com.konata-mirror.main.desktop": "assets/com.konata-mirror.main.desktop"
+        },
         "depends": [
           "libwebkit2gtk-4.1-0",
           "libgtk-3-0",
@@ -15,6 +23,9 @@
         ]
       },
       "rpm": {
+        "files": {
+          "/usr/share/applications/com.konata-mirror.main.desktop": "assets/com.konata-mirror.main.desktop"
+        },
         "depends": [
           "webkit2gtk4.1",
           "gtk3",
