@@ -157,7 +157,11 @@ fn read_one(
     limit: usize,
     budget_bytes: usize,
 ) -> Result<(String, String, bool)> {
-    let resolved = cx.services.workspaces.resolve_existing(raw_path).map_err(anyhow::Error::msg)?;
+    let resolved = cx
+        .services
+        .workspaces
+        .resolve_existing(raw_path)
+        .map_err(anyhow::Error::msg)?;
     if resolved.abs_path.is_dir() {
         anyhow::bail!("{} 是目录，请改用 list_dir", resolved.abs_path.display());
     }
@@ -233,9 +237,15 @@ impl Tool for ListDir {
         cx.ensure_not_cancelled()?;
         let raw = args::optional_str(&args, "path").unwrap_or_default();
         let resolved = if raw.is_empty() {
-            cx.services.workspaces.resolve_dir(".").map_err(anyhow::Error::msg)?
+            cx.services
+                .workspaces
+                .resolve_dir(".")
+                .map_err(anyhow::Error::msg)?
         } else {
-            cx.services.workspaces.resolve_dir(&raw).map_err(anyhow::Error::msg)?
+            cx.services
+                .workspaces
+                .resolve_dir(&raw)
+                .map_err(anyhow::Error::msg)?
         };
 
         let mut dirs: Vec<String> = Vec::new();
@@ -252,7 +262,9 @@ impl Tool for ListDir {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(metadata) = entry.metadata() else { continue };
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
             if metadata.is_dir() {
                 dirs.push(format!("{}/", name));
             } else {
@@ -324,8 +336,16 @@ impl Tool for GlobSearch {
 
         let root_arg = args::optional_str(&args, "root");
         let search_root = match &root_arg {
-            Some(id) => cx.services.workspaces.resolve_dir(&format!("{}:.", id)).map_err(anyhow::Error::msg)?,
-            None => cx.services.workspaces.resolve_dir(".").map_err(anyhow::Error::msg)?,
+            Some(id) => cx
+                .services
+                .workspaces
+                .resolve_dir(&format!("{}:.", id))
+                .map_err(anyhow::Error::msg)?,
+            None => cx
+                .services
+                .workspaces
+                .resolve_dir(".")
+                .map_err(anyhow::Error::msg)?,
         };
 
         let mut hits: Vec<String> = Vec::new();
@@ -359,10 +379,7 @@ impl Tool for GlobSearch {
             }
             if glob.is_match(&relative) || glob.is_match(format!("/{}", relative)) {
                 let marker = if entry.file_type().is_dir() { "/" } else { "" };
-                hits.push(format!(
-                    "{}{}  [{}]",
-                    relative, marker, search_root.root_id
-                ));
+                hits.push(format!("{}{}  [{}]", relative, marker, search_root.root_id));
                 if hits.len() >= max {
                     break;
                 }
@@ -376,7 +393,11 @@ impl Tool for GlobSearch {
             search_root.root_id,
             hits.len(),
             scanned,
-            if hits.len() >= max { "，已达上限" } else { "" }
+            if hits.len() >= max {
+                "，已达上限"
+            } else {
+                ""
+            }
         );
         let mut body = header.clone();
         body.push('\n');
@@ -425,8 +446,16 @@ impl Tool for GrepSearch {
             .map_err(|e| anyhow::anyhow!("file_glob 不合法：{}", e))?;
 
         let target = match args::optional_str(&args, "path") {
-            Some(path) => cx.services.workspaces.resolve_existing(&path).map_err(anyhow::Error::msg)?,
-            None => cx.services.workspaces.resolve_dir(".").map_err(anyhow::Error::msg)?,
+            Some(path) => cx
+                .services
+                .workspaces
+                .resolve_existing(&path)
+                .map_err(anyhow::Error::msg)?,
+            None => cx
+                .services
+                .workspaces
+                .resolve_dir(".")
+                .map_err(anyhow::Error::msg)?,
         };
 
         let mut hits: Vec<String> = Vec::new();
@@ -505,7 +534,11 @@ impl Tool for GrepSearch {
             pattern,
             hits.len(),
             files_scanned,
-            if hits.len() >= max { "，已达上限" } else { "" }
+            if hits.len() >= max {
+                "，已达上限"
+            } else {
+                ""
+            }
         );
         let mut body = header.clone();
         if hits.is_empty() {
@@ -523,10 +556,7 @@ impl Tool for GrepSearch {
 
 /// 二进制探测：前 8 KB 出现 NUL 即视为二进制
 pub(crate) fn is_binary(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .take(BINARY_SNIFF_BYTES)
-        .any(|byte| *byte == 0)
+    bytes.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0)
 }
 
 /// 跳过隐藏目录（.git / node_modules / target 等），避免搜索退化
@@ -545,9 +575,7 @@ fn is_hidden_dir(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::agent::harness::jail::WorkspaceSet;
-    use crate::agent::harness::traits::{
-        DenyAllApprover, NullSink, ToolLimits, ToolServices,
-    };
+    use crate::agent::harness::traits::{DenyAllApprover, NullSink, ToolLimits, ToolServices};
     use crate::config::types::{ToolConfig, ToolMode};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -568,18 +596,19 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("konata-fs-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("konata-fs-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(dir.join("src")).unwrap();
             std::fs::write(dir.join("README.md"), "# 标题\n第二行\n第三行\n").unwrap();
-            std::fs::write(dir.join("src/main.rs"), "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+            std::fs::write(
+                dir.join("src/main.rs"),
+                "fn main() {\n    println!(\"hi\");\n}\n",
+            )
+            .unwrap();
             std::fs::write(dir.join("secret.txt"), "ok").unwrap();
             std::fs::write(dir.join("config.json"), "{\"api_key\":\"sk-x\"}").unwrap();
 
-            let cfg = ToolConfig::with_single_root(
-                &dir,
-                true,
-                "测试",
-            );
+            let cfg = ToolConfig::with_single_root(&dir, true, "测试");
             let set = WorkspaceSet::from_config(&cfg, &dir);
             Self {
                 services: ToolServices::minimal(dir.clone(), set, ToolMode::Standard),
@@ -629,11 +658,9 @@ mod tests {
     fn read_file_paginates() {
         let fx = Fixture::new("page");
         let cx = fx.ctx();
-        let out = block_on(ReadFile.call(
-            json!({"path": "README.md", "offset": 2, "limit": 1}),
-            &cx,
-        ))
-        .unwrap();
+        let out =
+            block_on(ReadFile.call(json!({"path": "README.md", "offset": 2, "limit": 1}), &cx))
+                .unwrap();
         assert!(out.content.contains("本次显示 2-2 行"));
         assert!(out.content.contains("第二行"));
         assert!(!out.content.contains("第三行"));
@@ -643,11 +670,8 @@ mod tests {
     fn read_file_batches_multiple_paths_in_one_call() {
         let fx = Fixture::new("batch");
         let cx = fx.ctx();
-        let out = block_on(ReadFile.call(
-            json!({"paths": ["README.md", "src/main.rs"]}),
-            &cx,
-        ))
-        .unwrap();
+        let out =
+            block_on(ReadFile.call(json!({"paths": ["README.md", "src/main.rs"]}), &cx)).unwrap();
         assert!(out.content.contains("批量读取 2 个文件"), "{}", out.content);
         assert!(out.content.contains("# 标题"), "{}", out.content);
         assert!(out.content.contains("fn main()"), "{}", out.content);
@@ -658,11 +682,8 @@ mod tests {
     fn batch_read_reports_per_file_failures() {
         let fx = Fixture::new("batch-fail");
         let cx = fx.ctx();
-        let out = block_on(ReadFile.call(
-            json!({"paths": ["README.md", "missing.rs"]}),
-            &cx,
-        ))
-        .unwrap();
+        let out =
+            block_on(ReadFile.call(json!({"paths": ["README.md", "missing.rs"]}), &cx)).unwrap();
         assert!(out.content.contains("读取失败"), "{}", out.content);
         assert!(out.content.contains("# 标题"), "{}", out.content);
     }
@@ -675,8 +696,9 @@ mod tests {
         let err = block_on(ReadFile.call(json!({"paths": []}), &cx)).unwrap_err();
         assert!(err.to_string().contains("不能是空数组"), "{err}");
 
-        let too_many: Vec<String> =
-            (0..=MAX_BATCH_READ_FILES).map(|i| format!("f{i}.rs")).collect();
+        let too_many: Vec<String> = (0..=MAX_BATCH_READ_FILES)
+            .map(|i| format!("f{i}.rs"))
+            .collect();
         let err = block_on(ReadFile.call(json!({"paths": too_many}), &cx)).unwrap_err();
         assert!(err.to_string().contains("最多读"), "{err}");
 

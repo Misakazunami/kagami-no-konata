@@ -74,9 +74,7 @@ pub fn migrate_legacy_data_dir(current_dir: &Path, legacy_dir: &Path) -> Result<
     }
     // 新目录一旦有真实数据就不再动手，避免覆盖用户已经产生的内容
     if current_dir.join("data.db").exists() || current_dir.join("config.json").exists() {
-        return Ok(MigrationReport::skipped(
-            "新数据目录已有数据，不做自动迁移",
-        ));
+        return Ok(MigrationReport::skipped("新数据目录已有数据，不做自动迁移"));
     }
     if !legacy_dir.is_dir() {
         return Ok(MigrationReport::skipped("旧数据目录不存在"));
@@ -228,7 +226,11 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("konata-migrate-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir = std::env::temp_dir().join(format!(
+                "konata-migrate-{}-{}",
+                tag,
+                uuid::Uuid::new_v4()
+            ));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -247,15 +249,32 @@ mod tests {
     fn seed_legacy(dir: &Path) {
         let conn = db::init_db(dir).unwrap();
         let store = ChatStore::new(conn);
-        let session = store.create_session("konata-default", "旧会话", None, None, None).unwrap();
+        let session = store
+            .create_session("konata-default", "旧会话", None, None, None)
+            .unwrap();
         store
-            .add_message(&session.id, crate::agent::context::Role::User, "你好", 1, 0, None, None)
+            .add_message(
+                &session.id,
+                crate::agent::context::Role::User,
+                "你好",
+                1,
+                0,
+                None,
+                None,
+            )
             .unwrap();
 
-        std::fs::write(dir.join("config.json"), "{\"user\":{\"nickname\":\"主人\"}}").unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            "{\"user\":{\"nickname\":\"主人\"}}",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.join("personas")).unwrap();
-        std::fs::write(dir.join("personas/mine.yaml"), "id: mine\nname: 我的角色\nsystem_prompt: x\n")
-            .unwrap();
+        std::fs::write(
+            dir.join("personas/mine.yaml"),
+            "id: mine\nname: 我的角色\nsystem_prompt: x\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.join("workspace/notes")).unwrap();
         std::fs::write(dir.join("workspace/notes/a.md"), "笔记").unwrap();
     }
@@ -304,7 +323,11 @@ mod tests {
         std::fs::create_dir_all(&current).unwrap();
         seed_legacy(&legacy);
         // 新目录已经有自己的数据
-        std::fs::write(current.join("config.json"), "{\"user\":{\"nickname\":\"新\"}}").unwrap();
+        std::fs::write(
+            current.join("config.json"),
+            "{\"user\":{\"nickname\":\"新\"}}",
+        )
+        .unwrap();
 
         let report = migrate_legacy_data_dir(&current, &legacy).unwrap();
         assert!(!report.performed);
@@ -324,7 +347,11 @@ mod tests {
         std::fs::create_dir_all(&current).unwrap();
         seed_legacy(&legacy);
 
-        assert!(migrate_legacy_data_dir(&current, &legacy).unwrap().performed);
+        assert!(
+            migrate_legacy_data_dir(&current, &legacy)
+                .unwrap()
+                .performed
+        );
 
         // 用户主动清空新目录里的数据
         std::fs::remove_file(current.join("data.db")).unwrap();
@@ -375,9 +402,19 @@ mod tests {
         // 写入后不 checkpoint，制造"数据还在 WAL 里"的状态
         let conn = db::init_db(&legacy).unwrap();
         let store = ChatStore::new(conn);
-        let session = store.create_session("konata-default", "WAL 里的会话", None, None, None).unwrap();
+        let session = store
+            .create_session("konata-default", "WAL 里的会话", None, None, None)
+            .unwrap();
         store
-            .add_message(&session.id, crate::agent::context::Role::User, "hi", 1, 0, None, None)
+            .add_message(
+                &session.id,
+                crate::agent::context::Role::User,
+                "hi",
+                1,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         assert!(legacy.join("data.db-wal").exists(), "应处于 WAL 模式");
         drop(store);

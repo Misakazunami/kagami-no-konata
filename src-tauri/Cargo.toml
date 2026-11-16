@@ -16,6 +16,7 @@ tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
 tauri = { version = "2.12", features = ["tray-icon", "image-png", "image-ico"] }
+tauri-plugin-single-instance = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
@@ -33,12 +34,29 @@ bytes = "1"
 regex = "1"
 globset = "0.4.20"
 walkdir = "2.5.0"
+enigo = "0.2"
+screenshots = "0.8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
 
 # Windows 回收站：走系统 IFileOperation（Linux/macOS 使用 trash.rs 自带的
 # XDG / ~/.Trash 实现，不引入本依赖）。放在 target 依赖里保证其它平台
 # 不会编译到 COM 绑定。
 [target.'cfg(windows)'.dependencies]
 trash = "5"
+# SetCursorPos / 窗口激活：需要虚拟桌面坐标（副屏在主屏左侧时 x 为负），
+# enigo 0.2 的 Coordinate::Abs 只按主屏归一化，表达不了这种坐标。
+# 版本与 screenshots 传递依赖保持一致，避免把 windows 编两遍。
+windows = { version = "0.51", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# X11 光标定位 / 绝对移动 / EWMH 窗口激活。
+# 不依赖 xdotool/wmctrl，避免把外部命令变成运行时依赖。
+x11rb = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+# 进程组回收（run_command 超时/取消时杀掉整个子进程树）。
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"

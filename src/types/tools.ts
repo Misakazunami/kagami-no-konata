@@ -19,6 +19,8 @@ export interface ToolInfo {
   permission: string;
   read_only: boolean;
   enabled: boolean;
+  /** 平台/环境导致工具不可用时的原因（可用时不返回） */
+  unavailable_reason?: string;
 }
 
 /** `get_tool_invocations({ sessionId })` 返回的一条工具调用记录 */

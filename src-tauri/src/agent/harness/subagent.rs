@@ -79,9 +79,10 @@ impl AgentRuntime {
         Self {
             models,
             // 子代理的注册表 = 内置工具里去掉 `spawn_subagents` 自己
-            // （它的权限是 Read，模式过滤挡不住；深度因此恒为 1 层）
+            // （它的权限是 Read，模式过滤挡不住；深度因此恒为 1 层）和
+            // `look_at_screen`（子代理不该把用户屏幕内容带进自己的上下文）
             child_registry: super::tools::builtin_registry()
-                .excluding(&["spawn_subagents"]),
+                .excluding(&["spawn_subagents", "look_at_screen"]),
             children_left: Arc::new(AtomicUsize::new(max_children)),
             spawned: Arc::new(AtomicUsize::new(0)),
             max_child_steps: DEFAULT_CHILD_STEPS,
@@ -268,6 +269,9 @@ fn child_services(parent: &ToolServices) -> ToolServices {
         plan_network: false,
         // 子代理自身不能再派子代理；原样保留父级预算，结构上不缺字段
         subagent_timeout: parent.subagent_timeout,
+        // 子代理不截图，但保持字段与父级一致，避免以后再补截图时行为漂移
+        screenshot_max_dim: parent.screenshot_max_dim,
+        screenshot_jpeg_quality: parent.screenshot_jpeg_quality,
     }
 }
 
@@ -394,12 +398,17 @@ mod tests {
     #[test]
     fn child_registry_only_offers_read_tools() {
         let runtime = AgentRuntime::new(Arc::new(SilentBackend), DEFAULT_MAX_CHILDREN);
-        let names = runtime
-            .child_registry
-            .visible_names(ToolMode::ReadOnly);
+        let names = runtime.child_registry.visible_names(ToolMode::ReadOnly);
         assert!(names.contains(&"read_file".to_string()), "{names:?}");
         assert!(names.contains(&"grep_search".to_string()), "{names:?}");
-        for forbidden in ["write_file", "edit_file", "run_command", "delete_path", "web_fetch"] {
+        for forbidden in [
+            "write_file",
+            "edit_file",
+            "run_command",
+            "delete_path",
+            "web_fetch",
+            "look_at_screen",
+        ] {
             assert!(
                 !names.contains(&forbidden.to_string()),
                 "子代理绝不能看到 {forbidden}：{names:?}"
@@ -415,12 +424,12 @@ mod tests {
         let child = child_services(&parent);
         let messages = child_messages(&child, "看看认证是怎么做的", Some("src/auth"));
         assert_eq!(messages.len(), 2);
-        let system = &messages[0].content;
+        let system = messages[0].content.content_as_str();
         assert!(system.contains("只读调查子代理"), "{system}");
         assert!(system.contains("不是指令"), "{system}");
         assert!(system.contains("src/auth"), "{system}");
         assert!(system.contains("1500 字以内"), "{system}");
-        assert_eq!(messages[1].content, "看看认证是怎么做的");
+        assert_eq!(messages[1].content.content_as_str(), "看看认证是怎么做的");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -527,5 +536,4 @@ mod tests {
         });
         assert!(chunks.is_empty());
     }
-
 }

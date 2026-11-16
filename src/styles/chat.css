@@ -5,12 +5,24 @@
 .chat-window {
   display: flex;
   height: 100%;
+
+  /* ── 显示密度令牌（默认：标准档）──
+   * 三档由视口宽度切换（见文件末尾的断点区），全部走变量而不是散落的 px：
+   * 侧栏宽度、正文留白、版心宽度、底部面板栈高度预算都从这里取值，
+   * 否则加一档就要在十几个规则里找写死的数字。 */
+  --sidebar-w: 240px;
+  --gutter-x: 20px;
+  --content-measure: 64rem;
+  --bottom-budget: 42vh;
+
+  /* 一个面板的内高上限：面板自身不滚动，滚动交给它的 body，避免高度算重 */
+  --panel-max-h: min(32vh, 260px);
 }
 
 /* ===== 侧边栏 ===== */
 .sidebar {
-  width: 240px;
-  min-width: 240px;
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
   background: var(--bg-secondary);
   border-right: 1px solid var(--border);
   display: flex;
@@ -581,21 +593,63 @@ button.task-status-chip {
   background: var(--border);
 }
 
+/* ── 侧栏折叠（宽窗口）──
+ * 平台主流做法：折叠时侧栏整体推出视野并把空间还给内容，用负外边距平移，
+ * 宽度不变（动画不重排文本）。
+ *
+ * 为什么是 `calc(-1 * var(--sidebar-w))` 而不是 `margin-left: auto`：
+ * `auto` 不可过渡（auto 之间的动画不插值），折叠会变成瞬间跳变。
+ * `.chat-window` 上的 overflow: hidden 是给这条规则兜底的：推出去的那部分
+ * 不能再参与滚动，否则会凭空多出一条横向滚动条。
+ * 窄屏下的折叠改用 display 切换，见下方紧凑档规则。 */
+.chat-window {
+  overflow: hidden;
+}
+
+.sidebar-collapsed .sidebar {
+  margin-left: calc(-1 * var(--sidebar-w));
+}
+
+.sidebar {
+  transition: margin-left var(--dur-base) var(--ease-out);
+}
+
+/* 动效降级：prefers-reduced-motion 时由 a11y.css 统一压缩过渡时长 */
+
+/* 顶栏的侧栏折叠按钮：底样式复用 .header-action-btn（描边、hover），
+ * 这里只加"侧栏当前可见"的点亮态，让按钮能反映它控制的对象 */
+.header-action-btn.sidebar-toggle-btn.active,
+.header-action-btn.sidebar-toggle-btn.active:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* ===== 主对话区 ===== */
 .chat-main {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  /* 纵向同理：不加这个，矮窗口下面板栈会把消息区撑破而不是压缩它 */
+  min-height: 0;
 }
 
 /* ===== 消息列表 ===== */
 .message-list {
   flex: 1;
   overflow-y: auto;
-  padding: 20px;
+  padding: 20px var(--gutter-x);
   /* 可聚焦的滚动容器（键盘翻阅历史）：外扩焦点环会被 overflow 裁掉，改成内嵌 */
   outline-offset: -2px;
+}
+
+/* 正文内容列：由版心决定行宽，而不是由视口决定。
+ * 全屏（1920px）下 `.message-bubble{max-width:75%}` 会得到 1200px 以上的行宽
+ * （60+ 汉字/行），比 900px 窗口更难读；这里把内容列收在 --content-measure 内，
+ * 窄窗口时 min(100%) 自动退化为满宽。 */
+.chat-main .message-list-content {
+  max-width: var(--content-measure);
+  margin-inline: auto;
 }
 
 .empty-state {
@@ -1603,4 +1657,185 @@ button.task-status-chip {
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+/* ===== 底部面板栈（改动记录 / 计划 / 工作记忆）=====
+ * 三个面板互相独立、都是 flex-shrink:0，矮窗口里展开任一个都会把消息区压成一条缝。
+ * 收进一个栈里统一限额：栈整体不超过 --bottom-budget，超出在栈内滚动；
+ * 单个面板再有 --panel-max-h 上限，避免一个长计划独占全部预算。 */
+.bottom-stack {
+  flex-shrink: 0;
+  max-height: var(--bottom-budget);
+  overflow-y: auto;
+  /* 面板自带左右外边距，这里只补纵向节奏，避免与 .panel 的 margin 叠加 */
+  padding-bottom: 2px;
+}
+
+.bottom-stack .panel {
+  max-height: var(--panel-max-h);
+}
+
+/* 面板本体不滚动，滚动交给内容区：否则折叠头会跟着内容一起滚走 */
+.bottom-stack .panel-body {
+  max-height: calc(var(--panel-max-h) - 34px);
+  overflow-y: auto;
+}
+
+/* ===== 视口自适应断点 =====
+ * 主窗口可缩放（最小 600×400）也能最大化到全屏，三档只按视口宽度切换。
+ * 断点用 px（窗口宽度即视口宽度，与根字号无关），版心/留白用变量里的 rem。
+ * 注：这些断点是"整站唯一的一份"，settings.css / panels.css 里的相关规则
+ * 都以这里的分档为准，不再各自写一套阈值。 */
+
+/* ── 紧凑档：< 700px ──
+ * 600px 窗口下 240px 侧栏 + 40px 正文留白只剩约 317px 正文，
+ * 顶栏（.task-status-bar 最小 220px）必然挤成 2–3 行。
+ *
+ * 这里的处理是**自动隐藏侧栏**（不是缩成图标条）：侧栏在窄屏下改为覆盖层，
+ * 由顶栏的展开按钮唤出、点对话区收回（见 .sidebar-collapsed 与 ChatWindow）。
+ * 图标条那种"缩到 56px"的做法仍然占着 56px 宽度、还要为它单独维护一套窄版排版，
+ * 收益不如直接让出整块宽度。
+ *
+ * 侧栏内部不再做窄版排版：它一旦显示就是覆盖层，宽度回到可读的 --sidebar-w。 */
+@media (max-width: 699px) {
+  .chat-window {
+    --gutter-x: 12px;
+    --bottom-budget: 34vh;
+    --panel-max-h: min(26vh, 200px);
+  }
+
+  /* 顶栏：去掉占位的人设徽标，状态条不再强制换行 */
+  .chat-header {
+    padding: 6px var(--gutter-x);
+    gap: 6px;
+  }
+
+  .chat-persona-badge {
+    display: none;
+  }
+
+  .task-status-bar {
+    min-width: 0;
+    gap: 6px;
+  }
+
+  /* 次要状态收进「详情」弹层：紧凑档的顶栏放不下这么多 chip */
+  .task-status-chips {
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+
+  .task-status-chip {
+    max-width: 110px;
+  }
+
+  .task-status-panel {
+    min-width: 0;
+    max-width: min(80vw, 320px);
+  }
+
+  .input-area {
+    padding: 8px var(--gutter-x) 10px;
+    gap: 6px;
+  }
+
+  .input-box textarea {
+    padding: 8px 12px;
+  }
+
+  .send-btn {
+    padding: 8px 12px;
+  }
+
+  .empty-state-hint {
+    max-width: 100%;
+  }
+
+  /* 错误横幅在窄窗口下按钮会掉到第二行，允许换行而不是裁掉 */
+  .chat-error-banner {
+    flex-wrap: wrap;
+    margin: 6px var(--gutter-x) 0;
+    gap: 6px;
+  }
+
+  /*
+   * 侧栏显示时是覆盖在对话区上的浮层：必须钉在左侧固定宽度，
+   * 否则 flex 会按"内容 + 剩余空间"把它重新算宽（变宽后又不再命中窄屏规则）。
+   */
+  .sidebar {
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    width: var(--sidebar-w);
+    min-width: var(--sidebar-w);
+    z-index: 30;
+    box-shadow: var(--shadow-lg);
+  }
+
+  /*
+   * 窄屏下的折叠：侧栏不再占位（否则收起后仍留一条空白）。
+   * 这里用 `display: none` 而不是位移：位移方案要靠 --sidebar-w 与
+   * 布局算出的实际宽度完全一致才不会露边，一旦有滚动条/内边距差异就会露一条缝。
+   * 窄屏用不到收起动画（覆盖层的淡入淡出观感本来就不同），宽屏才有过渡。
+   */
+  .sidebar-collapsed .sidebar {
+    display: none;
+  }
+}
+
+/* ── 宽松档：>= 1400px（最大化 / 全屏）──
+ * 侧栏可以更宽（会话标题少截断），版心略放大，正文两侧留白加大。 */
+@media (min-width: 1400px) {
+  .chat-window {
+    --sidebar-w: 280px;
+    --gutter-x: 32px;
+    --content-measure: 72rem;
+    --bottom-budget: 46vh;
+  }
+}
+
+/* ── 矮窗口：<= 560px 高 ──
+ * 例如把主窗拖成 900×400。此时纵向比横向更紧张，底部面板栈要收得更狠，
+ * 消息区至少保住约 4 行。 */
+@media (max-height: 560px) {
+  .chat-window {
+    --bottom-budget: 32vh;
+    --panel-max-h: min(24vh, 180px);
+  }
+
+  .message-bubble {
+    padding: 8px 12px;
+  }
+
+  .message-row {
+    margin-bottom: 10px;
+  }
+
+  .message-list {
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+
+  .thinking-content {
+    max-height: 160px;
+  }
+
+  /* 宽而矮（例如 900×400）：紧凑档按宽度不生效，但纵向同样紧张，
+   * 底部面板与输入区一起收一圈，把高度让给消息区。 */
+  .panel {
+    margin: 0 12px 4px;
+  }
+
+  .panel-head {
+    padding: 5px 10px;
+  }
+
+  .bottom-stack .panel-body {
+    max-height: calc(var(--panel-max-h) - 28px);
+  }
+
+  .input-area {
+    padding: 8px 16px 10px;
+    gap: 6px;
+  }
 }

@@ -146,8 +146,9 @@ pub struct HarnessRun<'a> {
 
 /// 单次工具调用的外层兜底窗口
 ///
-/// 工具可以自带预算（目前只有 `spawn_subagents`：它的调用包住整个子代理批次），
-/// 未提供时用 `ToolLimits.call_timeout`。外层统一留一段宽限，让工具在自己的
+/// 工具可以自带预算（`spawn_subagents` 包住整个子代理批次；
+/// `look_at_screen` 覆盖可能等待系统授权的截图），未提供时用
+/// `ToolLimits.call_timeout`。外层统一留一段宽限，让工具在自己的
 /// 软截止之后还有时间把部分结果收拢返回。
 fn call_timeout_window(tool_budget: Option<Duration>, limits: &ToolLimits) -> Duration {
     tool_budget
@@ -156,6 +157,56 @@ fn call_timeout_window(tool_budget: Option<Duration>, limits: &ToolLimits) -> Du
 }
 
 impl HarnessRun<'_> {
+    /// 把一帧截图编码成多模态消息追加到上下文
+    ///
+    /// 注入前先清掉历史里的上一帧（[`super::screen::FRAME_MARKER`] 前缀），
+    /// 只保留最新一张：多轮之后历史截图会让 token 累积超限。
+    /// 返回是否成功编码。
+    fn push_screen_frame(
+        &self,
+        messages: &mut Vec<LlmMessage>,
+        frame: super::screen::Frame,
+        extra_note: Option<&str>,
+    ) -> bool {
+        messages.retain(|m| {
+            !m.content
+                .content_as_str()
+                .starts_with(super::screen::FRAME_MARKER)
+        });
+
+        let mut buffer = Vec::new();
+        // 用 JPEG 而不是 PNG：同样的画面 Base64 体积小一个数量级。
+        // 质量可配：小字（聊天记录、菜单项）在低质量下会糊成块，
+        // 分辨率调高时通常也要把质量一起提上来
+        let encoded = {
+            let mut encoder = screenshots::image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut buffer,
+                self.services.screenshot_jpeg_quality,
+            );
+            encoder.encode_image(&frame.image)
+        };
+        if encoded.is_err() {
+            eprintln!("[harness] 屏幕截图编码失败，本轮没有视觉上下文");
+            return false;
+        }
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(buffer);
+        let note = match extra_note {
+            Some(extra) if !extra.is_empty() => format!("{}\n{}", frame.note, extra),
+            _ => frame.note,
+        };
+        messages.push(LlmMessage::user_parts(vec![
+            crate::llm::types::ContentPart::Text { text: note },
+            crate::llm::types::ContentPart::ImageUrl {
+                image_url: crate::llm::types::ImageUrl {
+                    url: format!("data:image/jpeg;base64,{}", b64),
+                },
+            },
+        ]));
+        true
+    }
+
     /// 执行工具循环
     ///
     /// 不变式：
@@ -190,6 +241,8 @@ impl HarnessRun<'_> {
         // 模型"什么都没说也没做"时的重试次数（见 EMPTY_TURN_RETRIES）
         let mut empty_retries = 0usize;
         let mut empty_turn = false;
+        // 截图失败只提示一次：Wayland 下每轮都失败，不能每步刷一条 toast
+        let mut screenshot_warning_emitted = false;
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -201,9 +254,113 @@ impl HarnessRun<'_> {
             if !offer_tools && tool_rounds >= self.max_steps && !schemas.is_empty() {
                 hit_step_limit = true;
             }
-            let tools_arg = if offer_tools { Some(schemas.clone()) } else { None };
+            let tools_arg = if offer_tools {
+                Some(schemas.clone())
+            } else {
+                None
+            };
 
-            let mut stream = self.backend.chat_stream(messages.clone(), tools_arg).await?;
+            // 按需截图：`look_at_screen` 的调用结果只能是文本，图片要等到
+            // 下一次 LLM 请求前才能注入。按 session/stream 取，避免串会话。
+            if self.tools_enabled
+                && self
+                    .registry
+                    .find("look_at_screen", self.services.mode)
+                    .is_some()
+            {
+                if let Some(frame) =
+                    super::screen::take_pending_frame(self.session_id, self.stream_id)
+                {
+                    self.push_screen_frame(
+                        &mut messages,
+                        frame,
+                        Some(
+                            "这张图来自你刚才调用的 `look_at_screen`；\
+                             当前会话只能查看屏幕，不能点击或输入。",
+                        ),
+                    );
+                }
+            }
+
+            // OS 接管模式：自动注入「操作指引 + 当前显示器截图」。
+            //
+            // 工具可见性按模式判定（`find` 而不是 `contains_tool`）：标准/只读模式下
+            // os_control 本来就不可用，这时再截屏只会白白泄露屏幕内容。
+            if self.tools_enabled
+                && self
+                    .registry
+                    .find("os_control", self.services.mode)
+                    .is_some()
+            {
+                // 1. 确保系统提示词包含 OS 操作指引（若尚未注入）
+                //
+                // 必须**点名工具**：只描述能力时，模型会按工具规则里出现的
+                // read_file / run_command 去概括工具箱，然后声称"没有桌面工具"
+                // （真实发生过：同一会话前一分钟刚调用过 os_control）。
+                let os_instruction = format!(
+                    "[系统指令: OS接管模式]\n\
+                     你当前具备通过屏幕视觉感知与鼠标键盘操作直接控制电脑的能力。\
+                     负责这件事的工具叫 `os_control`，可用动作固定为：{}。\n\
+                     工作准则：\n\
+                     1. 每一轮交互前，系统都会自动把当前显示器的截图放进上下文，不需要自己调用截图。\n\
+                     2. 截图会注明它来自哪块显示器、缩放比多少；mouse_click 的 x/y 直接填截图上的像素坐标即可，系统会换算成屏幕坐标。\n\
+                     3. 截图里只会有前台窗口。要操作被最小化/被挡住的窗口，先用 activate_window 把它切到前台；\
+                        如果它最小化在托盘里（截图里找不到），请告诉用户先手动唤出，不要盲点坐标。\n\
+                     4. 执行关键、不可逆或敏感操作（如删除重要文件、修改系统设置、关机）前，需在回复中清晰说明意图。\n\
+                     5. 如果画面没有发生预期的变化（点击没生效、焦点没过去），请重新看最新截图判断，而不是重复同一个坐标。\n\
+                     6. `os_control` 就在你的工具表里。**不要**向用户罗列、复述或评价你的工具清单，\
+                        也不要说\"没有注册/没有下发/工具栏里没有\"这类话——工具是否可用以**调用结果**为准。\
+                        用户要求操作时，直接调用；只有真的收到\"工具不存在\"的报错，才向用户说明。",
+                    crate::agent::harness::tools::os_control::ACTION_LIST
+                );
+
+                let already_has_instruction = messages.iter().any(|m| {
+                    m.content
+                        .content_as_str()
+                        .contains("[系统指令: OS接管模式]")
+                });
+                if !already_has_instruction {
+                    messages.insert(0, LlmMessage::system(os_instruction));
+                }
+
+                // 2. 截当前显示器（跟随鼠标，退回主屏），缩放比由 screen 模块统一决定，
+                //    并在截图时记住坐标系——os_control 的鼠标动作要靠它把图像坐标还原成屏幕坐标。
+                match super::screen::capture_for_model(self.services.screenshot_max_dim) {
+                    Ok(frame) => {
+                        // 每轮都重申工具名与动作：模型对"上一轮说过的能力"
+                        // 记不牢，而截图是它每轮必然读到的一条消息
+                        let extra = format!(
+                            "本轮可用的桌面工具：`os_control`（动作：{}，每次调用需审批）",
+                            crate::agent::harness::tools::os_control::ACTION_LIST
+                        );
+                        self.push_screen_frame(&mut messages, frame, Some(&extra));
+                    }
+                    // 截图失败不能静默：模型没有画面时会开始瞎猜坐标。
+                    // 日志留痕之外，再给 UI 一条系统提示（每个 stream 只提示一次）。
+                    Err(e) => {
+                        eprintln!("[harness] 屏幕截图失败，本轮没有视觉上下文：{e}");
+                        if !screenshot_warning_emitted {
+                            screenshot_warning_emitted = true;
+                            self.emit.emit(
+                                "harness-notice",
+                                json!({
+                                    "session_id": self.session_id,
+                                    "stream_id": self.stream_id,
+                                    "level": "warning",
+                                    "message": format!(
+                                        "屏幕感知不可用，本轮没有视觉上下文：{e}"
+                                    ),
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+
+            let mut stream = self
+                .backend
+                .chat_stream(messages.clone(), tools_arg)
+                .await?;
             let mut accumulator = ToolCallAccumulator::default();
             let mut step_text = String::new();
             let mut finish_reason: Option<String> = None;
@@ -289,7 +446,10 @@ impl HarnessRun<'_> {
                 .iter()
                 .map(|c| ToolCall::new(c.id.clone(), c.name.clone(), c.raw_arguments.clone()))
                 .collect();
-            messages.push(LlmMessage::assistant_tool_calls(step_text.clone(), tool_calls));
+            messages.push(LlmMessage::assistant_tool_calls(
+                step_text.clone(),
+                tool_calls,
+            ));
 
             // 正文里插入空行，使流式渲染结果与最终落库内容一致
             if !step_text.is_empty() {
@@ -321,9 +481,9 @@ impl HarnessRun<'_> {
                         batch.push(calls[index].clone());
                         index += 1;
                     }
-                    let futures = batch.iter().map(|call| {
-                        self.execute_call(call, tool_rounds, Some(&session_grants))
-                    });
+                    let futures = batch
+                        .iter()
+                        .map(|call| self.execute_call(call, tool_rounds, Some(&session_grants)));
                     let results = futures::future::join_all(futures).await;
                     for (record, message) in results {
                         extra_tokens += record.extra_tokens;
@@ -342,14 +502,11 @@ impl HarnessRun<'_> {
                         // 同时落库：按钮承诺的是"本会话"，只在本次生成的内存里
                         // 生效会让用户下一轮又被同一个工具弹窗（界面与语义不符）
                         if let Some(store) = self.services.chat_store.as_ref() {
-                            let saved = store
-                                .lock()
-                                .map_err(|e| e.to_string())
-                                .and_then(|store| {
-                                    store
-                                        .grant_session_tool(self.session_id, &record.tool)
-                                        .map_err(|e| e.to_string())
-                                });
+                            let saved = store.lock().map_err(|e| e.to_string()).and_then(|store| {
+                                store
+                                    .grant_session_tool(self.session_id, &record.tool)
+                                    .map_err(|e| e.to_string())
+                            });
                             if let Err(e) = saved {
                                 eprintln!("[harness] 保存会话授权失败：{}", e);
                             }
@@ -413,11 +570,10 @@ impl HarnessRun<'_> {
         }
 
         // ─── 工具不存在或当前模式不可见 ───
-        let Some(tool) = self.registry.find_with(
-            &call.name,
-            self.services.mode,
-            self.services.plan_network,
-        ) else {
+        let Some(tool) =
+            self.registry
+                .find_with(&call.name, self.services.mode, self.services.plan_network)
+        else {
             let available = self
                 .registry
                 .visible_names_with(self.services.mode, self.services.plan_network)
@@ -515,16 +671,13 @@ impl HarnessRun<'_> {
         // 预算按工具选择：普通工具用 `call_timeout`（默认 60 秒），
         // `spawn_subagents` 用整批子代理自己的预算（默认 600 秒）
         let window = call_timeout_window(tool.timeout_budget(&self.services), &self.limits);
-        let outcome = tokio::time::timeout(
-            window,
-            tool.call(call.arguments.clone(), &cx),
-        )
-        .await;
+        let outcome = tokio::time::timeout(window, tool.call(call.arguments.clone(), &cx)).await;
 
         match outcome {
             Ok(Ok(output)) => {
                 // 兜底截断：工具自己没截干净时也不能把上下文撑爆
-                let (body, truncated) = truncate_text(&output.content, self.limits.max_output_bytes);
+                let (body, truncated) =
+                    truncate_text(&output.content, self.limits.max_output_bytes);
                 let truncated = truncated || output.truncated;
                 let preview = output
                     .preview
@@ -540,8 +693,7 @@ impl HarnessRun<'_> {
                 record.extra_tokens = output.extra_tokens;
                 record.duration_ms = started.elapsed().as_millis() as i64;
 
-                let message =
-                    tool_message(&record.call_id, &record.tool, &record.status, &body);
+                let message = tool_message(&record.call_id, &record.tool, &record.status, &body);
                 self.emit_result(&record, &preview);
                 (record, message)
             }
@@ -561,7 +713,10 @@ impl HarnessRun<'_> {
                 self.finish_error(
                     record,
                     started,
-                    format!("工具执行超时（{} 秒）且未返回任何输出，已被强制终止", timeout),
+                    format!(
+                        "工具执行超时（{} 秒）且未返回任何输出，已被强制终止",
+                        timeout
+                    ),
                     "timeout",
                 )
             }
@@ -622,8 +777,8 @@ mod tests {
     use super::*;
     use crate::agent::harness::jail::WorkspaceSet;
     use crate::agent::harness::traits::{
-        AllowAllApprover, DenyAllApprover, Permission, Tool, ToolDescriptor,
-        ToolInfo, ToolOutput, ToolStatus,
+        AllowAllApprover, DenyAllApprover, Permission, Tool, ToolDescriptor, ToolInfo, ToolOutput,
+        ToolStatus,
     };
     use crate::config::types::{ToolConfig, ToolMode};
     use crate::llm::types::ToolSchema;
@@ -783,11 +938,7 @@ mod tests {
     fn temp_workspace(tag: &str) -> (std::path::PathBuf, WorkspaceSet) {
         let dir = std::env::temp_dir().join(format!("konata-run-{}-{}", tag, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = ToolConfig::with_single_root(
-            &dir,
-            true,
-            "测试",
-        );
+        let cfg = ToolConfig::with_single_root(&dir, true, "测试");
         let set = WorkspaceSet::from_config(&cfg, &dir);
         (dir, set)
     }
@@ -898,9 +1049,7 @@ mod tests {
         let (tool, _) = MockTool::with_status("slow", Permission::Read, ToolStatus::Timeout);
         let fx = fixture(vec![tool], ToolMode::Standard);
         let backend = MockBackend::new(vec![
-            vec![
-                tool_call_chunk(0, "c1", "slow", "{}"),
-            ],
+            vec![tool_call_chunk(0, "c1", "slow", "{}")],
             vec![StreamChunk::Content("看到了部分输出。".to_string())],
         ]);
 
@@ -930,8 +1079,12 @@ mod tests {
             .iter()
             .find(|m| m.role == "tool")
             .expect("必须回灌 tool 角色消息");
-        assert!(tool_msg.content.contains("status=\"timeout\""), "{}", tool_msg.content);
-        assert!(tool_msg.content.contains("工具结果"), "{}", tool_msg.content);
+        let tool_content = tool_msg.content.content_as_str();
+        assert!(
+            tool_content.contains("status=\"timeout\""),
+            "{tool_content}"
+        );
+        assert!(tool_content.contains("工具结果"), "{tool_content}");
 
         // 事件里的状态同样不是 running/ok
         let result = &fx.sink.payloads(EVENT_TOOL_RESULT)[0];
@@ -955,7 +1108,9 @@ mod tests {
             // 第 2 轮：空响应（历史实现就在这里静悄悄结束了）
             Vec::new(),
             // 第 3 轮：被提醒后接着做
-            vec![StreamChunk::Content("继续实现：已经写出第一个文件。".to_string())],
+            vec![StreamChunk::Content(
+                "继续实现：已经写出第一个文件。".to_string(),
+            )],
         ]);
 
         let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
@@ -970,7 +1125,8 @@ mod tests {
         assert_eq!(seen.len(), 3, "三次请求：工具轮 + 空回合 + 继续");
         let reminder = seen[2].last().expect("提醒消息");
         assert_eq!(reminder.role, "user");
-        assert!(reminder.content.contains("空"), "{}", reminder.content);
+        let reminder_text = reminder.content.content_as_str();
+        assert!(reminder_text.contains("空"), "{reminder_text}");
     }
 
     /// 反复空响应时必须重试有上限，并且留下一句用户可见的说明
@@ -988,7 +1144,10 @@ mod tests {
         let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
 
         // 重试最多 EMPTY_TURN_RETRIES 次，随后如实告知用户
-        assert_eq!(backend.seen_messages.lock().unwrap().len(), 1 + EMPTY_TURN_RETRIES + 1);
+        assert_eq!(
+            backend.seen_messages.lock().unwrap().len(),
+            1 + EMPTY_TURN_RETRIES + 1
+        );
         assert!(outcome.empty_turn, "必须标记为空回合，调用方才能区别对待");
         assert!(
             outcome.content.contains("没有收到模型的任何输出"),
@@ -1013,7 +1172,7 @@ mod tests {
 
         assert_eq!(outcome.content, "好的，我先写第一个文件。");
         let seen = backend.seen_messages.lock().unwrap();
-        let reminder = seen[1].last().expect("提醒消息").content.clone();
+        let reminder = seen[1].last().expect("提醒消息").content.content_as_str();
         assert!(reminder.contains("max_tokens"), "{reminder}");
         assert!(reminder.contains("拆小"), "{reminder}");
     }
@@ -1022,7 +1181,8 @@ mod tests {
     /// 两步按序回灌、状态为 ok、事件齐备
     #[cfg(unix)]
     #[test]
-    fn real_run_command_steps_end_to_end() {        let fx = fixture(
+    fn real_run_command_steps_end_to_end() {
+        let fx = fixture(
             vec![Arc::new(crate::agent::harness::tools::shell::RunCommand) as Arc<dyn Tool>],
             ToolMode::Full,
         );
@@ -1077,7 +1237,14 @@ mod tests {
         let fx = fixture(vec![tool], ToolMode::Standard);
         let backend = MockBackend::new(vec![vec![StreamChunk::Content("只有聊天".to_string())]]);
 
-        let outcome = run_with(&fx, &backend, Arc::new(AllowAllApprover), messages(), false, 8);
+        let outcome = run_with(
+            &fx,
+            &backend,
+            Arc::new(AllowAllApprover),
+            messages(),
+            false,
+            8,
+        );
         assert_eq!(outcome.content, "只有聊天");
         let seen = backend.seen_tools.lock().unwrap();
         assert_eq!(seen.len(), 1);
@@ -1142,14 +1309,18 @@ mod tests {
             .find(|m| m.role == "tool")
             .expect("必须回灌 tool 消息");
         assert_eq!(tool_msg.tool_call_id.as_deref(), Some("c1"));
-        assert!(tool_msg.content.contains("untrusted=\"true\""));
-        assert!(tool_msg.content.contains("工具结果"));
+        let tool_text = tool_msg.content.content_as_str();
+        assert!(tool_text.contains("untrusted=\"true\""));
+        assert!(tool_text.contains("工具结果"));
         // assistant 消息必须带上 tool_calls
         let assistant = second
             .iter()
             .find(|m| m.tool_calls.is_some())
             .expect("必须带 tool_calls");
-        assert_eq!(assistant.tool_calls.as_ref().unwrap()[0].function.name, "probe");
+        assert_eq!(
+            assistant.tool_calls.as_ref().unwrap()[0].function.name,
+            "probe"
+        );
     }
 
     #[test]
@@ -1176,7 +1347,10 @@ mod tests {
             .iter()
             .find(|m| m.role == "tool")
             .unwrap();
-        assert!(tool_msg.content.contains("status=\"error\""));
+        assert!(tool_msg
+            .content
+            .content_as_str()
+            .contains("status=\"error\""));
     }
 
     struct FailingTool {
@@ -1262,9 +1436,15 @@ mod tests {
 
         let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
         assert_eq!(*calls.lock().unwrap(), 2);
-        assert_eq!(outcome.invocations[0].approval.as_deref(), Some("allow_once"));
+        assert_eq!(
+            outcome.invocations[0].approval.as_deref(),
+            Some("allow_once")
+        );
         // 第二次是同一个工具：AllowOnce 不产生会话授权，仍会再次询问
-        assert_eq!(outcome.invocations[1].approval.as_deref(), Some("allow_once"));
+        assert_eq!(
+            outcome.invocations[1].approval.as_deref(),
+            Some("allow_once")
+        );
     }
 
     #[test]
@@ -1277,7 +1457,14 @@ mod tests {
             vec![StreamChunk::Content("收尾回答".to_string())],
         ]);
 
-        let outcome = run_with(&fx, &backend, Arc::new(AllowAllApprover), messages(), true, 2);
+        let outcome = run_with(
+            &fx,
+            &backend,
+            Arc::new(AllowAllApprover),
+            messages(),
+            true,
+            2,
+        );
         assert!(outcome.hit_step_limit);
         assert_eq!(outcome.steps, 2);
         assert_eq!(*calls.lock().unwrap(), 2);
@@ -1341,9 +1528,15 @@ mod tests {
         let outcome = run(&fx, &backend, Arc::new(AllowAllApprover), messages());
         assert!(outcome.invocations[0].truncated);
         let seen = backend.seen_messages.lock().unwrap();
-        let tool_msg = seen.last().unwrap().iter().find(|m| m.role == "tool").unwrap();
-        assert!(tool_msg.content.contains("已截断"));
-        assert!(tool_msg.content.len() < 70 * 1024);
+        let tool_msg = seen
+            .last()
+            .unwrap()
+            .iter()
+            .find(|m| m.role == "tool")
+            .unwrap();
+        let tool_text = tool_msg.content.content_as_str();
+        assert!(tool_text.contains("已截断"));
+        assert!(tool_text.len() < 70 * 1024);
     }
 
     struct HugeTool {
@@ -1520,10 +1713,7 @@ mod tests {
         }
     }
 
-    fn run_broken(
-        fx: &Fixture,
-        backend: &Arc<BrokenStreamBackend>,
-    ) -> Result<HarnessOutcome> {
+    fn run_broken(fx: &Fixture, backend: &Arc<BrokenStreamBackend>) -> Result<HarnessOutcome> {
         let cancel = Arc::new(AtomicBool::new(false));
         let run = HarnessRun {
             backend: backend.as_ref(),
@@ -1560,10 +1750,7 @@ mod tests {
         let outcome = run_broken(&fx, &backend).expect("必须保留部分输出而不是报错");
         assert!(outcome.content.contains("前半段。"), "{}", outcome.content);
         assert!(outcome.content.contains("连接中断"), "{}", outcome.content);
-        assert!(
-            outcome.invocations.is_empty(),
-            "中断时不得执行半截工具调用"
-        );
+        assert!(outcome.invocations.is_empty(), "中断时不得执行半截工具调用");
     }
 
     /// 一个字都没产出就断开：仍然按错误上报（没有可保留的内容）
@@ -1597,5 +1784,43 @@ mod tests {
             call_timeout_window(Some(Duration::MAX), &limits),
             Duration::MAX
         );
+    }
+
+    /// OS 接管模式的系统提示必须**点名** `os_control` 与动作名。
+    ///
+    /// 真实报障：模型声称"工具表里没有桌面工具"，而同一会话前一分钟它刚
+    /// 成功调用过 os_control。只描述能力、不给工具名，模型就会按工具规则里
+    /// 出现的 read_file / run_command 去概括工具箱。
+    #[test]
+    fn os_mode_prompt_names_the_desktop_tool() {
+        let (tool, _) = MockTool::new("os_control", Permission::OsControl);
+        let fx = fixture(vec![tool], ToolMode::Full);
+        let backend = MockBackend::new(vec![vec![StreamChunk::Content("好".to_string())]]);
+        run(&fx, &backend, Arc::new(AllowAllApprover), messages());
+
+        let seen = backend.seen_messages.lock().unwrap();
+        let system = seen[0][0].content.content_as_str();
+        assert!(system.contains("OS接管模式"), "{system}");
+        assert!(system.contains("`os_control`"), "{system}");
+        assert!(system.contains("mouse_click"), "{system}");
+        assert!(system.contains("activate_window"), "{system}");
+    }
+
+    /// 只读模式不该注入 OS 接管指引，也不该截屏（截图会泄露屏幕内容）
+    #[test]
+    fn readonly_mode_never_injects_the_os_briefing() {
+        let (tool, _) = MockTool::new("os_control", Permission::OsControl);
+        let fx = fixture(vec![tool], ToolMode::ReadOnly);
+        let backend = MockBackend::new(vec![vec![StreamChunk::Content("好".to_string())]]);
+        run(&fx, &backend, Arc::new(AllowAllApprover), messages());
+
+        let seen = backend.seen_messages.lock().unwrap();
+        let joined = seen[0]
+            .iter()
+            .map(|m| m.content.content_as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("[系统指令: OS接管模式]"), "{joined}");
+        assert!(!joined.contains("[系统感知] 当前屏幕快照"), "{joined}");
     }
 }

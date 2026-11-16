@@ -223,6 +223,21 @@ export const IconMinimize = (p: IconProps) => (
   </Base>
 );
 
+/* ── 侧栏折叠 ──
+ * 用"分栏框 + 展开箭头"表达折叠动作：单看箭头会与轮播/翻页混淆，
+ * 单看分栏框又看不出"点一下会收起来"。
+ * 只保留一个图标：折叠开关只有一个入口（顶栏），图标固定表达"把侧栏拉出来"，
+ * 当前状态由点亮态与 title 传达，不再需要一个反向图标。 */
+
+/** 侧栏折叠开关（表达"把侧栏拉出来"） */
+export const IconSidebarExpand = (p: IconProps) => (
+  <Base {...p}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M9.5 4v16" />
+    <path d="M5.5 12h3M7 10.5l1.5 1.5L7 13.5" />
+  </Base>
+);
+
 /* ── 设置页分区 ── */
 
 export const IconSettings = (p: IconProps) => (

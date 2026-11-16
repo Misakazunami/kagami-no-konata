@@ -151,7 +151,10 @@ fn decode_model_pref(raw: Option<String>) -> Option<crate::llm::router::SessionM
     match serde_json::from_str::<crate::llm::router::SessionModelPref>(&text) {
         Ok(pref) => Some(pref),
         Err(e) => {
-            eprintln!("[models] 会话模型偏好解析失败，按「跟随全局提供商」处理: {}", e);
+            eprintln!(
+                "[models] 会话模型偏好解析失败，按「跟随全局提供商」处理: {}",
+                e
+            );
             None
         }
     }
@@ -266,12 +269,10 @@ impl ChatStore {
 
     /// 获取会话的所有消息（含元数据）
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
-        let mut stmt = self.conn.prepare(
-            &format!(
-                "SELECT {} FROM messages WHERE session_id = ?1 ORDER BY created_at",
-                MESSAGE_COLUMNS
-            ),
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM messages WHERE session_id = ?1 ORDER BY created_at",
+            MESSAGE_COLUMNS
+        ))?;
 
         let messages = stmt
             .query_map(rusqlite::params![session_id], map_message_row)?
@@ -324,11 +325,7 @@ impl ChatStore {
     }
 
     /// 获取会话的用户消息中指定时间之后的记录（正序，用于增量记忆提取）
-    pub fn get_user_messages_after(
-        &self,
-        session_id: &str,
-        after: &str,
-    ) -> Result<Vec<Message>> {
+    pub fn get_user_messages_after(&self, session_id: &str, after: &str) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {} FROM messages WHERE session_id = ?1 AND role = 'user' AND created_at > ?2 ORDER BY created_at",
             MESSAGE_COLUMNS
@@ -340,11 +337,7 @@ impl ChatStore {
     }
 
     /// 获取会话最近 N 条用户消息（正序返回，首次提取时限制范围）
-    pub fn get_recent_user_messages(
-        &self,
-        session_id: &str,
-        limit: usize,
-    ) -> Result<Vec<Message>> {
+    pub fn get_recent_user_messages(&self, session_id: &str, limit: usize) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {} FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY created_at DESC LIMIT ?2",
             MESSAGE_COLUMNS
@@ -364,7 +357,8 @@ impl ChatStore {
             "SELECT {} FROM messages WHERE id = ?1 AND session_id = ?2",
             MESSAGE_COLUMNS
         ))?;
-        let mut rows = stmt.query_map(rusqlite::params![message_id, session_id], map_message_row)?;
+        let mut rows =
+            stmt.query_map(rusqlite::params![message_id, session_id], map_message_row)?;
         match rows.next() {
             Some(row) => Ok(row?),
             None => anyhow::bail!("消息不存在或不属于该会话：{}", message_id),
@@ -804,10 +798,7 @@ impl ChatStore {
     pub fn get_session(&self, session_id: &str) -> Result<Session> {
         self.conn
             .query_row(
-                &format!(
-                    "SELECT {} FROM sessions WHERE id = ?1",
-                    SESSION_COLUMNS
-                ),
+                &format!("SELECT {} FROM sessions WHERE id = ?1", SESSION_COLUMNS),
                 rusqlite::params![session_id],
                 map_session_row,
             )
@@ -906,7 +897,11 @@ impl ChatStore {
     }
 
     /// 设置/清除会话绑定的工作区（`None` = 使用默认沙箱）
-    pub fn set_session_workspace(&self, session_id: &str, workspace_id: Option<&str>) -> Result<()> {
+    pub fn set_session_workspace(
+        &self,
+        session_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET workspace_id = ?1, updated_at = ?2 WHERE id = ?3",
             rusqlite::params![workspace_id, Utc::now().to_rfc3339(), session_id],
@@ -1149,8 +1144,7 @@ impl ChatStore {
         let mut keep: Vec<&SessionNote> = Vec::new();
         for note in notes.iter().rev() {
             let within_count = keep.len() < crate::agent::notes::MAX_NOTES;
-            let within_bytes =
-                keep_bytes + note.bytes <= crate::agent::notes::MAX_TOTAL_BYTES;
+            let within_bytes = keep_bytes + note.bytes <= crate::agent::notes::MAX_TOTAL_BYTES;
             if within_count && within_bytes {
                 keep_bytes += note.bytes;
                 keep.push(note);
@@ -1196,10 +1190,9 @@ impl ChatStore {
                 "DELETE FROM tool_notes WHERE session_id = ?1 AND id = ?2",
                 rusqlite::params![session_id, id],
             )?,
-            None => self.conn.execute(
-                "DELETE FROM tool_notes WHERE session_id = ?1",
-                [session_id],
-            )?,
+            None => self
+                .conn
+                .execute("DELETE FROM tool_notes WHERE session_id = ?1", [session_id])?,
         };
         Ok(removed)
     }
@@ -1287,9 +1280,9 @@ impl ChatStore {
     /// 删除会话前调用：表行会随会话级联删除，但备份文件在磁盘上，
     /// 必须先把 stream 清单取出来交给调用方清理，否则文件永远回收不了。
     pub fn list_snapshot_streams(&self, session_id: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT stream_id FROM workspace_snapshots WHERE session_id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT stream_id FROM workspace_snapshots WHERE session_id = ?1")?;
         let rows = stmt
             .query_map([session_id], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1374,11 +1367,8 @@ mod tests {
     use crate::llm::router::SessionModelPref;
 
     fn temp_store(tag: &str) -> (ChatStore, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "konata-store-{}-{}",
-            tag,
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("konata-store-{}-{}", tag, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let conn = crate::store::db::init_db(&dir).expect("init db");
         (ChatStore::new(conn), dir)
@@ -1479,15 +1469,24 @@ mod tests {
         // `created_at` 存 UTC，但"今天"是用户本地概念：查询必须按 localtime
         // 换算，否则 UTC+8 的凌晨时段找不到刚创建的会话（真实缺陷）。
         let local_today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert!(store.find_session_by_date(&local_today, "task").unwrap().is_some());
-        assert!(store.find_session_by_date(&local_today, "chat").unwrap().is_none());
+        assert!(store
+            .find_session_by_date(&local_today, "task")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .find_session_by_date(&local_today, "chat")
+            .unwrap()
+            .is_none());
 
         // 本地日期与 UTC 日期不同的时区里，用 UTC 日期查询必须查不到
         // （证明查询确实按本地时间解释，而不是碰巧同日）
         let utc_today = Utc::now().format("%Y-%m-%d").to_string();
         if utc_today != local_today {
             assert!(
-                store.find_session_by_date(&utc_today, "task").unwrap().is_none(),
+                store
+                    .find_session_by_date(&utc_today, "task")
+                    .unwrap()
+                    .is_none(),
                 "查询必须按本地日期解释 created_at"
             );
         }
@@ -1515,7 +1514,9 @@ mod tests {
             .expect("set");
         assert!(store.get_session(&session.id).unwrap().model_pref.is_some());
 
-        store.set_session_model_pref(&session.id, None).expect("clear");
+        store
+            .set_session_model_pref(&session.id, None)
+            .expect("clear");
         assert!(
             store.get_session(&session.id).unwrap().model_pref.is_none(),
             "清除后必须回到「跟随全局」"
@@ -1537,7 +1538,10 @@ mod tests {
             .set_session_auto_approve(&session.id, true)
             .expect("set");
         assert!(store.get_session(&session.id).unwrap().auto_approve_all);
-        assert!(store.list_sessions().unwrap()[0].auto_approve_all, "列表查询");
+        assert!(
+            store.list_sessions().unwrap()[0].auto_approve_all,
+            "列表查询"
+        );
 
         store
             .set_session_auto_approve(&session.id, false)
@@ -1589,9 +1593,15 @@ mod tests {
             bytes: 10,
             created_at: at.to_string(),
         };
-        store.record_snapshot(&row("s1", "a.rs", "2026-01-01T00:00:00Z")).unwrap();
-        store.record_snapshot(&row("s1", "b.rs", "2026-01-01T00:00:01Z")).unwrap();
-        store.record_snapshot(&row("s2", "c.rs", "2026-01-02T00:00:00Z")).unwrap();
+        store
+            .record_snapshot(&row("s1", "a.rs", "2026-01-01T00:00:00Z"))
+            .unwrap();
+        store
+            .record_snapshot(&row("s1", "b.rs", "2026-01-01T00:00:01Z"))
+            .unwrap();
+        store
+            .record_snapshot(&row("s2", "c.rs", "2026-01-02T00:00:00Z"))
+            .unwrap();
         let mut foreign = row("s3", "d.rs", "2026-01-03T00:00:00Z");
         foreign.session_id = other.id.clone();
         store.record_snapshot(&foreign).unwrap();
@@ -1618,7 +1628,9 @@ mod tests {
 
         store.grant_session_tool(&session.id, "write_file").unwrap();
         store.grant_session_tool(&session.id, "write_file").unwrap(); // 幂等
-        store.grant_session_tool(&session.id, "run_command").unwrap();
+        store
+            .grant_session_tool(&session.id, "run_command")
+            .unwrap();
         store.grant_session_tool(&other.id, "web_fetch").unwrap();
 
         assert_eq!(
@@ -1628,9 +1640,16 @@ mod tests {
         );
         assert_eq!(store.list_session_grants(&other.id).unwrap().len(), 1);
 
-        assert!(store.revoke_session_tool(&session.id, "write_file").unwrap());
-        assert!(!store.revoke_session_tool(&session.id, "write_file").unwrap());
-        assert_eq!(store.list_session_grants(&session.id).unwrap(), vec!["run_command"]);
+        assert!(store
+            .revoke_session_tool(&session.id, "write_file")
+            .unwrap());
+        assert!(!store
+            .revoke_session_tool(&session.id, "write_file")
+            .unwrap());
+        assert_eq!(
+            store.list_session_grants(&session.id).unwrap(),
+            vec!["run_command"]
+        );
 
         // 删除会话 → 级联清理（外键开启时）
         store.delete_session(&session.id).unwrap();
@@ -1684,7 +1703,9 @@ mod tests {
     #[test]
     fn rewind_removes_tail_and_attached_tool_invocations() {
         let (store, dir) = temp_store("rewind-tail");
-        let session = store.create_session("p", "t", None, None, None).expect("create");
+        let session = store
+            .create_session("p", "t", None, None, None)
+            .expect("create");
 
         let mut ids = Vec::new();
         for (i, role) in [Role::User, Role::Assistant, Role::User, Role::Assistant]
@@ -1751,7 +1772,11 @@ mod tests {
             let session = store.create_session("p", title, None, None, None).unwrap();
             let mut ids = Vec::new();
             for i in 0..6 {
-                let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+                let role = if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
                 ids.push(
                     store
                         .add_message(&session.id, role, &format!("m{}", i), 1, 0, None, None)
@@ -1772,7 +1797,9 @@ mod tests {
 
         // index=2 < 水位 4：摘要引用了被删内容，必须整体清空重算
         let (session2, ids2) = make_session(&store, "t2");
-        store.set_session_summary(&session2.id, "旧摘要", 4).unwrap();
+        store
+            .set_session_summary(&session2.id, "旧摘要", 4)
+            .unwrap();
         let outcome = store.rewind_messages(&session2.id, &ids2[2], true).unwrap();
         assert!(outcome.summary_cleared);
         let (summary, count) = store.get_summary_with_count(&session2.id).unwrap();
@@ -1836,11 +1863,7 @@ mod tests {
         store
             .save_note(
                 &session.id,
-                &SessionNote::new(
-                    "n1".to_string(),
-                    None,
-                    "基于旧回答的结论".to_string(),
-                ),
+                &SessionNote::new("n1".to_string(), None, "基于旧回答的结论".to_string()),
             )
             .unwrap();
 

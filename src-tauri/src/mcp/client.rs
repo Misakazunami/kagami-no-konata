@@ -68,7 +68,10 @@ fn build_command(cfg: &McpServerConfig) -> Command {
                 tail.push_str(&format!("\"{}\"", arg));
             }
             let mut cmd = Command::new(crate::agent::harness::command_guard::windows_cmd_exe());
-            cmd.arg("/d").arg("/s").arg("/c").arg(format!("\"{}\"", tail));
+            cmd.arg("/d")
+                .arg("/s")
+                .arg("/c")
+                .arg(format!("\"{}\"", tail));
             return cmd;
         }
     }
@@ -97,8 +100,8 @@ fn resolve_windows_script(command: &str) -> Option<std::path::PathBuf> {
         None if has_separator => None,
         // 无扩展名裸名：按 PATHEXT 找，只有命中 .cmd/.bat 才需要包装
         None => {
-            let pathext = std::env::var("PATHEXT")
-                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
             pathext
                 .split(';')
                 .map(|ext| ext.trim().to_ascii_lowercase())
@@ -272,7 +275,10 @@ impl McpClient {
                     Ok(info) if !info.name.is_empty() => out.push(info),
                     Ok(_) => eprintln!("[mcp] 忽略没有名字的工具（服务器 {}）", self.server_id),
                     Err(e) => {
-                        eprintln!("[mcp] 忽略无法解析的工具声明（服务器 {}）：{}", self.server_id, e)
+                        eprintln!(
+                            "[mcp] 忽略无法解析的工具声明（服务器 {}）：{}",
+                            self.server_id, e
+                        )
                     }
                 }
             }
@@ -354,11 +360,9 @@ impl McpClient {
             }
             let line = match self.lines.recv_timeout(remaining) {
                 Ok(Ok(line)) => line,
-                Ok(Err(message)) => anyhow::bail!(
-                    "MCP 服务器「{}」输出异常：{}",
-                    self.server_id,
-                    message
-                ),
+                Ok(Err(message)) => {
+                    anyhow::bail!("MCP 服务器「{}」输出异常：{}", self.server_id, message)
+                }
                 Err(RecvTimeoutError::Timeout) => anyhow::bail!(
                     "MCP 服务器「{}」在 {} 秒内没有响应 {}",
                     self.server_id,
@@ -415,7 +419,10 @@ impl McpClient {
         // 投递给写线程即返回：即使子进程不读 stdin、管道已满，也不会在这里
         // 永久阻塞（调用方的超时因此始终有效）
         self.writes.send(line).map_err(|_| {
-            anyhow::anyhow!("向 MCP 服务器「{}」写入失败（写线程已退出）", self.server_id)
+            anyhow::anyhow!(
+                "向 MCP 服务器「{}」写入失败（写线程已退出）",
+                self.server_id
+            )
         })
     }
 }
@@ -424,10 +431,7 @@ impl McpClient {
 ///
 /// `BufRead::lines` 会把整行（可能几百 MB）完整读进内存后才交给调用方，
 /// 单条响应上限形同虚设；这里边读边计数，超过 `max` 立刻失败。
-fn read_bounded_line<R: BufRead>(
-    reader: &mut R,
-    max: usize,
-) -> std::io::Result<Option<String>> {
+fn read_bounded_line<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<Option<String>> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let available = reader.fill_buf()?;

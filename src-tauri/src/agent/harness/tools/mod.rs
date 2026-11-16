@@ -2,8 +2,10 @@ pub mod basic;
 pub mod fs_move;
 pub mod fs_read;
 pub mod fs_write;
+pub mod look_at_screen;
 pub mod memory;
 pub mod notes;
+pub mod os_control;
 pub mod plan;
 pub mod shell;
 pub mod subagent;
@@ -55,6 +57,10 @@ pub fn builtin_registry() -> ToolRegistry {
         Arc::new(web::WebSearch),
         // 调起系统默认程序（需审批）
         Arc::new(web::OpenWithSystem),
+        // 操作系统直接控制（极高风险，需审批，仅 Full 模式可见）
+        Arc::new(os_control::OsControlTool),
+        // Wayland 只读截图（实验，显式 opt-in；不能控制键鼠）
+        Arc::new(look_at_screen::LookAtScreen),
     ])
 }
 
@@ -112,7 +118,7 @@ mod tests {
     fn builtin_registry_has_unique_names() {
         let registry = builtin_registry();
         // len 与 schema 数一致即说明没有重复名覆盖
-        assert_eq!(registry.len(), 24, "内置工具数量应当与设计一致");
+        assert_eq!(registry.len(), 26, "内置工具数量应当与设计一致");
         let names = registry.visible_names(ToolMode::Full);
         let mut unique = names.clone();
         unique.sort();
@@ -151,7 +157,11 @@ mod tests {
     fn tool_descriptions_are_persona_agnostic() {
         // 工具描述是模型可见的提示词，写死角色名会在用户切换人格后串戏
         for info in builtin_registry().infos(ToolMode::Full) {
-            for text in [info.label.as_str(), info.description.as_str(), info.name.as_str()] {
+            for text in [
+                info.label.as_str(),
+                info.description.as_str(),
+                info.name.as_str(),
+            ] {
                 for name in ["此方", "こなた", "泉此方"] {
                     assert!(
                         !text.contains(name),

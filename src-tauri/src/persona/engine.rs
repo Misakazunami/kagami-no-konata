@@ -1,8 +1,8 @@
+use super::types::PersonaConfig;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use super::types::PersonaConfig;
 
 /// 预置默认人格 YAML（嵌入二进制）
 const DEFAULT_PERSONA_YAML: &str = include_str!("../../personas/default.yaml");
@@ -24,7 +24,10 @@ impl PersonaEngine {
         let default_id = default.id.clone();
         personas.insert(default.id.clone(), default);
 
-        Ok(Self { personas, default_id })
+        Ok(Self {
+            personas,
+            default_id,
+        })
     }
 
     /// 初始化并加载全部人格（内置 + 磁盘用户自定义）
@@ -170,10 +173,7 @@ mod tests {
         let prompt = engine
             .build_system_prompt("不存在的ID", "用户", None)
             .expect("fallback prompt");
-        assert!(
-            prompt.contains("此方"),
-            "回退后应使用内置默认人格的提示词"
-        );
+        assert!(prompt.contains("此方"), "回退后应使用内置默认人格的提示词");
     }
 
     /// `{user_nickname}` 必须被插值：任务模式的人设块与对话链路共用同一处实现

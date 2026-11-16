@@ -1,10 +1,10 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::agent::plan::{sanitize_items, SessionPlan};
 use crate::agent::harness::traits::{
     Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput, EVENT_PLAN_UPDATED,
 };
+use crate::agent::plan::{sanitize_items, SessionPlan};
 
 /// 计划项条数上限（与 store 的 `MAX_PLAN_ITEMS` 一致，见 `agent::plan`）
 pub const MAX_ITEMS: usize = crate::store::chat_store::MAX_PLAN_ITEMS;
@@ -61,7 +61,10 @@ impl Tool for UpdatePlan {
     }
 
     async fn call(&self, args: Value, cx: &ToolCtx<'_>) -> Result<ToolOutput> {
-        let raw = args.get("items").cloned().unwrap_or(Value::Array(Vec::new()));
+        let raw = args
+            .get("items")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
         let items = sanitize_items(&raw).map_err(|e| anyhow::anyhow!(e))?;
         let note = args
             .get("note")
@@ -176,12 +179,17 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("konata-plan-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("konata-plan-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let conn = db::init_db(&dir).unwrap();
             let store = Arc::new(Mutex::new(ChatStore::new(conn)));
             // 计划有外键指向 sessions，先建一条会话
-            store.lock().unwrap().create_session("konata-default", "测试", None, None, None).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .create_session("konata-default", "测试", None, None, None)
+                .unwrap();
             let cfg = ToolConfig::with_single_root(&dir, true, "测试");
             let set = WorkspaceSet::from_config(&cfg, &dir);
             let mut services = ToolServices::minimal(dir.clone(), set, ToolMode::Standard);
@@ -285,12 +293,27 @@ mod tests {
             ..fx.ctx()
         };
         block_on(UpdatePlan.call(json!({"items": ["唯一一项"]}), &cx)).unwrap();
-        assert!(fx.store.lock().unwrap().get_plan(&session_id).unwrap().is_some());
+        assert!(fx
+            .store
+            .lock()
+            .unwrap()
+            .get_plan(&session_id)
+            .unwrap()
+            .is_some());
 
         let out = block_on(UpdatePlan.call(json!({"items": []}), &cx)).unwrap();
-        assert!(out.content.contains("计划已清空") || out.content.contains("计划已更新"), "{}", out.content);
         assert!(
-            fx.store.lock().unwrap().get_plan(&session_id).unwrap().is_none(),
+            out.content.contains("计划已清空") || out.content.contains("计划已更新"),
+            "{}",
+            out.content
+        );
+        assert!(
+            fx.store
+                .lock()
+                .unwrap()
+                .get_plan(&session_id)
+                .unwrap()
+                .is_none(),
             "空计划必须删除记录，而不是留下空壳"
         );
     }
@@ -305,9 +328,16 @@ mod tests {
         };
         block_on(UpdatePlan.call(json!({"items": ["有效一项"]}), &cx)).unwrap();
 
-        let err = block_on(UpdatePlan.call(json!({"items": [{"status": "done"}]}), &cx)).unwrap_err();
+        let err =
+            block_on(UpdatePlan.call(json!({"items": [{"status": "done"}]}), &cx)).unwrap_err();
         assert!(err.to_string().contains("title"), "{err}");
-        let stored = fx.store.lock().unwrap().get_plan(&session_id).unwrap().unwrap();
+        let stored = fx
+            .store
+            .lock()
+            .unwrap()
+            .get_plan(&session_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.items.len(), 1, "校验失败不得改动已有计划");
     }
 

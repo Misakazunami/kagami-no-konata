@@ -4,9 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::agent::harness::snapshot::{capture_before_change, snapshot_note, Capture};
-use crate::agent::harness::traits::{
-    Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput,
-};
+use crate::agent::harness::traits::{Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput};
 use crate::agent::harness::trash::{self, Removal};
 
 use super::args;
@@ -211,28 +209,15 @@ fn remove_any(target: &Path) -> Result<()> {
 /// 目录不参与内容快照（由回收站兜底）。不能套用 `snapshot_note(None)` 的
 /// "当前环境未启用文件快照"兜底文案——快照其实是启用的，那会误导模型与用户。
 fn directory_snapshot_note() -> String {
-    "\n（目录不做内容快照，本次改动无法在应用内一键回滚；非永久删除可从系统回收站找回）"
-        .to_string()
+    "\n（目录不做内容快照，本次改动无法在应用内一键回滚；非永久删除可从系统回收站找回）".to_string()
 }
 
 /// 若目标已存在且允许覆盖，先给目标做快照（否则回滚拿不回被覆盖的内容）
-fn capture_existing(
-    cx: &ToolCtx<'_>,
-    root_id: &str,
-    rel: &Path,
-    abs: &Path,
-) -> Option<Capture> {
+fn capture_existing(cx: &ToolCtx<'_>, root_id: &str, rel: &Path, abs: &Path) -> Option<Capture> {
     if !abs.exists() {
         return None;
     }
-    capture_before_change(
-        cx.services,
-        cx.session_id,
-        cx.stream_id,
-        root_id,
-        rel,
-        abs,
-    )
+    capture_before_change(cx.services, cx.session_id, cx.stream_id, root_id, rel, abs)
 }
 
 // ─── delete_path ─────────────────────────────────────────
@@ -359,7 +344,11 @@ impl Tool for DeletePath {
             Removal::Trashed
         };
 
-        let kind = if metadata.is_dir() { "目录" } else { "文件" };
+        let kind = if metadata.is_dir() {
+            "目录"
+        } else {
+            "文件"
+        };
         let backup_note = if metadata.is_dir() {
             directory_snapshot_note()
         } else {
@@ -499,12 +488,7 @@ impl Tool for MovePath {
             &from.abs_path,
         );
         let target_capture = if to.abs_path.exists() {
-            capture_existing(
-                cx,
-                &to.root_id,
-                &to.rel,
-                &to.abs_path,
-            )
+            capture_existing(cx, &to.root_id, &to.rel, &to.abs_path)
         } else {
             None
         };
@@ -624,10 +608,16 @@ impl Tool for CopyPath {
         }
         let is_dir = from.abs_path.is_dir();
         if is_dir && !recursive {
-            anyhow::bail!("{} 是目录：复制目录必须显式设置 recursive=true", from.abs_path.display());
+            anyhow::bail!(
+                "{} 是目录：复制目录必须显式设置 recursive=true",
+                from.abs_path.display()
+            );
         }
         if !is_dir && to.abs_path.is_dir() {
-            anyhow::bail!("目标 {} 是目录，不能作为文件的目标路径", to.abs_path.display());
+            anyhow::bail!(
+                "目标 {} 是目录，不能作为文件的目标路径",
+                to.abs_path.display()
+            );
         }
         if to.abs_path.exists() && !overwrite {
             anyhow::bail!(
@@ -660,7 +650,10 @@ impl Tool for CopyPath {
         };
         if to.abs_path.exists() && to.abs_path.is_dir() {
             // 目录覆盖语义在各平台不一致，明确拒绝而不是猜
-            anyhow::bail!("目标 {} 已存在且是目录，拒绝覆盖目录", to.abs_path.display());
+            anyhow::bail!(
+                "目标 {} 已存在且是目录，拒绝覆盖目录",
+                to.abs_path.display()
+            );
         }
 
         cx.ensure_not_cancelled()?;
@@ -694,9 +687,7 @@ mod tests {
     use super::*;
     use crate::agent::harness::jail::WorkspaceSet;
     use crate::agent::harness::snapshot::SnapshotStore;
-    use crate::agent::harness::traits::{
-        DenyAllApprover, ToolLimits, ToolServices,
-    };
+    use crate::agent::harness::traits::{DenyAllApprover, ToolLimits, ToolServices};
     use crate::config::types::{ToolConfig, ToolMode};
     use crate::store::chat_store::ChatStore;
     use crate::store::db;
@@ -721,8 +712,8 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("konata-mv-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("konata-mv-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let conn = db::init_db(&dir).unwrap();
             let store = Arc::new(Mutex::new(ChatStore::new(conn)));
@@ -799,7 +790,10 @@ mod tests {
         let cx = fx.ctx();
         let err = block_on(DeletePath.call(json!({"path": "sub"}), &cx)).unwrap_err();
         assert!(err.to_string().contains("recursive"), "{err}");
-        assert!(fx.dir.join("sub/a.txt").exists(), "被拒绝时不能删除任何东西");
+        assert!(
+            fx.dir.join("sub/a.txt").exists(),
+            "被拒绝时不能删除任何东西"
+        );
     }
 
     #[test]
@@ -808,7 +802,10 @@ mod tests {
         fx.write("config.json", "{}");
         let cx = fx.ctx();
         let err = block_on(DeletePath.call(json!({"path": "config.json"}), &cx)).unwrap_err();
-        assert!(err.to_string().contains("拒绝") || err.to_string().contains("敏感"), "{err}");
+        assert!(
+            err.to_string().contains("拒绝") || err.to_string().contains("敏感"),
+            "{err}"
+        );
         assert!(fx.dir.join("config.json").exists());
     }
 
@@ -818,18 +815,17 @@ mod tests {
         let fx = Fixture::new("perm");
         fx.write("note.txt", "重要内容");
         let cx = fx.ctx();
-        let out = block_on(DeletePath.call(
-            json!({"path": "note.txt", "permanent": true}),
-            &cx,
-        ))
-        .unwrap();
+        let out =
+            block_on(DeletePath.call(json!({"path": "note.txt", "permanent": true}), &cx)).unwrap();
         assert!(!fx.dir.join("note.txt").exists());
         assert!(out.content.contains("永久删除"), "{}", out.content);
 
         // 删除前已备份 → 可以回滚
         let info = fx.snapshots.info(&fx.session_id, "st1");
         assert_eq!(info.files, 1);
-        let report = fx.snapshots.restore("st1", &fx.session_id, &fx.services.workspaces);
+        let report = fx
+            .snapshots
+            .restore("st1", &fx.session_id, &fx.services.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(
             std::fs::read_to_string(fx.dir.join("note.txt")).unwrap(),
@@ -866,17 +862,18 @@ mod tests {
         let fx = Fixture::new("move");
         fx.write("old.txt", "内容");
         let cx = fx.ctx();
-        let out = block_on(MovePath.call(
-            json!({"from": "old.txt", "to": "new.txt"}),
-            &cx,
-        ))
-        .unwrap();
+        let out =
+            block_on(MovePath.call(json!({"from": "old.txt", "to": "new.txt"}), &cx)).unwrap();
         assert!(!fx.dir.join("old.txt").exists());
-        assert_eq!(std::fs::read_to_string(fx.dir.join("new.txt")).unwrap(), "内容");
+        assert_eq!(
+            std::fs::read_to_string(fx.dir.join("new.txt")).unwrap(),
+            "内容"
+        );
         assert!(out.content.contains("已移动"), "{}", out.content);
 
         // 回滚把源放回原位
-        fx.snapshots.restore("st1", &fx.session_id, &fx.services.workspaces);
+        fx.snapshots
+            .restore("st1", &fx.session_id, &fx.services.workspaces);
         assert_eq!(
             std::fs::read_to_string(fx.dir.join("old.txt")).unwrap(),
             "内容"
@@ -891,7 +888,8 @@ mod tests {
         let err = block_on(MovePath.call(json!({"from": "ghost", "to": "x"}), &cx)).unwrap_err();
         assert!(err.to_string().contains("不存在"), "{err}");
 
-        let err = block_on(MovePath.call(json!({"from": "dir", "to": "dir/sub"}), &cx)).unwrap_err();
+        let err =
+            block_on(MovePath.call(json!({"from": "dir", "to": "dir/sub"}), &cx)).unwrap_err();
         assert!(err.to_string().contains("子路径"), "{err}");
     }
 
@@ -902,7 +900,8 @@ mod tests {
         fx.write("b.txt", "B");
         let cx = fx.ctx();
 
-        let err = block_on(MovePath.call(json!({"from": "a.txt", "to": "b.txt"}), &cx)).unwrap_err();
+        let err =
+            block_on(MovePath.call(json!({"from": "a.txt", "to": "b.txt"}), &cx)).unwrap_err();
         assert!(err.to_string().contains("overwrite"), "{err}");
 
         block_on(MovePath.call(
@@ -936,7 +935,10 @@ mod tests {
         let cx = fx.ctx();
         block_on(CopyPath.call(json!({"from": "src.txt", "to": "copy.txt"}), &cx)).unwrap();
         assert!(fx.dir.join("src.txt").exists());
-        assert_eq!(std::fs::read_to_string(fx.dir.join("copy.txt")).unwrap(), "内容");
+        assert_eq!(
+            std::fs::read_to_string(fx.dir.join("copy.txt")).unwrap(),
+            "内容"
+        );
         // 复制不动源文件 → 没有备份记录（没有东西被覆盖）
         assert_eq!(fx.snapshots.info(&fx.session_id, "st1").files, 0);
     }
@@ -954,7 +956,10 @@ mod tests {
             &cx,
         ))
         .unwrap();
-        assert_eq!(std::fs::read_to_string(fx.dir.join("e/f.txt")).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(fx.dir.join("e/f.txt")).unwrap(),
+            "x"
+        );
     }
 
     #[test]
@@ -984,11 +989,8 @@ mod tests {
         } else {
             "/tmp/konata-should-not-exist.txt"
         };
-        let err = block_on(MovePath.call(
-            json!({"from": "f.txt", "to": outside}),
-            &cx,
-        ))
-        .unwrap_err();
+        let err =
+            block_on(MovePath.call(json!({"from": "f.txt", "to": outside}), &cx)).unwrap_err();
         assert!(err.to_string().contains("工作区"), "{err}");
         assert!(fx.dir.join("f.txt").exists());
     }

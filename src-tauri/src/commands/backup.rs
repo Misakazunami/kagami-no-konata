@@ -1,7 +1,9 @@
 use std::fs;
 use tauri::State;
 
-use crate::commands::persona::{is_inside_dir, personas_dir, validate_persona_id, write_persona_file};
+use crate::commands::persona::{
+    is_inside_dir, personas_dir, validate_persona_id, write_persona_file,
+};
 use crate::persona::types::PersonaConfig;
 use crate::store::memory_store::{
     decode_embedding_b64, encode_embedding_b64, MemoryEntry, MemoryStore, MemoryType,
@@ -149,7 +151,10 @@ impl ImportReport {
 }
 
 /// 校验并解析导入用的 JSON 文本
-fn parse_import<T: serde::de::DeserializeOwned>(json_content: &str, what: &str) -> Result<T, String> {
+fn parse_import<T: serde::de::DeserializeOwned>(
+    json_content: &str,
+    what: &str,
+) -> Result<T, String> {
     if json_content.len() > MAX_IMPORT_BYTES {
         return Err(format!(
             "导入文件过大（{} 字节，上限 {} 字节）",

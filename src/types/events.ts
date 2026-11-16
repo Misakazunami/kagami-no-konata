@@ -317,6 +317,14 @@ export interface RewindOutcomeView {
   summary_cleared: boolean;
 }
 
+/** `harness-notice` 事件载荷：后端运行期提示（截图失败、能力降级等） */
+export interface HarnessNoticeData {
+  session_id: string;
+  stream_id: string;
+  level: "info" | "warning" | "error";
+  message: string;
+}
+
 export const STREAM_EVENT = {
   chunk: "stream-chunk",
   thinking: "stream-thinking-chunk",

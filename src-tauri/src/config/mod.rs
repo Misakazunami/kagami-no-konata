@@ -16,6 +16,37 @@ fn config_tmp_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("config.json.tmp")
 }
 
+/// 收紧应用数据目录权限（Unix：0700）
+///
+/// `config.json` 里存着 API Key。Unix 下 `create_dir_all` 默认按 umask
+/// 创建（通常是 0755），同机其他用户虽然读不到 0600 的文件，但仍能枚举
+/// 目录内容。失败只告警：部分网络文件系统不支持 chmod，不能因此让配置
+/// 保存整体失败。
+#[cfg(unix)]
+fn restrict_dir_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+        eprintln!("[config] 收紧目录权限失败（{}）：{}", path.display(), e);
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_permissions(_path: &Path) {}
+
+/// 收紧配置文件权限（Unix：0600）
+#[cfg(unix)]
+fn restrict_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        eprintln!("[config] 收紧文件权限失败（{}）：{}", path.display(), e);
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_path: &Path) {}
+
 /// 加载配置
 ///
 /// 容错策略（历史上这里任何错误都会让启动直接 panic，用户只能手改文件）：
@@ -32,6 +63,8 @@ pub fn load_config(app_data_dir: &Path) -> Result<AppConfig> {
     }
 
     let content = fs::read_to_string(&path)?;
+    // 旧版本/手工创建的文件可能是 0644；加载时就地收紧，不等下次保存。
+    restrict_file_permissions(&path);
     let mut config: AppConfig = match serde_json::from_str(&content) {
         Ok(config) => config,
         Err(e) => {
@@ -60,10 +93,7 @@ pub fn load_config(app_data_dir: &Path) -> Result<AppConfig> {
         .any(|p| p.id == config.llm.active_provider_id)
     {
         if let Some(first) = config.llm.providers.first() {
-            eprintln!(
-                "[config] 活跃提供商 id 悬空，已切换到「{}」",
-                first.name
-            );
+            eprintln!("[config] 活跃提供商 id 悬空，已切换到「{}」", first.name);
             config.llm.active_provider_id = first.id.clone();
             repaired = true;
         }
@@ -109,10 +139,7 @@ pub fn load_config(app_data_dir: &Path) -> Result<AppConfig> {
             repaired = true;
         }
         if let Err(e) = fs::write(&defaults_marker, "1") {
-            eprintln!(
-                "[config] 写入默认值迁移标记失败（下次启动会重试）: {}",
-                e
-            );
+            eprintln!("[config] 写入默认值迁移标记失败（下次启动会重试）: {}", e);
         }
     }
 
@@ -126,10 +153,7 @@ pub fn load_config(app_data_dir: &Path) -> Result<AppConfig> {
             repaired = true;
         }
         if let Err(e) = fs::write(&timeout_marker, "1") {
-            eprintln!(
-                "[config] 写入默认值迁移标记失败（下次启动会重试）: {}",
-                e
-            );
+            eprintln!("[config] 写入默认值迁移标记失败（下次启动会重试）: {}", e);
         }
     }
 
@@ -160,6 +184,7 @@ fn backup_corrupt_config(path: &Path) -> PathBuf {
 /// ——后者会让下次启动的配置解析失败。
 pub fn save_config(app_data_dir: &Path, config: &AppConfig) -> Result<()> {
     fs::create_dir_all(app_data_dir)?;
+    restrict_dir_permissions(app_data_dir);
 
     let path = config_path(app_data_dir);
     let tmp = config_tmp_path(app_data_dir);
@@ -167,12 +192,18 @@ pub fn save_config(app_data_dir: &Path, config: &AppConfig) -> Result<()> {
 
     {
         let mut file = fs::File::create(&tmp)?;
+        // `File::create` 会复用既有 inode 的权限位：旧版本留下的 0644 临时文件
+        // 必须在写入前收紧，否则 API Key 会有一瞬间对同机其他用户可读。
+        restrict_file_permissions(&tmp);
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
 
     // Windows 上 std::fs::rename 使用 MOVEFILE_REPLACE_EXISTING，可覆盖既有文件
     fs::rename(&tmp, &path)?;
+    // rename 保留临时文件的权限位；这里再兜一次，覆盖"旧版本创建的 tmp 文件
+    // 恰好没有走上面 chmod"的历史情况。
+    restrict_file_permissions(&path);
     Ok(())
 }
 
@@ -181,11 +212,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "konata-config-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("konata-config-test-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
@@ -197,6 +225,32 @@ mod tests {
         let config = load_config(&dir).expect("load default config");
         assert!(!config.llm.providers.is_empty());
         assert!(config_path(&dir).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// config.json 含 API Key：Unix 上必须是 0600，目录是 0700
+    #[cfg(unix)]
+    #[test]
+    fn config_permissions_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("perms");
+        save_config(&dir, &AppConfig::default()).expect("save config");
+
+        let file_mode = fs::metadata(config_path(&dir))
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "config.json 必须仅属主可读写");
+
+        let dir_mode = fs::metadata(&dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "应用数据目录必须仅属主可访问");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -215,10 +269,10 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
             .collect();
         assert_eq!(backups.len(), 1, "损坏的配置必须被备份");
-        assert!(serde_json::from_str::<AppConfig>(
-            &fs::read_to_string(config_path(&dir)).unwrap()
-        )
-        .is_ok());
+        assert!(
+            serde_json::from_str::<AppConfig>(&fs::read_to_string(config_path(&dir)).unwrap())
+                .is_ok()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -294,7 +348,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(config_path(&dir)).unwrap()).unwrap();
         assert!(reloaded.tools.missing_builtin_deny_globs().is_empty());
         let again = load_config(&dir).expect("second load");
-        assert_eq!(again.tools.deny_globs.len(), reloaded.tools.deny_globs.len());
+        assert_eq!(
+            again.tools.deny_globs.len(),
+            reloaded.tools.deny_globs.len()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

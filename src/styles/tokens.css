@@ -35,7 +35,8 @@
   --tool-error-bg: rgba(247, 118, 142, 0.14);
   --tool-warn-bg: rgba(224, 175, 104, 0.16);
   --tool-running-bg: rgba(187, 154, 247, 0.12);
-  --tool-mono: ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+  --tool-mono: ui-monospace, "Cascadia Mono", "Noto Sans Mono CJK SC", "Source Han Mono SC",
+    "DejaVu Sans Mono", Consolas, "Microsoft YaHei", monospace;
   /*
    * ── 字体阶梯（rem）──
    * 基准 1rem = 14px。全部字号都用 rem，设置页的"字号"才能整体缩放界面；
@@ -65,7 +66,8 @@
   --dur-fast: 0.15s;
   --dur-base: 0.2s;
   --ease-out: ease-out;
-  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-family: "Segoe UI", "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei",
+    "Microsoft YaHei", "Noto Sans", "DejaVu Sans", sans-serif;
   /* 根字号必须是绝对值：它是所有 rem 的换算基准（1rem = 14px），
    * 运行时由 applyTheme 按用户设置覆盖；写成 1rem 会变成浏览器默认 16px */
   font-size: 14px;

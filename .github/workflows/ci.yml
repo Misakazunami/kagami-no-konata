@@ -11,8 +11,8 @@ concurrency:
 
 jobs:
   linux:
-    name: Linux · 前端构建 + 后端测试 + clippy
-    runs-on: ubuntu-latest
+    name: Linux · 测试 + clippy + 打包
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +30,8 @@ jobs:
           sudo apt-get install -y \
             build-essential curl wget file \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev libssl-dev patchelf
+            librsvg2-dev libxdo-dev libxcb1-dev libxrandr-dev \
+            libdbus-1-dev libssl-dev patchelf rpm xvfb dbus-x11
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -41,8 +42,26 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # 在 Xvfb 下跑测试，让平台能力探测走 X11 分支，而不是 CI 的“无 DISPLAY”分支。
+      - run: xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: 打包 deb / AppImage / rpm
+        run: pnpm tauri build --bundles deb,appimage,rpm
+
+      - name: 冒烟测试（X11）
+        run: |
+          dbus-run-session -- xvfb-run -a env \
+            KONATA_SMOKE_TEST=1 \
+            WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+            ./src-tauri/target/release/kagami-no-konata
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundles
+          path: src-tauri/target/release/bundle/**
+          if-no-files-found: error
 
   windows:
     name: Windows · 编译检查 + clippy
@@ -63,3 +82,31 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
       - name: cargo clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  windows-bundle:
+    name: Windows · NSIS 打包
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri build --bundles nsis
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis
+          path: src-tauri/target/release/bundle/nsis/**
+          if-no-files-found: error

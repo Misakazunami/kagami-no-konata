@@ -534,6 +534,14 @@
   opacity: 0.55;
 }
 
+/* 平台/环境禁用原因：比描述更具体，允许换行 */
+.tool-item-reason {
+  margin-top: 4px;
+  font-size: 0.786rem;
+  line-height: 1.5;
+  color: var(--tool-warn);
+}
+
 .tool-item-main {
   display: flex;
   align-items: center;

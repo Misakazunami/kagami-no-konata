@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { PlatformCapabilities } from "../types/platform";
 
 export type ToastKind = "success" | "error" | "info";
 
@@ -12,6 +13,9 @@ export interface Toast {
 
 interface UiState {
   toasts: Toast[];
+  /** 平台能力（启动时由 App 调用 `get_platform_capabilities` 填充） */
+  platform: PlatformCapabilities | null;
+  setPlatformCapabilities: (platform: PlatformCapabilities) => void;
   /** 推一条 toast；同一文本只保留最新一条（避免重复点击刷屏） */
   pushToast: (text: string, kind?: ToastKind, duration?: number) => void;
   dismissToast: (id: string) => void;
@@ -33,6 +37,9 @@ const DEFAULT_DURATION: Record<ToastKind, number> = {
  */
 export const useUiStore = create<UiState>((set, get) => ({
   toasts: [],
+  platform: null,
+
+  setPlatformCapabilities: (platform) => set({ platform }),
 
   pushToast: (text, kind = "info", duration) => {
     const trimmed = text.trim();

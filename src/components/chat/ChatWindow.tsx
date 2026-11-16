@@ -5,6 +5,7 @@ import { useChatStore, type Session } from "../../stores/chatStore";
 import { useUiStore } from "../../stores/uiStore";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { useFocusTrap } from "../../hooks/useFocusTrap";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { MessageList } from "./MessageList";
 import { InputBox } from "./InputBox";
 import { NotesPanel } from "./NotesPanel";
@@ -24,6 +25,7 @@ import {
   IconMoon,
   IconPlus,
   IconSettings,
+  IconSidebarExpand,
   IconSparkles,
   IconSun,
   IconX,
@@ -34,6 +36,14 @@ import {
   FALLBACK_SHORT_NAME,
   type PersonaSummary,
 } from "../../types/persona";
+
+/**
+ * 侧栏自动折叠的断点
+ *
+ * 必须与 chat.css 里 `@media (max-width: 699px)` 的分档一致：CSS 负责窄屏下
+ * 把侧栏变成覆盖层，这里负责"窗口够窄时自动收起"，两边同一个阈值。
+ */
+const SIDEBAR_AUTO_COLLAPSE_QUERY = "(max-width: 699px)";
 
 /**
  * 本地日期键（`YYYY-MM-DD`）
@@ -90,6 +100,80 @@ export function ChatWindow() {
   const backgroundStreams = useChatStore((s) => s.backgroundStreams);
   const isStreaming = useChatStore((s) => s.isStreaming);
   const pushToast = useUiStore((s) => s.pushToast);
+
+  /*
+   * ── 会话侧栏的收起 / 展开 ──
+   *
+   * 两个来源必须分开记，否则会互相覆盖：
+   * - `userCollapsed`：用户手动点按钮的偏好，持久化到 config.ui.sidebar_collapsed；
+   * - `autoCollapsed`：窗口够窄（<= 699px，与 chat.css 同断点）时自动收起，
+   *   只是"当下的临时状态"，不写回配置。
+   * 最终收起 = 两者任一成立。窗口变宽会自动展开回用户原来的偏好：
+   * 用户在宽窗口手动收起后，拉窄再拉宽不会莫名其妙被打开。
+   */
+  const [userCollapsed, setUserCollapsed] = useState(false);
+  const isNarrowWindow = useMediaQuery(SIDEBAR_AUTO_COLLAPSE_QUERY);
+  const autoCollapsed = isNarrowWindow;
+  const sidebarCollapsed = userCollapsed || autoCollapsed;
+
+  // 折叠偏好跟随配置：首次读取（不清空已有偏好），之后每次改动写回
+  const sidebarLoadedRef = useRef(false);
+  interface SidebarUiConfig {
+    ui: { sidebar_collapsed?: boolean; [key: string]: unknown };
+    [key: string]: unknown;
+  }
+  useEffect(() => {
+    let cancelled = false;
+    invoke<SidebarUiConfig>("get_config")
+      .then((config) => {
+        if (cancelled) return;
+        setUserCollapsed(config.ui.sidebar_collapsed ?? false);
+        sidebarLoadedRef.current = true;
+      })
+      .catch((e) => console.error("读取侧栏偏好失败:", e));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    // 首次读取完成前不写回，否则会抢先落盘一次默认值
+    if (!sidebarLoadedRef.current) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const config = await invoke<SidebarUiConfig>("get_config");
+        if (cancelled) return;
+        await invoke("update_config", {
+          newConfig: {
+            ...config,
+            ui: { ...config.ui, sidebar_collapsed: userCollapsed },
+          },
+        });
+      } catch (e) {
+        // 持久化失败不影响本次会话的折叠效果，只记日志
+        console.error("保存侧栏偏好失败:", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [userCollapsed]);
+
+  const toggleSidebar = () => {
+    setUserCollapsed((prev) => !prev);
+  };
+
+  /**
+   * 切会话：窄窗口下顺带把侧栏收回去
+   *
+   * 窄屏时侧栏是覆盖在对话区上的（见 chat.css `.sidebar-collapsed` 的覆盖层规则），
+   * 选完会话不收起来就等于把刚选中的对话挡住。
+   */
+  const handleSwitchSession = (sessionId: string) => {
+    void switchSession(sessionId);
+    if (isNarrowWindow) setUserCollapsed(true);
+  };
 
   // 待确认的删除会话（原生 confirm 样式不可控、文案也放不下影响范围提示）
   const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
@@ -308,11 +392,30 @@ export function ChatWindow() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [showTaskModal]);
 
+  /*
+   * 窄窗口下点对话区 = 关闭侧栏浮层
+   *
+   * 窄屏时侧栏覆盖在对话区之上，点别处却收不起来会显得很别扭。
+   * 只处理"侧栏当时是展开的"两种情况：已经收起时（userCollapsed 为真）
+   * 说明本来就没有浮层，不必为了点消息区的空白处去改用户的偏好。
+   */
+  const handleMainClick = () => {
+    if (!isNarrowWindow) return;
+    setUserCollapsed((prev) => {
+      if (prev) return prev;
+      return true;
+    });
+  };
+
   return (
-    <div className="chat-window">
+    <div className={`chat-window${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       {/* 侧边栏 */}
-      <div className="sidebar">
+      <div className="sidebar" id="session-sidebar">
         <div className="sidebar-header">
+          {/*
+            折叠入口只保留顶栏那一个（.chat-header 里的切换按钮）：两个按钮做同一件事
+            时用户会犹豫点哪个，且侧栏内那个还会随侧栏一起移出视野。
+          */}
           <h2>
             <IconSparkles /> Kagami no Konata
           </h2>
@@ -378,13 +481,13 @@ export function ChatWindow() {
                       tabIndex={0}
                       aria-current={s.id === currentSessionId ? "true" : undefined}
                       onClick={() => {
-                        if (editingId !== s.id) switchSession(s.id);
+                        if (editingId !== s.id) handleSwitchSession(s.id);
                       }}
                       onKeyDown={(e) => {
                         if (editingId === s.id) return;
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
-                          switchSession(s.id);
+                          handleSwitchSession(s.id);
                         }
                       }}
                       onDoubleClick={(e) => startRename(s, e)}
@@ -495,7 +598,7 @@ export function ChatWindow() {
       </div>
 
       {/* 主对话区 */}
-      <div className="chat-main">
+      <div className="chat-main" onClick={handleMainClick}>
         {errorMessage && (
           <div className="chat-error-banner" role="alert">
             <span className="chat-error-text">
@@ -543,6 +646,23 @@ export function ChatWindow() {
         {currentSessionId ? (
           <>
             <div className="chat-header">
+              {/*
+                侧栏折叠的唯一入口：常驻顶栏，侧栏收起后它是唯一的唤出方式，
+                所以不做 hover 显隐、也不随侧栏一起移出视野。
+                图标固定用"分栏框 + 展开箭头"（表达"点一下把侧栏拉出来"），
+                当前是否展开由点亮态与 title 表达；宽窗口下点它同样有效。
+              */}
+              <button
+                type="button"
+                className={`header-action-btn icon-only sidebar-toggle-btn${sidebarCollapsed ? "" : " active"}`}
+                onClick={toggleSidebar}
+                aria-expanded={!sidebarCollapsed}
+                aria-controls="session-sidebar"
+                title={sidebarCollapsed ? "展开会话侧栏" : "收起会话侧栏"}
+                aria-label={sidebarCollapsed ? "展开会话侧栏" : "收起会话侧栏"}
+              >
+                <IconSidebarExpand />
+              </button>
               <span className="chat-persona-badge">{currentPersonaName}</span>
               <TaskStatusBar />
               <div className="chat-header-actions">
@@ -574,10 +694,16 @@ export function ChatWindow() {
               </div>
             </div>
             <MessageList personaShortName={currentPersonaShortName} />
-            {/* 改动记录与计划面板都贴着输入框：它们是"这一轮任务"的状态，不是聊天内容 */}
-            <ChangesPanel />
-            <PlanPanel />
-            <NotesPanel />
+            {/*
+              改动记录 / 计划 / 工作记忆都贴着输入框：它们是"这一轮任务"的状态，不是聊天内容。
+              三者收进同一个栈，是为了能给它们一个**共同的高度预算**（.bottom-stack）：
+              面板各自都是 flex-shrink:0，矮窗口里展开任一个都会把消息区压成一条缝。
+            */}
+            <div className="bottom-stack">
+              <ChangesPanel />
+              <PlanPanel />
+              <NotesPanel />
+            </div>
             <InputBox />
           </>
         ) : (
@@ -600,109 +726,116 @@ export function ChatWindow() {
             tabIndex={-1}
             role="dialog"
             aria-modal="true"
-            aria-label="创建任务会话"
+            aria-labelledby="task-modal-title"
             onClick={(e) => e.stopPropagation()}
           >
-            <h3>
+            <h3 id="task-modal-title">
               <IconZap /> 创建任务会话
             </h3>
 
-            <label>
-              <span>执行工作区</span>
-              <select
-                value={selectedWorkspace}
-                onChange={(e) => setSelectedWorkspace(e.target.value)}
-              >
-                {workspaces.map((w) => (
-                  <option key={w.id} value={w.id}>
-                    {w.label}
-                    {w.is_default ? "（默认沙箱）" : ""}
-                    {w.writable ? "" : " [只读]"}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {/*
+              内容区独立滚动、动作行 sticky 在卡片底部：
+              主窗口最小高度 400px 时，四个分区展开后总高必然超过视口，
+              没有这层包裹就点不到「确定创建」。
+            */}
+            <div className="modal-body">
+              <label>
+                <span>执行工作区</span>
+                <select
+                  value={selectedWorkspace}
+                  onChange={(e) => setSelectedWorkspace(e.target.value)}
+                >
+                  {workspaces.map((w) => (
+                    <option key={w.id} value={w.id}>
+                      {w.label}
+                      {w.is_default ? "（默认沙箱）" : ""}
+                      {w.writable ? "" : " [只读]"}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
-            <div className="task-modal-section">
-              <div className="task-modal-section-title">或添加自定义项目路径</div>
-              <div className="task-modal-inline">
-                <input
-                  type="text"
-                  placeholder="绝对路径，例如 /home/me/project 或 D:\project"
-                  aria-label="自定义项目绝对路径"
-                  value={customPath}
-                  onChange={(e) => setCustomPath(e.target.value)}
-                />
+              <div className="task-modal-section">
+                <div className="task-modal-section-title">或添加自定义项目路径</div>
+                <div className="task-modal-inline">
+                  <input
+                    type="text"
+                    placeholder="绝对路径，例如 /home/me/project 或 D:\project"
+                    aria-label="自定义项目绝对路径"
+                    value={customPath}
+                    onChange={(e) => setCustomPath(e.target.value)}
+                  />
+                </div>
+                <div className="task-modal-inline">
+                  <input
+                    type="text"
+                    placeholder="标签（可选）"
+                    aria-label="工作区标签（可选）"
+                    value={customLabel}
+                    onChange={(e) => setCustomLabel(e.target.value)}
+                  />
+                  <label className="task-modal-check">
+                    <input
+                      type="checkbox"
+                      checked={customWritable}
+                      onChange={(e) => setCustomWritable(e.target.checked)}
+                    />
+                    允许写入
+                  </label>
+                </div>
+                <div className="task-modal-hint">
+                  填写路径后会先把它加入工作区列表，并用它作为本次任务的执行目录。
+                </div>
               </div>
-              <div className="task-modal-inline">
-                <input
-                  type="text"
-                  placeholder="标签（可选）"
-                  aria-label="工作区标签（可选）"
-                  value={customLabel}
-                  onChange={(e) => setCustomLabel(e.target.value)}
-                />
+
+              <div className="task-modal-section">
+                <div className="task-modal-section-title">运行模式</div>
+                <div className="task-modal-mode-group" role="group" aria-label="任务运行模式">
+                  <button
+                    type="button"
+                    className={`task-modal-mode-btn${newTaskMode === "plan" ? " active plan" : ""}`}
+                    aria-pressed={newTaskMode === "plan"}
+                    onClick={() => setNewTaskMode("plan")}
+                  >
+                    <IconClipboardList /> 规划 (Plan)
+                  </button>
+                  <button
+                    type="button"
+                    className={`task-modal-mode-btn${newTaskMode === "work" ? " active work" : ""}`}
+                    aria-pressed={newTaskMode === "work"}
+                    onClick={() => setNewTaskMode("work")}
+                  >
+                    <IconZap /> 执行 (Work)
+                  </button>
+                </div>
+                <div className="task-modal-hint">
+                  建议先规划：Plan 阶段只读调查并产出计划，批准后再执行；
+                  直接选 Work 则跳过规划，适合目标已经明确的任务。
+                </div>
+              </div>
+
+              <div className="task-modal-section">
+                <div className="task-modal-section-title">模型选择</div>
                 <label className="task-modal-check">
                   <input
                     type="checkbox"
-                    checked={customWritable}
-                    onChange={(e) => setCustomWritable(e.target.checked)}
+                    checked={autoModels}
+                    onChange={(e) => setAutoModels(e.target.checked)}
                   />
-                  允许写入
+                  自动选择（Plan 模式与子代理用子模型，Work 模式用主模型）
                 </label>
+                <div className="task-modal-hint">
+                  主模型与子模型在「设置 → 模型路由」里配置；不勾选则先跟随全局提供商，
+                  进入会话后仍可在底部工具条随时切换（只影响下一轮）。
+                </div>
               </div>
-              <div className="task-modal-hint">
-                填写路径后会先把它加入工作区列表，并用它作为本次任务的执行目录。
-              </div>
-            </div>
 
-            <div className="task-modal-section">
-              <div className="task-modal-section-title">运行模式</div>
-              <div className="task-modal-mode-group" role="group" aria-label="任务运行模式">
-                <button
-                  type="button"
-                  className={`task-modal-mode-btn${newTaskMode === "plan" ? " active plan" : ""}`}
-                  aria-pressed={newTaskMode === "plan"}
-                  onClick={() => setNewTaskMode("plan")}
-                >
-                  <IconClipboardList /> 规划 (Plan)
-                </button>
-                <button
-                  type="button"
-                  className={`task-modal-mode-btn${newTaskMode === "work" ? " active work" : ""}`}
-                  aria-pressed={newTaskMode === "work"}
-                  onClick={() => setNewTaskMode("work")}
-                >
-                  <IconZap /> 执行 (Work)
-                </button>
-              </div>
-              <div className="task-modal-hint">
-                建议先规划：Plan 阶段只读调查并产出计划，批准后再执行；
-                直接选 Work 则跳过规划，适合目标已经明确的任务。
-              </div>
+              {taskModalError && (
+                <div className="task-modal-error" role="alert">
+                  <IconAlert /> {taskModalError}
+                </div>
+              )}
             </div>
-
-            <div className="task-modal-section">
-              <div className="task-modal-section-title">模型选择</div>
-              <label className="task-modal-check">
-                <input
-                  type="checkbox"
-                  checked={autoModels}
-                  onChange={(e) => setAutoModels(e.target.checked)}
-                />
-                自动选择（Plan 模式与子代理用子模型，Work 模式用主模型）
-              </label>
-              <div className="task-modal-hint">
-                主模型与子模型在「设置 → 模型路由」里配置；不勾选则先跟随全局提供商，
-                进入会话后仍可在底部工具条随时切换（只影响下一轮）。
-              </div>
-            </div>
-
-            {taskModalError && (
-              <div className="task-modal-error" role="alert">
-                <IconAlert /> {taskModalError}
-              </div>
-            )}
 
             <div className="modal-actions">
               <button

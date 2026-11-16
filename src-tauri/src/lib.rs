@@ -3,9 +3,10 @@ mod appdata;
 mod commands;
 mod config;
 mod llm;
+mod mcp;
 mod memory;
 mod persona;
-mod mcp;
+mod platform;
 mod store;
 
 use std::collections::HashMap;
@@ -79,7 +80,18 @@ fn bootstrap_workspace(app_data_dir: &std::path::Path) -> std::io::Result<PathBu
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 必须在 Tauri/GTK 初始化之前设置：GDK_BACKEND、WebKitGTK 兼容变量等。
+    platform::apply_startup_env();
+
     tauri::Builder::default()
+        // 单实例必须最先注册：Linux 通过 DBus 实现，第二次启动会聚焦已有窗口。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
@@ -111,7 +123,9 @@ pub fn run() {
                     Ok(report) => {
                         println!(
                             "[appdata] 跳过旧数据迁移（{}）",
-                            report.skipped_reason.unwrap_or_else(|| "未知原因".to_string())
+                            report
+                                .skipped_reason
+                                .unwrap_or_else(|| "未知原因".to_string())
                         );
                     }
                     Err(e) => eprintln!("[appdata] 旧数据迁移失败（不影响启动）: {}", e),
@@ -196,81 +210,11 @@ pub fn run() {
             });
 
             // ─── 系统托盘 ─────────────────────────
-            let show_item = MenuItemBuilder::with_id("show", "打开主窗口").build(app)?;
-            let float_item = MenuItemBuilder::with_id("float", "打开悬浮窗").build(app)?;
-            let settings_item = MenuItemBuilder::with_id("settings", "设置").build(app)?;
-            let quit_item = MenuItemBuilder::with_id("quit", "退出").build(app)?;
-
-            let menu = MenuBuilder::new(app)
-                .item(&show_item)
-                .item(&float_item)
-                .separator()
-                .item(&settings_item)
-                .separator()
-                .item(&quit_item)
-                .build()?;
-
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Kagami no Konata")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(move |app, event| {
-                    let id = event.id().as_ref();
-                    match id {
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        "float" => {
-                            if let Some(window) = app.get_webview_window("float") {
-                                if window.is_visible().unwrap_or(false) {
-                                    let _ = window.hide();
-                                    let _ = app.emit("float-visibility-changed", false);
-                                } else {
-                                    let _ = window.set_shadow(false);
-                                    let position = app.state::<AppState>().config.lock().map(|c| c.ui.float_position.clone()).unwrap_or_else(|_| "bottom-right".to_string());
-                                    commands::window::apply_float_position(&window, &position);
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                    let _ = app.emit("float-visibility-changed", true);
-                                }
-                            }
-                        }
-                        "settings" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                                let _ = app.emit("navigate-to", "settings");
-                            }
-                        }
-                        "quit" => {
-                            app.exit(0);
-                        }
-                        _ => {}
-                    }
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click {
-                        button: tauri::tray::MouseButton::Left,
-                        button_state: tauri::tray::MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                    }
-                })
-                .build(app)?;
+            // 托盘初始化失败不能让整个应用起不来：Linux 缺少 AppIndicator
+            // 宿主/库时，聊天等核心功能仍应可用。
+            if let Err(e) = setup_tray(app) {
+                eprintln!("[tray] 初始化失败，应用继续运行：{e}");
+            }
 
             // ─── 窗口关闭拦截（根据配置决定行为） ───────
             let main_window = app.get_webview_window("main").unwrap();
@@ -283,7 +227,9 @@ pub fn run() {
                         .config
                         .lock()
                         .map(|c| c.ui.close_action.clone())
-                        .unwrap_or_else(|_| "hide".to_string());
+                        .unwrap_or_else(|_| {
+                            platform::capabilities().close_action_default.to_string()
+                        });
 
                     match close_action.as_str() {
                         "exit" => {
@@ -296,8 +242,17 @@ pub fn run() {
                             let _ = window_clone.hide();
                             if let Some(float_win) = app_handle.get_webview_window("float") {
                                 let _ = float_win.set_shadow(false);
-                                let position = app_handle.state::<AppState>().config.lock().map(|c| c.ui.float_position.clone()).unwrap_or_else(|_| "bottom-right".to_string());
-                                commands::window::apply_float_position(&float_win, &position);
+                                let position = app_handle
+                                    .state::<AppState>()
+                                    .config
+                                    .lock()
+                                    .map(|c| c.ui.float_position.clone())
+                                    .unwrap_or_else(|_| "bottom-right".to_string());
+                                commands::window::position_float_window(
+                                    &app_handle,
+                                    &float_win,
+                                    &position,
+                                );
                                 let _ = float_win.show();
                                 let _ = float_win.set_focus();
                             }
@@ -311,6 +266,16 @@ pub fn run() {
                     }
                 }
             });
+
+            // CI/自动化冒烟测试：启动完成后短暂运行再退出。
+            // 只由环境变量触发，正常启动路径完全不受影响。
+            if std::env::var_os("KONATA_SMOKE_TEST").is_some() {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    handle.exit(0);
+                });
+            }
 
             Ok(())
         })
@@ -331,6 +296,7 @@ pub fn run() {
             commands::chat::get_sessions,
             commands::chat::get_messages,
             commands::chat::delete_session,
+            commands::platform::get_platform_capabilities,
             commands::settings::get_config,
             commands::settings::update_config,
             commands::settings::test_llm_connection,
@@ -388,4 +354,103 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// 创建系统托盘。
+///
+/// Linux 使用 AppIndicator：左键通常直接弹菜单，`TrayIconEvent` 不会触发；
+/// 因此菜单项必须自己提供“显示/隐藏主窗口”的完整入口。
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let toggle_item = MenuItemBuilder::with_id("toggle-main", "显示/隐藏主窗口").build(app)?;
+    let float_item = MenuItemBuilder::with_id("float", "打开悬浮窗").build(app)?;
+    let settings_item = MenuItemBuilder::with_id("settings", "设置").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "退出").build(app)?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&toggle_item)
+        .item(&float_item)
+        .separator()
+        .item(&settings_item)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    let Some(icon) = app.default_window_icon().cloned() else {
+        eprintln!("[tray] 默认窗口图标不可用，跳过托盘初始化");
+        return Ok(());
+    };
+
+    let _tray = TrayIconBuilder::new()
+        .icon(icon)
+        .tooltip("Kagami no Konata")
+        .menu(&menu)
+        .show_menu_on_left_click(platform::tray_menu_on_left_click())
+        .on_menu_event(move |app, event| match event.id().as_ref() {
+            "toggle-main" => toggle_main_window_visible(app),
+            "float" => toggle_float_window_from_tray(app),
+            "settings" => {
+                show_main_window(app);
+                let _ = app.emit("navigate-to", "settings");
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_main_window_visible(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn toggle_main_window_visible(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+    } else {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn toggle_float_window_from_tray(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("float") else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        let _ = app.emit("float-visibility-changed", false);
+    } else {
+        let _ = window.set_shadow(false);
+        let position = app
+            .state::<AppState>()
+            .config
+            .lock()
+            .map(|config| config.ui.float_position.clone())
+            .unwrap_or_else(|_| "bottom-right".to_string());
+        commands::window::position_float_window(app, &window, &position);
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = app.emit("float-visibility-changed", true);
+    }
 }

@@ -45,6 +45,10 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn content_as_str(&self) -> &str {
+        self.content.as_str()
+    }
+
     pub fn new(role: Role, content: impl Into<String>, session_id: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),

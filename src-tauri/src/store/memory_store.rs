@@ -76,8 +76,10 @@ fn blob_to_vector(blob: &[u8]) -> Option<Vec<f32>> {
         return None;
     }
     Some(
-        blob.chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        blob.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
     )
 }
@@ -95,8 +97,7 @@ pub fn decode_embedding_b64(text: &str) -> Option<Vec<f32>> {
     blob_to_vector(&decode_b64(text)?)
 }
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn encode_b64(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -175,7 +176,10 @@ pub const MAX_IMPORT_ENTRIES: usize = 50_000;
 pub const RECALL_CANDIDATE_LIMIT: usize = 5_000;
 
 /// 读取记忆行中的嵌入向量：优先 BLOB，降级解析旧格式 JSON
-fn row_embedding(row_embedding_json: Option<String>, row_blob: Option<Vec<u8>>) -> Option<Vec<f32>> {
+fn row_embedding(
+    row_embedding_json: Option<String>,
+    row_blob: Option<Vec<u8>>,
+) -> Option<Vec<f32>> {
     if let Some(blob) = row_blob {
         return blob_to_vector(&blob);
     }
@@ -448,27 +452,27 @@ impl MemoryStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-/// 清洗外部导入的记忆条目（返回 None 表示该条应被跳过）
-///
-/// 备份 JSON 来自外部，`content` / `importance` / `embedding` 均不可信：
-/// - `content` 超长会污染之后每一轮对话的 system prompt
-/// - `importance` 越界（例如 1e30）会让该条记忆在检索中永久霸榜
-/// - `embedding` 维度异常会撑爆内存、维度不符则让检索结果变成噪声
-pub fn sanitize_imported(mut entry: MemoryEntry) -> Option<MemoryEntry> {
-    entry.id = entry.id.trim().chars().take(128).collect();
-    if entry.id.is_empty() {
-        return None;
-    }
+    /// 清洗外部导入的记忆条目（返回 None 表示该条应被跳过）
+    ///
+    /// 备份 JSON 来自外部，`content` / `importance` / `embedding` 均不可信：
+    /// - `content` 超长会污染之后每一轮对话的 system prompt
+    /// - `importance` 越界（例如 1e30）会让该条记忆在检索中永久霸榜
+    /// - `embedding` 维度异常会撑爆内存、维度不符则让检索结果变成噪声
+    pub fn sanitize_imported(mut entry: MemoryEntry) -> Option<MemoryEntry> {
+        entry.id = entry.id.trim().chars().take(128).collect();
+        if entry.id.is_empty() {
+            return None;
+        }
 
-    entry.content = strip_control_chars(entry.content.trim());
-    entry.content = entry
-        .content
-        .chars()
-        .take(MAX_MEMORY_CONTENT_CHARS)
-        .collect();
-    if entry.content.is_empty() {
-        return None;
-    }
+        entry.content = strip_control_chars(entry.content.trim());
+        entry.content = entry
+            .content
+            .chars()
+            .take(MAX_MEMORY_CONTENT_CHARS)
+            .collect();
+        if entry.content.is_empty() {
+            return None;
+        }
 
         if !entry.importance.is_finite() {
             entry.importance = 0.5;
@@ -585,7 +589,8 @@ mod tests {
     /// 零宽混淆字符）必须被清掉，正常换行/制表保留
     #[test]
     fn sanitize_imported_strips_control_chars() {
-        let clean = MemoryStore::sanitize_imported(entry("多行\n内容\t缩进\x07\x1b[31m红\x00")).unwrap();
+        let clean =
+            MemoryStore::sanitize_imported(entry("多行\n内容\t缩进\x07\x1b[31m红\x00")).unwrap();
         assert!(!clean.content.contains('\x07'), "{:?}", clean.content);
         assert!(!clean.content.contains('\x1b'), "{:?}", clean.content);
         assert!(!clean.content.contains('\x00'), "{:?}", clean.content);
@@ -604,7 +609,10 @@ mod tests {
 
         let mut huge = entry("x");
         huge.embedding = Some(vec![0.0; MAX_EMBEDDING_DIM + 1]);
-        assert!(MemoryStore::sanitize_imported(huge).unwrap().embedding.is_none());
+        assert!(MemoryStore::sanitize_imported(huge)
+            .unwrap()
+            .embedding
+            .is_none());
     }
 
     /// 备份里的向量用 Base64 紧凑编码，必须无损往返
@@ -621,16 +629,16 @@ mod tests {
         assert!(decode_embedding_b64("").is_none(), "空向量不是合法嵌入");
         // 6 个 Base64 字符 = 4 字节 = 1 个 f32；不足 4 字节的载荷必须拒绝
         assert_eq!(decode_embedding_b64("AAAAAA"), Some(vec![0.0f32]));
-        assert!(decode_embedding_b64("AAAA").is_none(), "不足一个 f32 的载荷应拒绝");
+        assert!(
+            decode_embedding_b64("AAAA").is_none(),
+            "不足一个 f32 的载荷应拒绝"
+        );
     }
 
     /// 召回必须有候选集上限，避免超大备份（5 万条 × 高维向量）把内存打爆
     #[test]
     fn recall_caps_candidate_set() {
-        let dir = std::env::temp_dir().join(format!(
-            "konata-memory-cap-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("konata-memory-cap-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = crate::store::db::init_db(&dir).unwrap();
         let store = MemoryStore::new(conn);
@@ -661,10 +669,7 @@ mod tests {
     /// 会话删除后来源标记要断开：记忆保留、读取路径不能因 NULL 而失败
     #[test]
     fn clear_source_session_keeps_memory_readable() {
-        let dir = std::env::temp_dir().join(format!(
-            "konata-memory-src-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("konata-memory-src-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = crate::store::db::init_db(&dir).unwrap();
         let store = MemoryStore::new(conn);
@@ -687,10 +692,8 @@ mod tests {
     /// 没有向量的记忆必须仍可被检索到（否则导入/嵌入失败的数据永远不可见）
     #[test]
     fn memories_without_embeddings_still_participate_in_recall() {
-        let dir = std::env::temp_dir().join(format!(
-            "konata-memory-recall-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("konata-memory-recall-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let conn = crate::store::db::init_db(&dir).unwrap();
         let store = MemoryStore::new(conn);

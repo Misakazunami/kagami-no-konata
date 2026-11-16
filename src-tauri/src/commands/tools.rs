@@ -85,10 +85,7 @@ pub async fn resolve_tool_approval(
     ensure_main_window(&window)?;
     let parsed = ToolDecision::parse(&decision);
     let entry = {
-        let mut map = state
-            .pending_approvals
-            .lock()
-            .map_err(|e| e.to_string())?;
+        let mut map = state.pending_approvals.lock().map_err(|e| e.to_string())?;
         map.remove(&approval_id)
     };
     match entry {
@@ -196,8 +193,7 @@ pub async fn update_plan_items(
     let items = crate::agent::plan::sanitize_items(&items)?;
     let plan = crate::agent::plan::SessionPlan::new(
         items,
-        note.map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty()),
+        note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
     );
     {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
@@ -324,9 +320,7 @@ pub async fn get_notes(
 ) -> Result<Vec<crate::agent::notes::SessionNote>, String> {
     ensure_main_window(&window)?;
     let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-    store
-        .list_notes(&session_id)
-        .map_err(|e| e.to_string())
+    store.list_notes(&session_id).map_err(|e| e.to_string())
 }
 
 /// 清空某个会话的工作记忆（模型也能通过 `forget_note` 清空）
@@ -434,10 +428,8 @@ pub async fn get_snapshot(
 ) -> Result<Option<crate::agent::harness::SnapshotInfo>, String> {
     ensure_main_window(&window)?;
     // 数据目录不可变：直接借用，无需（也不该）再去拿任何锁
-    let store = crate::agent::harness::SnapshotStore::new(
-        &state.app_data_dir,
-        state.chat_store.clone(),
-    );
+    let store =
+        crate::agent::harness::SnapshotStore::new(&state.app_data_dir, state.chat_store.clone());
     // 备份文件的存在性检查是磁盘 IO：放到阻塞线程，不占住 async 执行器
     let info = tokio::task::spawn_blocking(move || store.info(&session_id, &stream_id))
         .await
@@ -490,8 +482,7 @@ pub struct WorkspaceView {
 
 fn workspace_views(state: &AppState) -> Result<Vec<WorkspaceView>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    let set =
-        crate::agent::harness::WorkspaceSet::from_config(&config.tools, &state.app_data_dir);
+    let set = crate::agent::harness::WorkspaceSet::from_config(&config.tools, &state.app_data_dir);
     Ok(set
         .list()
         .into_iter()
@@ -516,7 +507,11 @@ pub async fn list_workspaces(
 }
 
 /// 校验并规范化一个待添加的绝对路径
-fn validate_new_root(path: &str, existing: &[WorkspaceRoot], app_data_dir: &std::path::Path) -> Result<String, String> {
+fn validate_new_root(
+    path: &str,
+    existing: &[WorkspaceRoot],
+    app_data_dir: &std::path::Path,
+) -> Result<String, String> {
     let raw = path.trim();
     if raw.is_empty() {
         return Err("路径不能为空".to_string());
@@ -528,8 +523,8 @@ fn validate_new_root(path: &str, existing: &[WorkspaceRoot], app_data_dir: &std:
     if !candidate.is_dir() {
         return Err(format!("目录不存在或不是目录：{}", candidate.display()));
     }
-    let canonical = std::fs::canonicalize(&candidate)
-        .map_err(|e| format!("无法解析路径：{}", e))?;
+    let canonical =
+        std::fs::canonicalize(&candidate).map_err(|e| format!("无法解析路径：{}", e))?;
 
     if canonical.parent().is_none() {
         return Err("不允许把磁盘根目录设为工作区".to_string());
@@ -547,8 +542,7 @@ fn validate_new_root(path: &str, existing: &[WorkspaceRoot], app_data_dir: &std:
         &["windows", "system32", "syswow64"]
     } else {
         &[
-            "etc", "usr", "bin", "sbin", "boot", "dev", "proc", "sys", "root", "system",
-            "library",
+            "etc", "usr", "bin", "sbin", "boot", "dev", "proc", "sys", "root", "system", "library",
         ]
     };
     if blocked.contains(&first_component.as_str()) {
@@ -558,7 +552,8 @@ fn validate_new_root(path: &str, existing: &[WorkspaceRoot], app_data_dir: &std:
         return Err("不允许把应用数据目录本身设为工作区（其中包含配置与数据库）".to_string());
     }
 
-    let app_data_canonical = std::fs::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
+    let app_data_canonical =
+        std::fs::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
     // 应用数据目录及其**所有子目录**都拒绝：snapshots/（回滚备份）与 personas/
     // （人格 system prompt）都在里面，放进来等于让文件工具能改写回滚备份与人格
     if canonical.starts_with(&app_data_canonical) {
@@ -599,7 +594,13 @@ fn derive_root_id(path: &std::path::Path, existing: &[WorkspaceRoot]) -> String 
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() || !slug.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
+    if slug.is_empty()
+        || !slug
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
+    {
         slug = "workspace".to_string();
     }
     slug.truncate(24);
@@ -738,7 +739,10 @@ pub async fn remove_workspace(
     persist_config(&state, &config)
 }
 
-fn persist_config(state: &AppState, config: &crate::config::types::AppConfig) -> Result<(), String> {
+fn persist_config(
+    state: &AppState,
+    config: &crate::config::types::AppConfig,
+) -> Result<(), String> {
     config.validate()?;
     // 落盘在**锁外**完成：磁盘 I/O 可能长达毫秒级，持锁 I/O 会放大并发窗口；
     // 且这里绝不能先拿 data_dir（已去锁）再拿 config，锁序统一为"不进锁做 I/O"。
@@ -835,7 +839,8 @@ mod tests {
         std::fs::create_dir_all(&appdata).unwrap();
 
         let existing = vec![root("base", "外层", &base.display().to_string())];
-        let err = validate_new_root(&nested.display().to_string(), &existing, &appdata).unwrap_err();
+        let err =
+            validate_new_root(&nested.display().to_string(), &existing, &appdata).unwrap_err();
         assert!(err.contains("嵌套"), "{err}");
 
         // 同一个目录重复添加

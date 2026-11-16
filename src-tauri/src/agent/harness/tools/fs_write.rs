@@ -44,7 +44,11 @@ impl Tool for WriteFile {
         let overwrite = args::optional_bool(&args, "overwrite", false);
         let create_parents = args::optional_bool(&args, "create_parents", true);
 
-        let resolved = cx.services.workspaces.resolve_writable(&raw_path).map_err(anyhow::Error::msg)?;
+        let resolved = cx
+            .services
+            .workspaces
+            .resolve_writable(&raw_path)
+            .map_err(anyhow::Error::msg)?;
         let target = resolved.abs_path.clone();
 
         if target.is_dir() {
@@ -61,7 +65,10 @@ impl Tool for WriteFile {
         if let Some(parent) = target.parent() {
             if !parent.exists() {
                 if !create_parents {
-                    anyhow::bail!("父目录不存在：{}（可设置 create_parents=true 自动创建）", parent.display());
+                    anyhow::bail!(
+                        "父目录不存在：{}（可设置 create_parents=true 自动创建）",
+                        parent.display()
+                    );
                 }
                 std::fs::create_dir_all(parent)?;
             }
@@ -96,9 +103,7 @@ impl Tool for WriteFile {
         } else {
             // 新建文件没有"原内容"可备份，回滚也只会恢复被覆盖的文件：
             // 必须如实说明，否则用户会以为"回滚"会把这个新文件也删掉
-            text.push_str(
-                "\n（本次为新建文件，没有可回滚的原内容；如需撤销请手动删除该文件）",
-            );
+            text.push_str("\n（本次为新建文件，没有可回滚的原内容；如需撤销请手动删除该文件）");
         }
         Ok(ToolOutput::text(text.clone()).with_preview(text))
     }
@@ -143,7 +148,11 @@ impl Tool for EditFile {
             anyhow::bail!("old_string 与 new_string 相同，无需修改");
         }
 
-        let resolved = cx.services.workspaces.resolve_writable(&raw_path).map_err(anyhow::Error::msg)?;
+        let resolved = cx
+            .services
+            .workspaces
+            .resolve_writable(&raw_path)
+            .map_err(anyhow::Error::msg)?;
         let target = resolved.abs_path.clone();
         if !target.is_file() {
             anyhow::bail!("文件不存在：{}", target.display());
@@ -218,7 +227,10 @@ impl Tool for EditFile {
             400,
         )
         .0;
-        Ok(ToolOutput::text(summary.clone()).with_preview(format!("{}\n{}", summary, diff_preview)))
+        Ok(
+            ToolOutput::text(summary.clone())
+                .with_preview(format!("{}\n{}", summary, diff_preview)),
+        )
     }
 }
 
@@ -283,7 +295,8 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str, writable: bool) -> Self {
-            let dir = std::env::temp_dir().join(format!("konata-write-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("konata-write-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("note.md"), "第一行\n第二行\n第二行\n").unwrap();
 
@@ -302,7 +315,9 @@ mod tests {
         /// 挂上一个真实的快照服务（覆盖/删除类改动因此可回滚）
         fn with_snapshots(mut self, tag: &str) -> Self {
             let conn = crate::store::db::init_db(&self.dir).unwrap();
-            let store = Arc::new(std::sync::Mutex::new(crate::store::chat_store::ChatStore::new(conn)));
+            let store = Arc::new(std::sync::Mutex::new(
+                crate::store::chat_store::ChatStore::new(conn),
+            ));
             let session = store
                 .lock()
                 .unwrap()
@@ -350,11 +365,9 @@ mod tests {
     fn writes_new_file_and_creates_parents() {
         let fx = Fixture::new("new", true);
         let cx = fx.ctx();
-        let out = block_on(WriteFile.call(
-            json!({"path": "sub/dir/a.txt", "content": "你好"}),
-            &cx,
-        ))
-        .unwrap();
+        let out =
+            block_on(WriteFile.call(json!({"path": "sub/dir/a.txt", "content": "你好"}), &cx))
+                .unwrap();
         assert!(out.content.contains("已创建"));
         assert_eq!(
             std::fs::read_to_string(fx.dir.join("sub/dir/a.txt")).unwrap(),
@@ -374,11 +387,8 @@ mod tests {
     fn new_file_note_explains_rollback_scope() {
         let fx = Fixture::new("new-note", true).with_snapshots("快照");
         let cx = fx.ctx();
-        let out = block_on(WriteFile.call(
-            json!({"path": "brand-new.txt", "content": "x"}),
-            &cx,
-        ))
-        .unwrap();
+        let out = block_on(WriteFile.call(json!({"path": "brand-new.txt", "content": "x"}), &cx))
+            .unwrap();
         assert!(out.content.contains("已创建"), "{}", out.content);
         assert!(out.content.contains("新建文件"), "{}", out.content);
         assert!(
@@ -401,7 +411,11 @@ mod tests {
         ))
         .unwrap();
         assert!(out.content.contains("已覆盖"), "{}", out.content);
-        assert!(out.content.contains("回滚"), "必须告知用户可回滚：{}", out.content);
+        assert!(
+            out.content.contains("回滚"),
+            "必须告知用户可回滚：{}",
+            out.content
+        );
 
         let info = snapshots.info(&session_id, "st1");
         assert_eq!(info.files, 1, "覆盖前必须备份");
@@ -498,11 +512,8 @@ mod tests {
     fn refuses_overwrite_without_flag() {
         let fx = Fixture::new("overwrite", true);
         let cx = fx.ctx();
-        let err = block_on(WriteFile.call(
-            json!({"path": "note.md", "content": "覆盖"}),
-            &cx,
-        ))
-        .unwrap_err();
+        let err = block_on(WriteFile.call(json!({"path": "note.md", "content": "覆盖"}), &cx))
+            .unwrap_err();
         assert!(err.to_string().contains("overwrite=true"), "{err}");
 
         block_on(WriteFile.call(
@@ -520,8 +531,8 @@ mod tests {
     fn readonly_workspace_cannot_be_written() {
         let fx = Fixture::new("readonly", false);
         let cx = fx.ctx();
-        let err = block_on(WriteFile.call(json!({"path": "x.txt", "content": "x"}), &cx))
-            .unwrap_err();
+        let err =
+            block_on(WriteFile.call(json!({"path": "x.txt", "content": "x"}), &cx)).unwrap_err();
         assert!(err.to_string().contains("只读"), "{err}");
     }
 

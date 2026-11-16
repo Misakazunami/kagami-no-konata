@@ -126,7 +126,7 @@
   position: relative;
   flex: 1;
   min-width: 0;
-  /* 给右侧轨道留出空间，避免轨道压住正文 */
+  /* 给右侧轨道留出空间，避免轨道压住正文（紧凑档由下方断点收回） */
   padding-right: 40px;
 }
 
@@ -301,4 +301,28 @@
   margin: 8px 0 0;
   font-size: 0.857rem;
   color: var(--text-muted);
+}
+
+/* ── 紧凑档（< 700px）：时间轴让位给正文 ──
+ * 轨道恒定占用 40px 右侧内边距，600px 窗口下这是正文宽度的 12%，
+ * 而它只在消息 >= 2 条时才有意义（MessageTimeline 自身也会返回 null）。
+ * 阈值与 chat.css 的分档保持一致。 */
+@media (max-width: 699px) {
+  .message-timeline {
+    display: none;
+  }
+
+  .message-list-wrap .message-list {
+    /* 与 .message-list 的 gutter 对齐：右padding 回到统一留白 */
+    padding-right: var(--gutter-x);
+  }
+
+  /* 未读数很长时按钮不能顶到两侧边缘 */
+  .scroll-bottom-btn {
+    bottom: 10px;
+    max-width: calc(100% - 24px);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }

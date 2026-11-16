@@ -17,7 +17,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (11, include_str!("migrations/011_session_model_pref.sql")),
     (12, include_str!("migrations/012_message_model.sql")),
     (13, include_str!("migrations/013_session_grants.sql")),
-    (14, include_str!("migrations/014_tool_invocation_tokens.sql")),
+    (
+        14,
+        include_str!("migrations/014_tool_invocation_tokens.sql"),
+    ),
     (15, include_str!("migrations/015_session_auto_approve.sql")),
 ];
 
@@ -245,8 +248,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(sql)
             .map_err(|e| anyhow::anyhow!("迁移 {} 执行失败（已整体回滚）：{}", version, e))?;
-        tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [version])
-            .map_err(|e| anyhow::anyhow!("迁移 {} 的版本号写入失败：{}", version, e))?;
+        tx.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            [version],
+        )
+        .map_err(|e| anyhow::anyhow!("迁移 {} 的版本号写入失败：{}", version, e))?;
         tx.commit()?;
     }
 
@@ -259,11 +265,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "konata-db-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("konata-db-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -303,9 +306,11 @@ mod tests {
     }
 
     fn schema_version(conn: &Connection) -> i32 {
-        conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| {
-            r.get(0)
-        })
+        conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )
         .unwrap()
     }
 
@@ -377,8 +382,11 @@ mod tests {
             )
             .unwrap();
             for version in 1..=16 {
-                conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [version])
-                    .unwrap();
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    [version],
+                )
+                .unwrap();
             }
             // 版本号远超本仓库的 6：修复前这里会让所有迁移被跳过
             assert_eq!(schema_version(&conn), 16);
@@ -407,7 +415,8 @@ mod tests {
         assert!(column_exists(&conn, "sessions", "scene_id").unwrap());
         // 新增表也必须建好（本仓库的 006）
         assert!(conn
-            .query_row("SELECT COUNT(*) FROM tool_invocations", [], |r| r.get::<_, i64>(0))
+            .query_row("SELECT COUNT(*) FROM tool_invocations", [], |r| r
+                .get::<_, i64>(0))
             .is_ok());
 
         // 真正触发过事故的那条查询现在必须能跑
@@ -513,11 +522,9 @@ mod tests {
         let target = dir.join("data.db");
 
         {
-            let src = Connection::open_with_flags(
-                &source,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .expect("打开真实库（只读）");
+            let src =
+                Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .expect("打开真实库（只读）");
             src.execute("VACUUM INTO ?1", [target.display().to_string()])
                 .expect("复制真实库");
         }
@@ -530,7 +537,10 @@ mod tests {
                 .filter(|(table, column, _)| !column_exists(&conn, table, column).unwrap())
                 .map(|(_, column, _)| *column)
                 .collect();
-            println!("真实库副本：schema_version={}，缺失列={:?}", ledger, missing);
+            println!(
+                "真实库副本：schema_version={}，缺失列={:?}",
+                ledger, missing
+            );
             missing
         };
         assert!(

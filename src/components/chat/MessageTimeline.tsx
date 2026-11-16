@@ -74,17 +74,35 @@ export function MessageTimeline({ messages, containerRef }: Props) {
   }, [containerRef, messages]);
 
   // 消息变化 / 面板缩放后重新测量
+  //
+  // 观察器与 window.resize 都走同一个合帧闸门：measure 会逐条读 offsetTop、
+  // 并读一次 container.scrollHeight（跨读写交替 = 强制同步布局）。缩放窗口或
+  // 切换最大化时 ResizeObserver 一帧可触发多次，长会话（数百条消息）下
+  // 每次都全量测量会明显掉帧；合帧后每帧最多测一次。
+  const measureRafRef = useRef(0);
   useEffect(() => {
     measure();
     const container = containerRef.current;
     if (!container) return;
-    const observer = new ResizeObserver(() => measure());
+
+    const scheduleMeasure = () => {
+      if (measureRafRef.current) return;
+      measureRafRef.current = requestAnimationFrame(() => {
+        measureRafRef.current = 0;
+        measure();
+      });
+    };
+
+    const observer = new ResizeObserver(scheduleMeasure);
     observer.observe(container);
-    const onResize = () => measure();
-    window.addEventListener("resize", onResize);
+    window.addEventListener("resize", scheduleMeasure);
     return () => {
       observer.disconnect();
-      window.removeEventListener("resize", onResize);
+      window.removeEventListener("resize", scheduleMeasure);
+      if (measureRafRef.current) {
+        cancelAnimationFrame(measureRafRef.current);
+        measureRafRef.current = 0;
+      }
     };
   }, [measure, containerRef]);
 

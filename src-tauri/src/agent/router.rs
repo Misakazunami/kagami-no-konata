@@ -79,7 +79,11 @@ impl IntentRouter {
                     };
                 } else if trimmed.starts_with(cmd) {
                     let rest = &trimmed[cmd.len()..];
-                    if rest.starts_with(' ') || rest.starts_with('\t') || rest.starts_with(':') || rest.starts_with('：') {
+                    if rest.starts_with(' ')
+                        || rest.starts_with('\t')
+                        || rest.starts_with(':')
+                        || rest.starts_with('：')
+                    {
                         let clean = rest.trim().to_string();
                         return RouteDecision {
                             target_agent: m.id.clone(),
@@ -129,7 +133,8 @@ impl IntentRouter {
             if matched_count > 0 {
                 // 改进打分逻辑：结合绝对命中词数（饱和阈值3个）与相对占比，防止关键词越多的 Agent 得分反而被惩罚
                 let count_factor = (matched_count as f32).min(3.0) / 3.0; // [0.33, 1.0]
-                let ratio_factor = (matched_count as f32) / (m.trigger_keywords.len().max(1) as f32);
+                let ratio_factor =
+                    (matched_count as f32) / (m.trigger_keywords.len().max(1) as f32);
                 let score = count_factor * 0.7 + ratio_factor * 0.3;
 
                 if score > best_score {

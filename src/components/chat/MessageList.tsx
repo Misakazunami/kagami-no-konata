@@ -125,6 +125,19 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
     bottomRef.current?.scrollIntoView({ block: "end", behavior });
   };
 
+  /**
+   * 立即贴底（不做平滑动画）
+   *
+   * 用于"内容自己长高"的两条路径：流式追加与工具卡片变高。
+   * 这两处若用 `scrollIntoView({behavior:"smooth"})`，动画还没跑完内容又变高了，
+   * 观感上是持续的回弹抖动；直接赋值 scrollTop 是同步的，稳定贴合。
+   * 用户主动触发的滚动（按钮 / 切会话）仍走 scrollToBottom 的平滑动画。
+   */
+  const pinToBottom = () => {
+    const el = containerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  };
+
   // 切换会话 / 首次挂载：无条件滚到最新消息
   //
   // 不能复用 `isNearBottom()`：切换瞬间 scrollTop 还是旧值（新会话刚挂载时是 0），
@@ -160,11 +173,12 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
   // 是典型的 layout thrashing；而绝大多数帧并没有新内容。
   // 现在改为 100ms 一次的定时器：流式文本本身也是按块到达的，观感足够。
   // 跟随条件用 stickRef（用户滚动驱动），内容长高不会打断它。
+  // 贴底用 pinToBottom（立即）：平滑动画会被下一块到达的内容打断。
   useEffect(() => {
     if (!isStreaming) return;
     const timer = setInterval(() => {
       if (stickRef.current) {
-        bottomRef.current?.scrollIntoView({ block: "end" });
+        pinToBottom();
       }
     }, 100);
     return () => clearInterval(timer);
@@ -178,7 +192,7 @@ export function MessageList({ personaShortName }: { personaShortName?: string })
     if (!content) return;
     const observer = new ResizeObserver(() => {
       if (stickRef.current) {
-        bottomRef.current?.scrollIntoView({ block: "end" });
+        pinToBottom();
       }
     });
     observer.observe(content);

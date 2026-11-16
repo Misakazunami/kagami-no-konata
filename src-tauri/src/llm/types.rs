@@ -1,14 +1,14 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-/// 反序列化 `content` 时把 `null` 视为空串
+/// 反序列化 `content` 时把 `null` 视为空内容
 ///
 /// 不少 OpenAI 兼容端点在消息只带 `tool_calls` 时会返回 `"content": null`，
-/// 若直接按 `String` 解析会让整个响应反序列化失败。
-fn null_as_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+/// 若直接按 `MessageContent` 解析会让整个响应反序列化失败。
+fn deserialize_content<'de, D>(deserializer: D) -> Result<MessageContent, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
-    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+    Ok(Option::<MessageContent>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn default_function_kind() -> String {
@@ -34,7 +34,11 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             kind: default_function_kind(),
@@ -46,13 +50,48 @@ impl ToolCall {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    pub fn content_as_str(&self) -> &str {
+        match self {
+            MessageContent::Text(text) => text.as_str(),
+            MessageContent::Parts(_) => "[多模态内容]",
+        }
+    }
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
+}
+
 /// LLM 消息格式（OpenAI 兼容）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: String,
     /// `tool` 角色消息按规范可以没有 content，因此这里允许缺省与 null
-    #[serde(default, deserialize_with = "null_as_empty")]
-    pub content: String,
+    #[serde(default, deserialize_with = "deserialize_content")]
+    pub content: MessageContent,
     /// assistant 消息请求的工具调用
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -65,7 +104,7 @@ impl LlmMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".to_string(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             ..Default::default()
         }
     }
@@ -73,7 +112,15 @@ impl LlmMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".to_string(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn user_parts(parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: MessageContent::Parts(parts),
             ..Default::default()
         }
     }
@@ -81,7 +128,7 @@ impl LlmMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             ..Default::default()
         }
     }
@@ -90,9 +137,17 @@ impl LlmMessage {
     pub fn assistant_tool_calls(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             tool_calls: Some(calls),
             tool_call_id: None,
+        }
+    }
+
+    /// 将 content 格式化或提取为纯文本（用于日志、摘要、去重匹配等）
+    pub fn content_as_str(&self) -> &str {
+        match &self.content {
+            MessageContent::Text(text) => text.as_str(),
+            MessageContent::Parts(_) => "[多模态内容]",
         }
     }
 
@@ -100,7 +155,7 @@ impl LlmMessage {
     pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".to_string(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
         }
@@ -332,7 +387,7 @@ mod tests {
                  {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}"#,
         )
         .unwrap();
-        assert_eq!(msg.content, "");
+        assert_eq!(msg.content.content_as_str(), "");
         let calls = msg.tool_calls.unwrap();
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[0].kind, "function");
@@ -359,8 +414,11 @@ mod tests {
 
     #[test]
     fn tool_schema_uses_function_type() {
-        let schema =
-            ToolSchema::function("read_file", "读取文件", serde_json::json!({"type":"object"}));
+        let schema = ToolSchema::function(
+            "read_file",
+            "读取文件",
+            serde_json::json!({"type":"object"}),
+        );
         let json = serde_json::to_value(&schema).unwrap();
         assert_eq!(json["type"], "function");
         assert_eq!(json["function"]["name"], "read_file");

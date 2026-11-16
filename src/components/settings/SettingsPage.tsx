@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../../stores/chatStore";
+import { useUiStore } from "../../stores/uiStore";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { useFocusTrap } from "../../hooks/useFocusTrap";
 import {
@@ -44,6 +45,15 @@ import {
   parseModelRefValue,
   type ModelSettings,
 } from "../../types/models";
+import type { PlatformCapabilities } from "../../types/platform";
+
+/** 会话类型 → 设置页诊断文案 */
+const SESSION_TYPE_LABEL: Record<PlatformCapabilities["sessionType"], string> = {
+  x11: "X11 / Xorg",
+  wayland: "Wayland（桌面能力降级）",
+  native: "原生窗口系统",
+  unknown: "未检测到图形会话",
+};
 
 /** 子模型数量上限（与后端 `config::types::MAX_SUB_MODELS` 保持一致） */
 const MAX_SUB_MODELS = 8;
@@ -61,6 +71,10 @@ interface ToolsConfig {
   approval_timeout_secs: number;
   /** 单次工具调用超时（秒）：run_command 会据此在超时前收手并保留部分输出 */
   call_timeout_secs: number;
+  /** 屏幕截图长边上限（像素）：0 = 原始分辨率，不缩放 */
+  screenshot_max_dim: number;
+  /** 截图 JPEG 质量（40~100） */
+  screenshot_jpeg_quality: number;
   /** 工作记忆：模型主动记下的跨轮结论 */
   working_memory: boolean;
   /** 子代理预算：每轮生成最多派出几个只读子代理 */
@@ -90,6 +104,8 @@ const DEFAULT_TOOLS_CONFIG: ToolsConfig = {
   max_output_bytes: 65536,
   approval_timeout_secs: 120,
   call_timeout_secs: 180,
+  screenshot_max_dim: 1024,
+  screenshot_jpeg_quality: 85,
   working_memory: true,
   subagent_max_children: 2,
   subagent_steps: 32,
@@ -299,6 +315,10 @@ export function SettingsPage() {
   const [addingWorkspace, setAddingWorkspace] = useState(false);
 
   const setCurrentPage = useChatStore((s) => s.setCurrentPage);
+  const platform = useUiStore((s) => s.platform);
+  // 能力尚未加载时按“支持”处理，避免设置页刚打开就闪一下禁用态
+  const floatPositioningSupported = platform?.windowPositioning ?? true;
+  const closeActionDefault = platform?.closeActionDefault ?? "hide";
 
   /**
    * 统一确认弹窗（替代原生 `confirm()`）
@@ -1398,6 +1418,53 @@ export function SettingsPage() {
           </span>
         </label>
 
+        {/* 截图质量：直接决定"模型能不能看清小字"，比 token 预算更容易被忽略 */}
+        <label>
+          <span>截图长边上限（像素）</span>
+          <input
+            type="number"
+            min="0"
+            max="7680"
+            step="128"
+            disabled={!toolsConfig.enabled}
+            value={toolsConfig.screenshot_max_dim}
+            onChange={(e) => {
+              // 0 = 原始分辨率；其余强制落在 640 ~ 7680（后端校验同此规则）
+              const raw = Number(e.target.value);
+              const next =
+                raw === 0
+                  ? 0
+                  : clampNumber(e.target.value, 640, 7680, 1024);
+              patchTools({ screenshot_max_dim: next });
+            }}
+          />
+          <span className="settings-hint">
+            送进模型的屏幕截图长边上限，默认 1024。<strong>填 0 表示不缩放</strong>，
+            按显示器原始分辨率下发——需要看清聊天记录、菜单项里的小字时设为 0；
+            分辨率越高单张图的 token 越多（1920×1080 约为 1024 宽时的 3.5 倍）
+          </span>
+        </label>
+        <label>
+          <span>截图 JPEG 质量</span>
+          <input
+            type="number"
+            min="40"
+            max="100"
+            step="5"
+            disabled={!toolsConfig.enabled}
+            value={toolsConfig.screenshot_jpeg_quality}
+            onChange={(e) =>
+              patchTools({
+                screenshot_jpeg_quality: clampNumber(e.target.value, 40, 100, 85),
+              })
+            }
+          />
+          <span className="settings-hint">
+            40 ~ 100，默认 85。截图以 JPEG 传输，质量太低时文字边缘会出现块状伪影，
+            模型容易看错数字与标点；把分辨率调到 0 时建议同时提到 90 以上
+          </span>
+        </label>
+
         {/* 子代理预算：调查类任务的开销上限，直接决定"后台偷偷花了多少" */}
         <label>
           <span>子代理名额（每轮）</span>
@@ -1500,6 +1567,9 @@ export function SettingsPage() {
                   {!t.enabled && <span className="tool-item-tag off">已停用</span>}
                 </div>
                 <div className="tool-item-desc">{t.description}</div>
+                {!t.enabled && t.unavailable_reason && (
+                  <div className="tool-item-reason">{t.unavailable_reason}</div>
+                )}
               </div>
             ))
           )}
@@ -1795,9 +1865,13 @@ export function SettingsPage() {
         </label>
         <label>
           <span>悬浮窗弹出位置</span>
-          <select value={config.ui.float_position ?? "bottom-right"} onChange={(e) => {
-            setConfig({ ...config, ui: { ...config.ui, float_position: e.target.value } });
-          }}>
+          <select
+            disabled={!floatPositioningSupported}
+            value={config.ui.float_position ?? "bottom-right"}
+            onChange={(e) => {
+              setConfig({ ...config, ui: { ...config.ui, float_position: e.target.value } });
+            }}
+          >
             <option value="bottom-right">右下角（默认）</option>
             <option value="bottom-left">左下角</option>
             <option value="top-right">右上角</option>
@@ -1805,23 +1879,78 @@ export function SettingsPage() {
             <option value="top-center">顶部居中</option>
             <option value="bottom-center">底部居中</option>
           </select>
-          <span className="settings-hint">悬浮窗每次出现时的屏幕位置</span>
+          <span className="settings-hint">
+            {floatPositioningSupported
+              ? "悬浮窗每次出现时的屏幕位置"
+              : "当前图形会话（Wayland）不允许应用设置窗口绝对位置，该选项由合成器决定"}
+          </span>
         </label>
         <label>
           <span>关闭主窗口时</span>
-          <select value={config.ui.close_action ?? "hide"} onChange={(e) => {
+          <select value={config.ui.close_action ?? closeActionDefault} onChange={(e) => {
             setConfig({ ...config, ui: { ...config.ui, close_action: e.target.value } });
           }}>
             <option value="exit">退出程序</option>
-            <option value="hide">进入后台（默认）</option>
-            <option value="hide_and_float">进入后台并打开悬浮窗</option>
+            <option value="hide">进入后台（Windows 默认）</option>
+            <option value="hide_and_float">进入后台并打开悬浮窗（Linux 默认）</option>
           </select>
           <span className="settings-hint">
-            {(config.ui.close_action ?? "hide") === "exit" && "点击关闭按钮将直接退出程序"}
-            {(config.ui.close_action ?? "hide") === "hide" && "点击关闭按钮将隐藏到系统托盘，可通过托盘菜单恢复"}
-            {(config.ui.close_action ?? "hide") === "hide_and_float" && "点击关闭按钮将隐藏主窗口并自动打开桌面悬浮窗"}
+            {(config.ui.close_action ?? closeActionDefault) === "exit" && "点击关闭按钮将直接退出程序"}
+            {(config.ui.close_action ?? closeActionDefault) === "hide" && "点击关闭按钮将隐藏到系统托盘，可通过托盘菜单恢复"}
+            {(config.ui.close_action ?? closeActionDefault) === "hide_and_float" && "点击关闭按钮将隐藏主窗口并自动打开桌面悬浮窗"}
+            {platform?.os === "linux" && !platform.trayReliable &&
+              " Linux 托盘依赖 AppIndicator（GNOME 需安装扩展）；若托盘不可见，建议选择“退出程序”或“进入后台并打开悬浮窗”。"}
           </span>
         </label>
+      </div>
+
+      {/* ─── 平台诊断 ─── */}
+      <div className="settings-section">
+        <h3>
+          <IconSettings /> 平台能力
+        </h3>
+        {platform ? (
+          <>
+            <div className="platform-diagnostics">
+              <span className="platform-diagnostic-item">
+                系统：{platform.os === "linux" ? "Linux" : platform.os === "windows" ? "Windows" : platform.os}
+              </span>
+              <span className="platform-diagnostic-item">
+                会话：{SESSION_TYPE_LABEL[platform.sessionType]}
+              </span>
+              <span className="platform-diagnostic-item">
+                悬浮窗定位：{platform.windowPositioning ? "可用" : "不可用"}
+              </span>
+              <span className="platform-diagnostic-item">
+                置顶：{platform.alwaysOnTop ? "可用" : "不保证"}
+              </span>
+              <span className="platform-diagnostic-item">
+                全局快捷键：{platform.globalShortcut ? "可用" : "不可用"}
+              </span>
+              <span className="platform-diagnostic-item">
+                截图：
+                {platform.screenCapture
+                  ? platform.screenCaptureOnly
+                    ? "只读（实验）"
+                    : "可用"
+                  : "不可用"}
+              </span>
+              <span className="platform-diagnostic-item">
+                桌面控制：{platform.osControl ? "可用" : "不可用"}
+              </span>
+              <span className="platform-diagnostic-item">
+                托盘：{platform.trayMenu ? (platform.trayReliable ? "可用" : "可用但不保证可见") : "不可用"}
+              </span>
+            </div>
+            {platform.notes.map((note) => (
+              <p className="settings-hint" key={note}>
+                {note}
+              </p>
+            ))}
+          </>
+        ) : (
+          <p className="settings-hint">平台能力加载中…</p>
+        )}
       </div>
 
       {/* ─── 戳一下设置 ─── */}

@@ -1,9 +1,7 @@
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::types::{
-    is_valid_workspace_id, ToolConfig, DEFAULT_WORKSPACE_ID,
-};
+use crate::config::types::{is_valid_workspace_id, ToolConfig, DEFAULT_WORKSPACE_ID};
 
 /// 一个已解析的工作区根目录
 #[derive(Debug, Clone)]
@@ -95,8 +93,8 @@ impl WorkspaceSet {
             })
             .cloned()
             .collect();
-        let app_data_dir = std::fs::canonicalize(app_data_dir)
-            .unwrap_or_else(|_| lexical_normalize(app_data_dir));
+        let app_data_dir =
+            std::fs::canonicalize(app_data_dir).unwrap_or_else(|_| lexical_normalize(app_data_dir));
 
         Self {
             roots,
@@ -153,11 +151,7 @@ impl WorkspaceSet {
 
     /// 该绝对路径是否命中敏感文件清单（供搜索类工具过滤结果）
     pub fn is_path_denied(&self, abs: &Path) -> bool {
-        match self
-            .roots
-            .iter()
-            .find(|r| abs.starts_with(&r.path))
-        {
+        match self.roots.iter().find(|r| abs.starts_with(&r.path)) {
             Some(root) => self.check_deny(root, abs).is_err(),
             // 不在任何工作区内的路径一律视为不可访问
             None => true,
@@ -181,8 +175,7 @@ impl WorkspaceSet {
             .split_once(':')
             .filter(|(prefix, rest)| {
                 is_valid_workspace_id(prefix)
-                    && !(prefix.len() == 1
-                        && (rest.starts_with('\\') || rest.starts_with('/')))
+                    && !(prefix.len() == 1 && (rest.starts_with('\\') || rest.starts_with('/')))
             })
             .map(|(prefix, _)| &raw[prefix.len() + 1..])
             .unwrap_or(raw);
@@ -268,8 +261,8 @@ impl WorkspaceSet {
         // 2) `root_id:相对路径` 寻址
         if let Some((maybe_id, rest)) = raw.split_once(':') {
             // Windows 盘符（单字母 + 反斜杠）不当作工作区 id
-            let looks_like_drive = maybe_id.len() == 1
-                && (rest.starts_with('\\') || rest.starts_with('/'));
+            let looks_like_drive =
+                maybe_id.len() == 1 && (rest.starts_with('\\') || rest.starts_with('/'));
             if !looks_like_drive && is_valid_workspace_id(maybe_id) {
                 return match self.get(maybe_id) {
                     Some(root) => {
@@ -306,7 +299,10 @@ impl WorkspaceSet {
 
     fn check_deny(&self, root: &Root, abs: &Path) -> Result<(), String> {
         let abs_str = to_slash(abs);
-        let rel_str = abs.strip_prefix(&root.path).map(to_slash).unwrap_or_default();
+        let rel_str = abs
+            .strip_prefix(&root.path)
+            .map(to_slash)
+            .unwrap_or_default();
 
         // 默认工作区位于 `%APPDATA%` 下：绝对路径命中 AppData 两条内置模式时，
         // 只要位于应用自身数据目录内就改用剔除后的集合，否则整个默认工作区
@@ -508,7 +504,18 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("konata-jail-{}-{}", tag, uuid::Uuid::new_v4()));
+            // Windows 的 %TEMP% 位于 AppData\Local，正好命中「AppData 凭据保护」
+            // 两条内置拒绝规则；这里验证的是路径监狱本身，不该被那条规则误伤，
+            // 所以把测试根放到可执行文件旁边（target 目录），而非 %TEMP%。
+            let base = if cfg!(windows) {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|dir| dir.join("konata-jail-tests")))
+                    .unwrap_or_else(std::env::temp_dir)
+            } else {
+                std::env::temp_dir()
+            };
+            let dir = base.join(format!("konata-jail-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -546,14 +553,21 @@ mod tests {
         let tmp = TempDir::new("escape");
         let set = set_with(tmp.path(), true);
         let err = set.resolve("../../etc/passwd").unwrap_err();
-        assert!(err.contains("越出工作区") || err.contains("上级目录"), "{err}");
+        assert!(
+            err.contains("越出工作区") || err.contains("上级目录"),
+            "{err}"
+        );
     }
 
     #[test]
     fn absolute_path_outside_root_is_rejected() {
         let tmp = TempDir::new("abs");
         let set = set_with(tmp.path(), true);
-        let outside = if cfg!(windows) { r"C:\Windows\System32" } else { "/etc/passwd" };
+        let outside = if cfg!(windows) {
+            r"C:\Windows\System32"
+        } else {
+            "/etc/passwd"
+        };
         let err = set.resolve(outside).unwrap_err();
         assert!(err.contains("必须位于某个工作区内"), "{err}");
     }
@@ -590,7 +604,9 @@ mod tests {
 
         let resolved = set.resolve("notes:todo.md").unwrap();
         assert_eq!(resolved.root_id, "notes");
-        assert!(resolved.abs_path.starts_with(std::fs::canonicalize(b.path()).unwrap()));
+        assert!(resolved
+            .abs_path
+            .starts_with(std::fs::canonicalize(b.path()).unwrap()));
         assert!(!resolved.writable);
 
         // 只读根拒绝写入
@@ -680,7 +696,11 @@ mod tests {
             ("//?/C:/ws/new.txt", "C:/ws/new.txt"),
             ("/tmp/ws/new.txt", "/tmp/ws/new.txt"),
         ] {
-            assert_eq!(comparable_path(Path::new(raw)), PathBuf::from(expected), "{raw}");
+            assert_eq!(
+                comparable_path(Path::new(raw)),
+                PathBuf::from(expected),
+                "{raw}"
+            );
         }
         // 前缀不同的两侧仍能判定包含关系，且不会把 ws2 误判进 ws
         assert!(comparable_path(Path::new("//?/C:/ws/new.txt"))
@@ -717,6 +737,8 @@ mod tests {
         let set = set_with(tmp.path(), true);
         let resolved = set.resolve("deep/nested/new.txt").unwrap();
         assert!(!resolved.existed);
-        assert!(resolved.abs_path.starts_with(std::fs::canonicalize(tmp.path()).unwrap()));
+        assert!(resolved
+            .abs_path
+            .starts_with(std::fs::canonicalize(tmp.path()).unwrap()));
     }
 }

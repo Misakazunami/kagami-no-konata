@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 
 use crate::agent::harness::traits::{Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput};
 
-
 /// 当前本地时间
 ///
 /// 取代了 `SystemAgent` 原先"只能看时间"的硬编码分支：同一个能力现在
@@ -142,7 +141,9 @@ impl Tool for GetAppStatus {
             if let Ok(stats) = store.get_usage_stats() {
                 lines.push(format!(
                     "累计用量：{} 次请求 / 共 {} tokens（输入 {} / 输出 {}）",
-                    stats.total_requests, stats.total_tokens, stats.prompt_tokens,
+                    stats.total_requests,
+                    stats.total_tokens,
+                    stats.prompt_tokens,
                     stats.completion_tokens
                 ));
             }
@@ -176,11 +177,7 @@ mod tests {
     fn ctx_fixture() -> (std::path::PathBuf, ToolServices, Arc<NullSink>) {
         let dir = std::env::temp_dir().join(format!("konata-basic-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = ToolConfig::with_single_root(
-            &dir,
-            true,
-            "测试",
-        );
+        let cfg = ToolConfig::with_single_root(&dir, true, "测试");
         let set = WorkspaceSet::from_config(&cfg, &dir);
         let services = ToolServices::minimal(dir.clone(), set, ToolMode::Standard);
         (dir, services, Arc::new(NullSink))

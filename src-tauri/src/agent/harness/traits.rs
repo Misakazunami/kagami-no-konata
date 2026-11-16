@@ -33,6 +33,8 @@ pub enum Permission {
     WriteFs,
     /// 执行外部命令，需要审批（且只在 `Full` 模式下可见）
     Execute,
+    /// 操作系统级控制（键盘、鼠标、截图），需要审批（仅在 Full 模式可见）
+    OsControl,
     /// 访问网络，需要审批 + 域名白名单
     Network,
 }
@@ -45,6 +47,7 @@ impl Permission {
             Permission::WriteSession => "write_session",
             Permission::WriteFs => "write_fs",
             Permission::Execute => "execute",
+            Permission::OsControl => "os_control",
             Permission::Network => "network",
         }
     }
@@ -57,6 +60,7 @@ impl Permission {
             Permission::WriteSession => "低风险（仅会话数据）",
             Permission::WriteFs => "中风险（写入文件）",
             Permission::Execute => "高风险（执行命令）",
+            Permission::OsControl => "极高风险（操作系统控制）",
             Permission::Network => "高风险（访问网络）",
         }
     }
@@ -69,7 +73,7 @@ impl Permission {
     pub fn requires_approval(self) -> bool {
         matches!(
             self,
-            Permission::WriteFs | Permission::Execute | Permission::Network
+            Permission::WriteFs | Permission::Execute | Permission::OsControl | Permission::Network
         )
     }
 
@@ -80,7 +84,7 @@ impl Permission {
             // 会话级状态（计划/笔记）例外——它们是模型维护进度的载体
             ToolMode::ReadOnly => matches!(self, Permission::Read | Permission::WriteSession),
             // 标准模式：文件写入与联网需要审批，命令执行不可见
-            ToolMode::Standard => !matches!(self, Permission::Execute),
+            ToolMode::Standard => !matches!(self, Permission::Execute | Permission::OsControl),
             // 完整模式：全部可见（敏感命令仍然被硬拦截）
             ToolMode::Full => true,
         }
@@ -96,6 +100,11 @@ pub struct ToolInfo {
     pub permission: Permission,
     pub read_only: bool,
     pub enabled: bool,
+    /// 工具被平台/环境禁用时的人类可读原因（`enabled == true` 时为 `None`）
+    ///
+    /// 设置页用它解释“为什么这个工具在这里不能用”，而不是只显示一个灰掉的开关。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
 /// 工具的静态描述
@@ -241,6 +250,13 @@ pub struct ToolServices {
     pub app_data_dir: PathBuf,
     pub workspaces: WorkspaceSet,
     pub mode: ToolMode,
+    /// 送进模型的屏幕截图长边上限（0 = 不缩放，按原始分辨率下发）
+    ///
+    /// 由 `tools.screenshot_max_dim` 配置：缩得太狠时聊天记录/菜单里的小字
+    /// 会糊成一团，模型"看得见但看不清"，需要时调大或设为 0。
+    pub screenshot_max_dim: u32,
+    /// 截图 JPEG 质量（40~100）
+    pub screenshot_jpeg_quality: u8,
     /// 当前活跃的 LLM 提供商（`search_memory` 需要 embedding）
     pub llm_provider: Option<LlmProvider>,
     pub memory: Option<Arc<Mutex<MemoryStore>>>,
@@ -288,6 +304,8 @@ impl ToolServices {
             app_data_dir,
             workspaces,
             mode,
+            screenshot_max_dim: super::screen::DEFAULT_MAX_IMAGE_DIM,
+            screenshot_jpeg_quality: super::screen::DEFAULT_JPEG_QUALITY,
             llm_provider: None,
             memory: None,
             personas: None,
@@ -303,9 +321,7 @@ impl ToolServices {
             working_memory: false,
             search: None,
             plan_network: false,
-            subagent_timeout: Duration::from_secs(
-                super::subagent::DEFAULT_SUBAGENT_TIMEOUT_SECS,
-            ),
+            subagent_timeout: Duration::from_secs(super::subagent::DEFAULT_SUBAGENT_TIMEOUT_SECS),
         }
     }
 
@@ -456,13 +472,23 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// 工具被禁用时给用户看的原因（默认不解释）
+    ///
+    /// 与 [`Tool::enabled`] 配套：平台能力缺失（例如 Wayland 下的桌面控制）
+    /// 或配置被关闭时，设置页需要一句具体说明，而不是只显示灰开关。
+    fn unavailable_reason(&self) -> Option<String> {
+        None
+    }
+
     /// `args` 已由 runner 解析为 JSON 对象；工具内部仍需自行校验每个字段
     async fn call(&self, args: Value, cx: &ToolCtx<'_>) -> Result<ToolOutput>;
 
     /// 本次调用的时间预算（`None` = 沿用 `ToolLimits.call_timeout`）
     ///
-    /// 只有"一次调用内部要跑完整段子流程"的工具需要覆盖它：目前只有
-    /// `spawn_subagents`（它包住整个子代理批次，普通工具的 60 秒会把批次掐死）。
+    /// 只有"一次调用内部要跑完整段子流程"的工具需要覆盖它：目前是
+    /// `spawn_subagents`（它包住整个子代理批次，普通工具的 60 秒会把批次掐死）
+    /// 和 `look_at_screen`（截图可能等待系统授权，需要自己的 20 秒超时先于
+    /// runner 的外层兜底触发）。
     fn timeout_budget(&self, _services: &ToolServices) -> Option<Duration> {
         None
     }
@@ -686,8 +712,7 @@ const TOOL_STREAM_CHUNK_BYTES: usize = 16 * 1024;
 /// 几十上百 MB 灌进 IPC 与前端 store（每个 chunk 都会触发一次状态更新）。
 const TOOL_STREAM_TOTAL_BYTES: usize = 1024 * 1024;
 /// 达到上限后发送的最后一条说明
-const TOOL_STREAM_CAPPED_NOTICE: &str =
-    "\n…[实时输出过多，已停止转发；完整结果见工具卡片]…\n";
+const TOOL_STREAM_CAPPED_NOTICE: &str = "\n…[实时输出过多，已停止转发；完整结果见工具卡片]…\n";
 
 impl ToolStream {
     pub fn new(cx: &ToolCtx<'_>, tool: &str, stream: &'static str) -> Self {
@@ -743,10 +768,8 @@ impl ToolStream {
                 return;
             }
             let allowed = TOOL_STREAM_TOTAL_BYTES - self.sent_bytes;
-            let end = floor_char_boundary(
-                rest,
-                TOOL_STREAM_CHUNK_BYTES.min(rest.len()).min(allowed),
-            );
+            let end =
+                floor_char_boundary(rest, TOOL_STREAM_CHUNK_BYTES.min(rest.len()).min(allowed));
             if end == 0 {
                 // 剩余配额装不下一个完整字符：直接收尾，绝不切坏 UTF-8
                 self.sent_bytes = TOOL_STREAM_TOTAL_BYTES;
@@ -884,7 +907,11 @@ mod tests {
         let (out, truncated) = buffer.finish();
         assert!(truncated);
         assert!(out.contains('此'));
-        assert!(out.len() <= 64 + "已省略 字节\n".len() + 8, "实际 {} 字节", out.len());
+        assert!(
+            out.len() <= 64 + "已省略 字节\n".len() + 8,
+            "实际 {} 字节",
+            out.len()
+        );
     }
 
     /// 头部关闭后，短行不能再插到已进尾部的长行之前（输出必须保持执行顺序）
@@ -972,12 +999,10 @@ mod tests {
             "转发总量必须封顶，实际 {total}"
         );
         assert!(
-            events
-                .iter()
-                .any(|payload| payload["data"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("已停止转发")),
+            events.iter().any(|payload| payload["data"]
+                .as_str()
+                .unwrap_or("")
+                .contains("已停止转发")),
             "超过上限必须发一句收尾说明"
         );
         // 载荷仍带全配对字段

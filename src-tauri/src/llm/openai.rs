@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::types::{
-    ChatChunk, ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, LlmError,
-    ModelInfo, ModelsResponse, StreamChunk,
+    ChatChunk, ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, LlmError, ModelInfo,
+    ModelsResponse, StreamChunk,
 };
 
 /// 全局共享 HTTP 客户端（复用连接池与 TLS 会话）
@@ -165,7 +165,11 @@ impl OpenAiClient {
         }
 
         let embedding_response: EmbeddingResponse = response.json().await?;
-        Ok(embedding_response.data.into_iter().map(|d| d.embedding).collect())
+        Ok(embedding_response
+            .data
+            .into_iter()
+            .map(|d| d.embedding)
+            .collect())
     }
 
     /// 非流式调用
@@ -187,7 +191,7 @@ impl OpenAiClient {
         chat_response
             .choices
             .first()
-            .map(|c| c.message.content.clone())
+            .map(|c| c.message.content_as_str().to_string())
             .ok_or_else(|| anyhow!("No response from LLM"))
     }
 
@@ -637,9 +641,8 @@ mod tests {
     /// 提供商在流内报错时必须上报，绝不能静默丢弃（否则就是一个空回合）
     #[test]
     fn provider_stream_error_is_surfaced() {
-        let err =
-            parse_one(r#"{"error":{"message":"upstream timeout","type":"server_error"}}"#)
-                .unwrap_err();
+        let err = parse_one(r#"{"error":{"message":"upstream timeout","type":"server_error"}}"#)
+            .unwrap_err();
         assert!(err.to_string().contains("upstream timeout"), "{err}");
 
         // 字符串形态的 error 同样识别
@@ -698,8 +701,14 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"<thi"}}]}"#,
             r#"{"choices":[{"delta":{"content":"nk>推理</think>答案"}}]}"#,
         ]);
-        assert!(matches!(&chunks[0], StreamChunk::Thinking(t) if t == "推理"), "{chunks:?}");
-        assert!(matches!(&chunks[1], StreamChunk::Content(t) if t == "答案"), "{chunks:?}");
+        assert!(
+            matches!(&chunks[0], StreamChunk::Thinking(t) if t == "推理"),
+            "{chunks:?}"
+        );
+        assert!(
+            matches!(&chunks[1], StreamChunk::Content(t) if t == "答案"),
+            "{chunks:?}"
+        );
         // 正文里绝不出现标签碎片
         for chunk in &chunks {
             if let StreamChunk::Content(text) = chunk {
@@ -712,19 +721,25 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"<think>推理</thi"}}]}"#,
             r#"{"choices":[{"delta":{"content":"nk>答案"}}]}"#,
         ]);
-        assert!(matches!(&chunks[0], StreamChunk::Thinking(t) if t == "推理"), "{chunks:?}");
-        assert!(matches!(&chunks[1], StreamChunk::Content(t) if t == "答案"), "{chunks:?}");
+        assert!(
+            matches!(&chunks[0], StreamChunk::Thinking(t) if t == "推理"),
+            "{chunks:?}"
+        );
+        assert!(
+            matches!(&chunks[1], StreamChunk::Content(t) if t == "答案"),
+            "{chunks:?}"
+        );
     }
 
     /// 普通文本尾部恰好是 `<` 这类可能前缀时也不能丢字符
     #[test]
     fn trailing_lt_is_not_lost_when_no_tag_follows() {
-        let (chunks, _) = parse(&[
-            r#"{"choices":[{"delta":{"content":"1 < 2"}}]}"#,
-        ]);
+        let (chunks, _) = parse(&[r#"{"choices":[{"delta":{"content":"1 < 2"}}]}"#]);
         // 本次事件里 `< 2` 不是标签前缀，直接输出
         assert!(
-            chunks.iter().any(|c| matches!(c, StreamChunk::Content(t) if t == "1 < 2")),
+            chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::Content(t) if t == "1 < 2")),
             "{chunks:?}"
         );
 
@@ -767,7 +782,8 @@ mod tests {
 
     #[test]
     fn parses_plain_content() {
-        let (chunks, done) = parse(&[r#"{"choices":[{"delta":{"content":"你好"},"finish_reason":null}]}"#]);
+        let (chunks, done) =
+            parse(&[r#"{"choices":[{"delta":{"content":"你好"},"finish_reason":null}]}"#]);
         assert!(!done);
         assert_eq!(chunks.len(), 1);
         assert!(matches!(&chunks[0], StreamChunk::Content(text) if text == "你好"));
@@ -790,9 +806,7 @@ mod tests {
         assert_eq!(deltas[2].arguments.as_deref(), Some("\"README.md\"}"));
 
         // 工具增量绝不能混进正文
-        assert!(chunks
-            .iter()
-            .all(|c| !matches!(c, StreamChunk::Content(_))));
+        assert!(chunks.iter().all(|c| !matches!(c, StreamChunk::Content(_))));
     }
 
     #[test]
@@ -853,9 +867,8 @@ mod tests {
 
     #[test]
     fn think_tags_inside_content_are_split() {
-        let (chunks, _) = parse(&[
-            r#"{"choices":[{"delta":{"content":"<think>推理</think>答案"}}]}"#,
-        ]);
+        let (chunks, _) =
+            parse(&[r#"{"choices":[{"delta":{"content":"<think>推理</think>答案"}}]}"#]);
         assert!(matches!(&chunks[0], StreamChunk::Thinking(t) if t == "推理"));
         assert!(matches!(&chunks[1], StreamChunk::Content(t) if t == "答案"));
     }

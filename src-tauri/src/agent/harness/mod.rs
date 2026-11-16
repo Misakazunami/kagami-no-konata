@@ -4,6 +4,7 @@ pub mod command_guard;
 pub mod jail;
 pub mod registry;
 pub mod runner;
+pub mod screen;
 pub mod snapshot;
 pub mod subagent;
 pub mod tools;
@@ -22,10 +23,9 @@ pub use snapshot::{SnapshotInfo, SnapshotStore};
 #[allow(unused_imports)]
 pub use traits::{
     truncate_text, ApprovalRequest, Approver, DenyAllApprover, EventSink, HeadTailBuffer, NullSink,
-    Permission,
-    SystemOpener, Tool, ToolCtx, ToolDecision, ToolDescriptor, ToolInfo, ToolLimits, ToolOutput,
-    ToolServices, ToolStatus, ToolStream, EVENT_NOTES_UPDATED, EVENT_PLAN_UPDATED, EVENT_SUBAGENT_STATUS,
-    EVENT_TOOL_OUTPUT, EVENT_TOOL_RESULT, EVENT_TOOL_START,
+    Permission, SystemOpener, Tool, ToolCtx, ToolDecision, ToolDescriptor, ToolInfo, ToolLimits,
+    ToolOutput, ToolServices, ToolStatus, ToolStream, EVENT_NOTES_UPDATED, EVENT_PLAN_UPDATED,
+    EVENT_SUBAGENT_STATUS, EVENT_TOOL_OUTPUT, EVENT_TOOL_RESULT, EVENT_TOOL_START,
 };
 
 /// 一次生成所需的工具运行时（`None` 表示纯对话，例如悬浮窗）
@@ -95,6 +95,28 @@ pub fn tool_usage_rules(runtime: &ToolRuntime, registry: &ToolRegistry) -> Strin
     text.push_str("- run_command 没有 shell：不支持管道、重定向与 `&&`。要连着跑几条命令（例如先构建再测试）就用 steps 数组一次提交，它们会按顺序串行执行、只需一次审批；某一步失败默认会中止后续步骤，请把失败原因如实告诉用户。\n");
     text.push_str("- 命令输出很长时（cargo / git 之类）用 max_output_lines 只保留末尾若干行；单次调用有执行时间上限，超时会带着已经产生的输出提前结束，这种情况请如实汇报「跑到哪一步、为什么超时」，而不是假装跑完了。\n");
     text.push_str("- 需要外部资料（版本、报错含义、最新做法）时用 web_search 检索候选链接，再用 web_fetch 打开具体页面；检索与抓取都会请求用户批准，被拒绝时不要反复重试。\n");
+    // 只有 os_control 真的可见时才写这条：只读/标准模式下它根本不在工具表里，
+    // 写了会让模型看到一条自相矛盾的规则
+    if registry
+        .visible_names_with(runtime.services.mode, runtime.services.plan_network)
+        .iter()
+        .any(|name| name == "os_control")
+    {
+        text.push_str(
+            "- 需要操作桌面（点按钮、输入文字、切换窗口）时调用 os_control（动作：mouse_click / keyboard_type / key_press / activate_window），不要用 run_command 拼自动化脚本；每次调用都要审批，被拒绝时说明情况而不是反复重试。\n",
+        );
+    }
+    // Wayland 只读截图：点名工具，并明确"只能看、不能操作"，
+    // 否则模型容易把"看得到"当成"点得到"。
+    if registry
+        .visible_names_with(runtime.services.mode, runtime.services.plan_network)
+        .iter()
+        .any(|name| name == "look_at_screen")
+    {
+        text.push_str(
+            "- 当前处于 Wayland 只读截图模式：需要看屏幕时调用 look_at_screen，图片会在下一轮对话前自动加入上下文；它只能看，不能点击、输入或切换窗口，不要声称已经操作界面。\n",
+        );
+    }
     text.push_str("- 已经查明的结论值得跨轮复用时，用 save_note 记下来（只记结论、别抄原文）；发现笔记过时或记错了就用 forget_note 删掉，别让错误结论一直挂在上下文里。\n");
     text.push_str("- 需要「分别看看这几个模块/文件，再汇总」时，用 spawn_subagents 把 1-3 个**只读**调查任务并行派出去（每轮最多 2 个任务）；子代理只能读，不能写文件、执行命令或联网，结论要自己再核对一遍关键点。
 ");
@@ -129,11 +151,7 @@ mod tests {
     fn runtime(mode: ToolMode) -> ToolRuntime {
         let dir = std::env::temp_dir().join(format!("konata-rt-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = ToolConfig::with_single_root(
-            &dir,
-            true,
-            "应用工作区",
-        );
+        let cfg = ToolConfig::with_single_root(&dir, true, "应用工作区");
         let set = WorkspaceSet::from_config(&cfg, &dir);
         ToolRuntime {
             services: ToolServices::minimal(dir, set, mode),
@@ -167,7 +185,10 @@ mod tests {
         let rules = tool_usage_rules(&runtime(ToolMode::Standard), &tools::builtin_registry());
         assert!(rules.contains("当前角色的身份、语气与说话风格"), "{rules}");
         // 汇报要角色化，但不得改写原始结果
-        assert!(rules.contains("不要改写、美化或省略工具返回的原始内容"), "{rules}");
+        assert!(
+            rules.contains("不要改写、美化或省略工具返回的原始内容"),
+            "{rules}"
+        );
     }
 
     #[test]
@@ -191,5 +212,59 @@ mod tests {
     fn readonly_mode_is_announced() {
         let rules = tool_usage_rules(&runtime(ToolMode::ReadOnly), &tools::builtin_registry());
         assert!(rules.contains("只读模式"));
+    }
+
+    /// 桌面工具可见时必须有一条点名 `os_control` 的规则；只读模式下不能出现
+    /// （模型曾因为规则里只见到工程类工具而声称"没有桌面工具"）
+    #[test]
+    fn os_control_rule_appears_only_when_the_tool_is_visible() {
+        let full = tool_usage_rules(&runtime(ToolMode::Full), &tools::builtin_registry());
+        assert!(full.contains("os_control"), "{full}");
+        assert!(full.contains("mouse_click"), "{full}");
+
+        let readonly = tool_usage_rules(&runtime(ToolMode::ReadOnly), &tools::builtin_registry());
+        assert!(!readonly.contains("os_control"), "{readonly}");
+    }
+
+    struct StubTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for StubTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor::new(
+                self.0,
+                "stub",
+                "stub",
+                Permission::Read,
+                serde_json::json!({ "type": "object" }),
+            )
+        }
+
+        async fn call(
+            &self,
+            _args: serde_json::Value,
+            _cx: &ToolCtx<'_>,
+        ) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::text("stub"))
+        }
+    }
+
+    fn stub_registry(name: &'static str) -> ToolRegistry {
+        ToolRegistry::new(vec![Arc::new(StubTool(name)) as Arc<dyn Tool>])
+    }
+
+    /// 只读截图可见时必须点名 `look_at_screen`，并明确"不能操作界面"；
+    /// 不可见时不能出现这条规则，否则模型会调用一个不存在的工具。
+    #[test]
+    fn look_at_screen_rule_appears_only_when_visible() {
+        let visible = tool_usage_rules(
+            &runtime(ToolMode::ReadOnly),
+            &stub_registry("look_at_screen"),
+        );
+        assert!(visible.contains("look_at_screen"), "{visible}");
+        assert!(visible.contains("不能点击"), "{visible}");
+
+        let hidden = tool_usage_rules(&runtime(ToolMode::ReadOnly), &stub_registry("read_file"));
+        assert!(!hidden.contains("look_at_screen"), "{hidden}");
     }
 }

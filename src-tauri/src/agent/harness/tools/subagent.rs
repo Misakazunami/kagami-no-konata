@@ -92,10 +92,7 @@ impl Tool for SpawnSubagents {
             anyhow::bail!("tasks 不能为空");
         }
         if tasks.len() > runtime.max_tasks_per_call() {
-            anyhow::bail!(
-                "任务过多（上限 {} 个）",
-                runtime.max_tasks_per_call()
-            );
+            anyhow::bail!("任务过多（上限 {} 个）", runtime.max_tasks_per_call());
         }
 
         // 先把任务解析干净，再决定要不要花预算
@@ -308,7 +305,12 @@ impl Tool for SpawnSubagents {
         let mut ok_count = 0usize;
         let mut tool_calls = 0usize;
         for (index, (goal, result)) in outcomes.iter().enumerate() {
-            body.push_str(&format!("── 子代理 {}/{} ──\n任务：{}\n", index + 1, outcomes.len(), goal));
+            body.push_str(&format!(
+                "── 子代理 {}/{} ──\n任务：{}\n",
+                index + 1,
+                outcomes.len(),
+                goal
+            ));
             match result {
                 Ok(child) => {
                     ok_count += 1;
@@ -318,7 +320,10 @@ impl Tool for SpawnSubagents {
                         child.steps, child.tool_calls, child.tokens, child.summary
                     ));
                     if child.truncated {
-                        body.push_str(&format!("（结论已截断到 {} KB）\n", MAX_SUMMARY_BYTES / 1024));
+                        body.push_str(&format!(
+                            "（结论已截断到 {} KB）\n",
+                            MAX_SUMMARY_BYTES / 1024
+                        ));
                     }
                 }
                 Err(error) => {
@@ -378,9 +383,7 @@ impl Tool for SpawnSubagents {
 mod tests {
     use super::*;
     use crate::agent::harness::subagent::AgentRuntime;
-    use crate::agent::harness::traits::{
-        DenyAllApprover, EventSink, ToolLimits, ToolServices,
-    };
+    use crate::agent::harness::traits::{DenyAllApprover, EventSink, ToolLimits, ToolServices};
     use crate::agent::harness::WorkspaceSet;
     use crate::config::types::{ToolConfig, ToolMode};
     use crate::llm::backend::ChatBackend;
@@ -484,8 +487,8 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str, backend: Arc<dyn ChatBackend>, max_children: usize) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("konata-spawn-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("konata-spawn-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("a.txt"), "文件 A 的内容").unwrap();
             let cfg = ToolConfig::with_single_root(&dir, true, "测试");
@@ -539,7 +542,11 @@ mod tests {
         .unwrap();
 
         assert!(out.content.contains("── 子代理 1/1 ──"), "{}", out.content);
-        assert!(out.content.contains("要点一：认证在 auth.rs"), "{}", out.content);
+        assert!(
+            out.content.contains("要点一：认证在 auth.rs"),
+            "{}",
+            out.content
+        );
         assert!(out.preview.as_deref().unwrap_or("").contains("1 个任务"));
         assert!(out.extra_tokens > 0, "子代理用量必须被估算出来");
         assert_eq!(out.status, crate::agent::harness::ToolStatus::Ok);
@@ -547,7 +554,8 @@ mod tests {
         // 子代理的提示词必须是只读调查员规则
         let seen = backend.seen_messages.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert!(seen[0][0].content.contains("只读调查子代理"), "{}", seen[0][0].content);
+        let prompt = seen[0][0].content.content_as_str();
+        assert!(prompt.contains("只读调查子代理"), "{prompt}");
 
         // 给子代理的 schema 里不能有写入/执行类工具
         let tools = backend.seen_tools.lock().unwrap();
@@ -603,7 +611,8 @@ mod tests {
         let fx = Fixture::new("exhausted", backend, 1);
         let cx = fx.ctx();
         let _ = block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "A"}]}), &cx)).unwrap();
-        let err = block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "B"}]}), &cx)).unwrap_err();
+        let err =
+            block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "B"}]}), &cx)).unwrap_err();
         assert!(err.to_string().contains("预算已用完"), "{err}");
         assert!(err.to_string().contains("自己按顺序调查"), "{err}");
     }
@@ -632,7 +641,8 @@ mod tests {
         let err = block_on(SpawnSubagents.call(json!({"tasks": []}), &cx)).unwrap_err();
         assert!(err.to_string().contains("不能为空"), "{err}");
 
-        let err = block_on(SpawnSubagents.call(json!({"tasks": [{"paths": "x"}]}), &cx)).unwrap_err();
+        let err =
+            block_on(SpawnSubagents.call(json!({"tasks": [{"paths": "x"}]}), &cx)).unwrap_err();
         assert!(err.to_string().contains("缺少 goal"), "{err}");
 
         let err = block_on(SpawnSubagents.call(json!({}), &cx)).unwrap_err();
@@ -663,7 +673,8 @@ mod tests {
             emit: sink,
             approver: Arc::new(DenyAllApprover),
         };
-        let err = block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "x"}]}), &cx)).unwrap_err();
+        let err =
+            block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "x"}]}), &cx)).unwrap_err();
         assert!(err.to_string().contains("不支持子代理"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -674,8 +685,8 @@ mod tests {
         let backend = ScriptBackend::empty();
         let fx = Fixture::new("fail", backend, 1);
         let cx = fx.ctx();
-        let out = block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "看点什么"}]}), &cx))
-            .unwrap();
+        let out =
+            block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "看点什么"}]}), &cx)).unwrap();
         assert_eq!(out.status, crate::agent::harness::ToolStatus::Error);
         assert!(out.content.contains("失败"), "{}", out.content);
     }
@@ -686,7 +697,8 @@ mod tests {
         let fx = Fixture::new("cancel", backend.clone(), 2);
         let cx = fx.ctx();
         fx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        let err = block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "A"}]}), &cx)).unwrap_err();
+        let err =
+            block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "A"}]}), &cx)).unwrap_err();
         assert!(err.to_string().contains("停止"), "{err}");
         assert!(
             backend.seen_messages.lock().unwrap().is_empty(),
@@ -729,11 +741,8 @@ mod tests {
         );
         fx.services.subagent_timeout = Duration::from_millis(100);
         let cx = fx.ctx();
-        let out = block_on(SpawnSubagents.call(
-            json!({"tasks": [{"goal": "慢任务"}]}),
-            &cx,
-        ))
-        .unwrap();
+        let out =
+            block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "慢任务"}]}), &cx)).unwrap();
 
         // 工具自己收尾：状态是超时、内容说明预算用尽、部分结果仍被带回
         assert_eq!(out.status, ToolStatus::Timeout);
@@ -741,9 +750,9 @@ mod tests {
         // 进度事件必须如实展示任务跑过（而不是什么都没发生）
         let events = fx.sink.events.lock().unwrap();
         assert!(
-            events
-                .iter()
-                .any(|(event, payload)| event == "subagent-status" && payload["status"] == "running"),
+            events.iter().any(
+                |(event, payload)| event == "subagent-status" && payload["status"] == "running"
+            ),
             "缺少 running 事件"
         );
     }
@@ -756,7 +765,8 @@ mod tests {
         // 预算为 0：deadline 在调用开始的那一刻就已过去
         fx.services.subagent_timeout = Duration::ZERO;
         let cx = fx.ctx();
-        let err = block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "A"}]}), &cx)).unwrap_err();
+        let err =
+            block_on(SpawnSubagents.call(json!({"tasks": [{"goal": "A"}]}), &cx)).unwrap_err();
         assert!(err.to_string().contains("时间预算"), "{err}");
         assert!(
             backend.seen_messages.lock().unwrap().is_empty(),

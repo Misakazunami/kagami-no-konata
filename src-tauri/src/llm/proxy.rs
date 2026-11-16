@@ -64,7 +64,11 @@ impl LlmProxy {
     /// 快照当前配置（克隆后立即释放锁，避免跨 await 持锁）
     fn snapshot(&self) -> (OpenAiClient, LlmProvider, ProviderOverrides) {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        (guard.client.clone(), guard.provider.clone(), guard.overrides)
+        (
+            guard.client.clone(),
+            guard.provider.clone(),
+            guard.overrides,
+        )
     }
 
     /// 获取可用模型列表
@@ -193,7 +197,13 @@ mod tests {
     }
 
     fn request_json(provider: &LlmProvider, overrides: ProviderOverrides) -> serde_json::Value {
-        let req = build_chat_request(provider, overrides, vec![LlmMessage::user("hi")], true, None);
+        let req = build_chat_request(
+            provider,
+            overrides,
+            vec![LlmMessage::user("hi")],
+            true,
+            None,
+        );
         serde_json::to_value(&req).unwrap()
     }
 
@@ -202,6 +212,78 @@ mod tests {
     fn thinking_field_absent_when_unset() {
         let json = request_json(&provider(), ProviderOverrides::default());
         assert!(json.get("enable_thinking").is_none(), "{json}");
+    }
+
+    /// Full 模式下 `os_control` 必须真的进入请求体的 `tools` 数组
+    ///
+    /// 真实报障：模型声称"工具栏里没有注册 os_control"，而它同一分钟刚成功
+    /// 调用过。这条断言把"我们这边到底发没发"钉死，避免以后再靠模型自述排查。
+    #[test]
+    fn full_mode_ships_os_control_in_the_request() {
+        use crate::agent::harness::tools::builtin_registry;
+        use crate::config::types::ToolMode;
+
+        let tools = builtin_registry().schemas(ToolMode::Full);
+        let req = build_chat_request(
+            &provider(),
+            ProviderOverrides::default(),
+            vec![LlmMessage::user("hi")],
+            true,
+            Some(tools),
+        );
+        let json = serde_json::to_value(&req).unwrap();
+
+        let tools = json["tools"].as_array().expect("tools 必须是数组");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap_or_default())
+            .collect();
+        assert!(names.contains(&"os_control"), "{names:?}");
+        assert_eq!(json["tool_choice"], "auto");
+
+        // 动作枚举也要完整下发，否则模型只能凭空猜参数形状
+        let os_control = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == "os_control")
+            .unwrap();
+        let actions = os_control["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action 必须是枚举");
+        for action in [
+            "mouse_click",
+            "keyboard_type",
+            "key_press",
+            "activate_window",
+        ] {
+            assert!(
+                actions.iter().any(|value| value == action),
+                "缺少动作 {action}：{actions:?}"
+            );
+        }
+    }
+
+    /// 只读模式不该把桌面控制工具发给模型
+    #[test]
+    fn readonly_mode_never_ships_os_control() {
+        use crate::agent::harness::tools::builtin_registry;
+        use crate::config::types::ToolMode;
+
+        let tools = builtin_registry().schemas(ToolMode::ReadOnly);
+        let req = build_chat_request(
+            &provider(),
+            ProviderOverrides::default(),
+            vec![LlmMessage::user("hi")],
+            true,
+            Some(tools),
+        );
+        let json = serde_json::to_value(&req).unwrap();
+        let names: Vec<&str> = json["tools"]
+            .as_array()
+            .expect("只读模式仍有读类工具")
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap_or_default())
+            .collect();
+        assert!(!names.contains(&"os_control"), "{names:?}");
     }
 
     /// 提供商默认开启 ⇒ 下发 true
@@ -218,7 +300,12 @@ mod tests {
     fn session_override_can_disable_provider_default() {
         let mut p = provider();
         p.enable_thinking = true;
-        let json = request_json(&p, ProviderOverrides { thinking: Some(false) });
+        let json = request_json(
+            &p,
+            ProviderOverrides {
+                thinking: Some(false),
+            },
+        );
         assert_eq!(
             json["enable_thinking"],
             serde_json::json!(false),
@@ -228,7 +315,12 @@ mod tests {
 
     #[test]
     fn session_override_can_enable_thinking() {
-        let json = request_json(&provider(), ProviderOverrides { thinking: Some(true) });
+        let json = request_json(
+            &provider(),
+            ProviderOverrides {
+                thinking: Some(true),
+            },
+        );
         assert_eq!(json["enable_thinking"], serde_json::json!(true));
         // 其他字段不受影响
         assert_eq!(json["model"], "qwen3-32b");
@@ -243,7 +335,12 @@ mod tests {
         let mut p = provider();
         p.model = "gpt-5".to_string();
         p.enable_thinking = true;
-        let json = request_json(&p, ProviderOverrides { thinking: Some(true) });
+        let json = request_json(
+            &p,
+            ProviderOverrides {
+                thinking: Some(true),
+            },
+        );
         assert!(
             json.get("enable_thinking").is_none(),
             "严格端点会 400：{json}"
@@ -258,7 +355,12 @@ mod tests {
         let mut p = provider();
         p.model = "gpt-4o".to_string();
         p.enable_thinking = true;
-        let json = request_json(&p, ProviderOverrides { thinking: Some(false) });
+        let json = request_json(
+            &p,
+            ProviderOverrides {
+                thinking: Some(false),
+            },
+        );
         assert!(
             json.get("enable_thinking").is_none(),
             "不支持时不下发；绝不能变成 true：{json}"
@@ -286,7 +388,12 @@ mod tests {
     /// 覆盖项属于"这一轮"：热更新提供商配置不得把它冲掉
     #[test]
     fn override_survives_provider_hot_update() {
-        let proxy = LlmProxy::with_overrides(&provider(), ProviderOverrides { thinking: Some(false) });
+        let proxy = LlmProxy::with_overrides(
+            &provider(),
+            ProviderOverrides {
+                thinking: Some(false),
+            },
+        );
         let mut updated = provider();
         updated.model = "deepseek-chat".to_string();
         proxy.update_provider(&updated);

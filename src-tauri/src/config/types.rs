@@ -335,8 +335,7 @@ impl ModelSettings {
             if !providers.iter().any(|p| p.id == item.provider_id) {
                 return Err(format!(
                     "{}引用的提供商不存在：{}（请先在设置里选择有效模型）",
-                    what,
-                    item.provider_id
+                    what, item.provider_id
                 ));
             }
             Ok(())
@@ -392,12 +391,19 @@ impl AppConfig {
             if !seen.insert(p.id.as_str()) {
                 return Err(format!("提供商 id 重复：{}", p.id));
             }
-            let name = if p.name.trim().is_empty() { p.id.as_str() } else { p.name.as_str() };
+            let name = if p.name.trim().is_empty() {
+                p.id.as_str()
+            } else {
+                p.name.as_str()
+            };
             if p.api_base_url.trim().is_empty() {
                 return Err(format!("提供商「{}」的 API 地址不能为空", name));
             }
             if !(p.api_base_url.starts_with("http://") || p.api_base_url.starts_with("https://")) {
-                return Err(format!("提供商「{}」的 API 地址必须以 http:// 或 https:// 开头", name));
+                return Err(format!(
+                    "提供商「{}」的 API 地址必须以 http:// 或 https:// 开头",
+                    name
+                ));
             }
             if let Some(max_tokens) = p.max_tokens {
                 if max_tokens == 0 || max_tokens > 1_000_000 {
@@ -408,7 +414,10 @@ impl AppConfig {
                 }
             }
             if !p.temperature.is_finite() || !(0.0..=2.0).contains(&p.temperature) {
-                return Err(format!("提供商「{}」的 temperature 必须在 0.0 ~ 2.0 之间", name));
+                return Err(format!(
+                    "提供商「{}」的 temperature 必须在 0.0 ~ 2.0 之间",
+                    name
+                ));
             }
         }
 
@@ -435,7 +444,8 @@ impl AppConfig {
         if !(8..=72).contains(&self.ui.font_size) {
             return Err("字号必须在 8 ~ 72 之间".to_string());
         }
-        if !self.ui.poke_probability.is_finite() || !(0.0..=1.0).contains(&self.ui.poke_probability) {
+        if !self.ui.poke_probability.is_finite() || !(0.0..=1.0).contains(&self.ui.poke_probability)
+        {
             return Err("戳一下触发概率必须在 0.0 ~ 1.0 之间".to_string());
         }
         if !self.ui.poke_llm_chance.is_finite() || !(0.0..=1.0).contains(&self.ui.poke_llm_chance) {
@@ -493,7 +503,11 @@ impl Default for MemoryConfig {
 }
 
 fn default_close_action() -> String {
-    "hide".to_string()
+    // Windows 保持“隐藏到托盘”；Linux 默认“隐藏并打开悬浮窗”，
+    // 因为 GNOME 默认没有 AppIndicator，单纯隐藏后用户可能找不到窗口。
+    crate::platform::capabilities()
+        .close_action_default
+        .to_string()
 }
 
 fn default_float_position() -> String {
@@ -538,6 +552,9 @@ pub struct UiConfig {
     /// 气泡自动隐藏时间（秒）
     #[serde(default = "default_bubble_auto_hide_secs")]
     pub bubble_auto_hide_secs: u32,
+    /// 会话侧栏是否折叠（窄窗口下由前端自动折叠，这里只记用户的手动偏好）
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
 }
 
 fn default_true() -> bool {
@@ -557,6 +574,7 @@ impl Default for UiConfig {
             poke_probability: default_poke_probability(),
             poke_llm_chance: default_poke_llm_chance(),
             bubble_auto_hide_secs: default_bubble_auto_hide_secs(),
+            sidebar_collapsed: false,
         }
     }
 }
@@ -647,10 +665,33 @@ pub fn is_valid_workspace_id(id: &str) -> bool {
 /// 恰好位于 `%APPDATA%/com.konata-mirror.main/workspace`，如果无条件匹配绝对
 /// 路径，Windows 上整个默认工作区都会被拒绝访问。因此 `WorkspaceSet` 会对
 /// 应用自身数据目录内的路径单独剔除这两条（其余内置条目照旧生效）。
-pub const APP_DATA_DENY_GLOBS: &[&str] = &[
-    "**/AppData/Roaming/**",
-    "**/AppData/Local/**",
+pub const APP_DATA_DENY_GLOBS: &[&str] = &["**/AppData/Roaming/**", "**/AppData/Local/**"];
+
+/// 仅 Linux 注入的敏感文件模式
+///
+/// 刻意不用 `**/.local/share/**` 这类大范围模式：本应用的默认工作区就在
+/// `~/.local/share/com.konata-mirror.main/workspace`，大范围拒绝会把整个
+/// 工作区挡在门外。这里只列凭据/密钥环/浏览器登录数据等具体位置。
+#[cfg(target_os = "linux")]
+pub const PLATFORM_DENY_GLOBS: &[&str] = &[
+    "**/.local/share/keyrings/**",
+    "**/.local/share/kwalletd/**",
+    "**/.local/share/password-store/**",
+    "**/.password-store/**",
+    "**/.config/gh/hosts.yml",
+    "**/.config/gcloud/**",
+    "**/.config/op/**",
+    "**/.config/sops/**",
+    "**/.mozilla/firefox/**/logins.json",
+    "**/.mozilla/firefox/**/key4.db",
+    "**/.config/google-chrome/**/Login Data",
+    "**/.config/chromium/**/Login Data",
+    "**/.config/BraveSoftware/**/Login Data",
 ];
+
+/// 非 Linux 平台没有额外条目（保持 Windows/macOS 默认清单不变）
+#[cfg(not(target_os = "linux"))]
+pub const PLATFORM_DENY_GLOBS: &[&str] = &[];
 
 /// 内置拒绝访问的文件模式（用户不能移除，只能追加）
 ///
@@ -696,24 +737,99 @@ pub const DEFAULT_DENY_GLOBS: &[&str] = &[
 /// 代执行类参数（`find -exec`、`git -c alias.x=!cmd`、`npm exec`/`pnpm dlx`）
 /// 也在参数审查里一律拒绝。
 pub const DEFAULT_COMMAND_ALLOWLIST: &[&str] = &[
-    "git", "cargo", "rustc", "rustup", "node", "npm", "pnpm", "yarn", "deno", "bun",
-    "python", "python3", "pip", "pip3", "uv", "go", "java", "javac", "mvn", "gradle", "dotnet",
+    "git",
+    "cargo",
+    "rustc",
+    "rustup",
+    "node",
+    "npm",
+    "pnpm",
+    "yarn",
+    "deno",
+    "bun",
+    "python",
+    "python3",
+    "pip",
+    "pip3",
+    "uv",
+    "go",
+    "java",
+    "javac",
+    "mvn",
+    "gradle",
+    "dotnet",
     // 解释器允许执行脚本文件，但 `-c` / `-e` 等求值参数由命令守卫一律拒绝
-    "perl", "ruby", "php", "lua",
-    "tsc", "eslint", "prettier", "pytest", "make", "cmake", "ls", "cat", "head", "tail", "wc",
-    "grep", "find", "echo", "pwd", "whoami",
+    "perl",
+    "ruby",
+    "php",
+    "lua",
+    "tsc",
+    "eslint",
+    "prettier",
+    "pytest",
+    "make",
+    "cmake",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "find",
+    "echo",
+    "pwd",
+    "whoami",
     // 搜索 / 文本处理（补足代码检索与编辑辅助）
     // 注意：sed / awk / xargs 属"代码执行通道"（e 命令、system()、代执行任意程序），
     // 永远不进默认列表；rg / fd / sort 的代执行参数由 command_guard 程序级拒绝。
-    "rg", "fd", "jq", "yq", "diff", "sort", "uniq", "cut", "tr", "stat", "file", "which", "tree",
+    "rg",
+    "fd",
+    "jq",
+    "yq",
+    "diff",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "stat",
+    "file",
+    "which",
+    "tree",
     // 构建 / 检查工具链（格式化、lint、编译器与构建系统）
-    "gofmt", "goimports", "staticcheck", "golangci-lint",
-    "clang", "clang++", "clang-format", "clang-tidy", "gcc", "g++", "cc", "c++",
-    "ninja", "meson", "just", "shellcheck",
-    "ruff", "black", "mypy", "flake8", "isort", "poetry", "pdm",
-    "swift", "swiftc", "xcodebuild",
+    "gofmt",
+    "goimports",
+    "staticcheck",
+    "golangci-lint",
+    "clang",
+    "clang++",
+    "clang-format",
+    "clang-tidy",
+    "gcc",
+    "g++",
+    "cc",
+    "c++",
+    "ninja",
+    "meson",
+    "just",
+    "shellcheck",
+    "ruff",
+    "black",
+    "mypy",
+    "flake8",
+    "isort",
+    "poetry",
+    "pdm",
+    "swift",
+    "swiftc",
+    "xcodebuild",
     // 前端项目本地二进制（`./node_modules/.bin/xxx` 的方式调用）
-    "vitest", "jest", "vite", "next", "esbuild", "rollup", "webpack",
+    "vitest",
+    "jest",
+    "vite",
+    "next",
+    "esbuild",
+    "rollup",
+    "webpack",
 ];
 
 /// Windows 专属的默认允许程序（仅在 Windows 上合并进允许集合）
@@ -759,6 +875,16 @@ fn default_call_timeout_secs() -> u64 {
     180
 }
 
+/// 屏幕截图长边上限（像素）；0 = 原始分辨率
+fn default_screenshot_max_dim() -> u32 {
+    crate::agent::harness::screen::DEFAULT_MAX_IMAGE_DIM
+}
+
+/// 截图 JPEG 质量
+fn default_screenshot_jpeg_quality() -> u8 {
+    crate::agent::harness::screen::DEFAULT_JPEG_QUALITY
+}
+
 /// 工具运行时配置（只作用于主窗口；悬浮窗恒不使用工具）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -777,6 +903,13 @@ pub struct ToolConfig {
     pub approval_timeout_secs: u64,
     /// 单次工具调用的超时（`run_command` 会据此在超时前收手并保留部分输出）
     pub call_timeout_secs: u64,
+    /// 送进模型的屏幕截图长边上限（像素）
+    ///
+    /// `0` 表示不缩放，按显示器原始分辨率下发。默认 1024 是 token 与可读性的
+    /// 折中；任务需要看清聊天记录、菜单里的小字时调大或设为 0。
+    pub screenshot_max_dim: u32,
+    /// 截图 JPEG 质量（40~100）
+    pub screenshot_jpeg_quality: u8,
     /// 工作记忆：模型主动记下的跨轮结论（默认开；关闭后相关工具明确报错且不再注入提示词）
     pub working_memory: bool,
     /// 每轮生成允许派出的只读子代理任务数（默认 2）
@@ -866,8 +999,10 @@ impl SearchConfig {
         } else {
             endpoint
         };
-        if matches!(self.provider, SearchProvider::Tavily | SearchProvider::Brave)
-            && self.api_key.trim().is_empty()
+        if matches!(
+            self.provider,
+            SearchProvider::Tavily | SearchProvider::Brave
+        ) && self.api_key.trim().is_empty()
         {
             return None;
         }
@@ -962,20 +1097,24 @@ impl McpPermission {
     }
 }
 
-
-
 impl Default for ToolConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             mode: ToolMode::default(),
             workspaces: vec![WorkspaceRoot::default()],
-            deny_globs: DEFAULT_DENY_GLOBS.iter().map(|s| s.to_string()).collect(),
+            deny_globs: DEFAULT_DENY_GLOBS
+                .iter()
+                .chain(PLATFORM_DENY_GLOBS.iter())
+                .map(|s| s.to_string())
+                .collect(),
             auto_approve: Vec::new(),
             max_steps: default_max_steps(),
             max_output_bytes: default_max_output_bytes(),
             approval_timeout_secs: default_approval_timeout_secs(),
             call_timeout_secs: default_call_timeout_secs(),
+            screenshot_max_dim: default_screenshot_max_dim(),
+            screenshot_jpeg_quality: default_screenshot_jpeg_quality(),
             working_memory: true,
             // 与子代理运行时的默认值同源，避免两处漂移
             subagent_max_children: crate::agent::harness::subagent::DEFAULT_MAX_CHILDREN,
@@ -1031,6 +1170,14 @@ impl ToolConfig {
         if !(5..=1800).contains(&self.call_timeout_secs) {
             return Err("单次工具超时必须在 5 ~ 1800 秒之间".to_string());
         }
+        // 0（原始分辨率）或一个合理的上限区间：太小会让截图糊到无法辨认，
+        // 太大则单张图就能把上下文撑爆
+        if self.screenshot_max_dim != 0 && !(640..=7680).contains(&self.screenshot_max_dim) {
+            return Err("截图长边上限必须为 0（原始分辨率）或 640 ~ 7680 像素".to_string());
+        }
+        if !(40..=100).contains(&self.screenshot_jpeg_quality) {
+            return Err("截图 JPEG 质量必须在 40 ~ 100 之间".to_string());
+        }
         if self.workspaces.len() > MAX_WORKSPACE_ROOTS {
             return Err(format!("工作区数量不能超过 {} 个", MAX_WORKSPACE_ROOTS));
         }
@@ -1042,7 +1189,8 @@ impl ToolConfig {
         }
         // 上限与工具 schema 里的 maxItems 一致（见 `subagent::MAX_TASKS_PER_CALL`）：
         // 配置只能收紧，不能放宽到模型看不到的额度
-        if !(1..=crate::agent::harness::subagent::MAX_TASKS_PER_CALL).contains(&self.subagent_max_tasks)
+        if !(1..=crate::agent::harness::subagent::MAX_TASKS_PER_CALL)
+            .contains(&self.subagent_max_tasks)
         {
             return Err(format!(
                 "单次提交的子代理任务数必须在 1 ~ {} 之间",
@@ -1129,11 +1277,7 @@ impl ToolConfig {
             }
         }
 
-        if self
-            .deny_globs
-            .iter()
-            .any(|g| g.trim().is_empty())
-        {
+        if self.deny_globs.iter().any(|g| g.trim().is_empty()) {
             return Err("拒绝访问模式不能为空字符串".to_string());
         }
 
@@ -1158,6 +1302,7 @@ impl ToolConfig {
     pub fn missing_builtin_deny_globs(&self) -> Vec<&'static str> {
         DEFAULT_DENY_GLOBS
             .iter()
+            .chain(PLATFORM_DENY_GLOBS.iter())
             .filter(|g| !self.deny_globs.iter().any(|d| d == **g))
             .copied()
             .collect()
@@ -1236,7 +1381,8 @@ mod tests {
         assert_eq!(cfg.providers.len(), 1, "最后一个提供商必须保留");
         assert!(cfg.remove_provider("不存在的 id").is_err());
 
-        cfg.providers.push(provider("second", "https://b.example/v1"));
+        cfg.providers
+            .push(provider("second", "https://b.example/v1"));
         let first_id = cfg.providers[0].id.clone();
         assert!(cfg.remove_provider(&first_id).is_ok());
         assert_eq!(cfg.providers.len(), 1);
@@ -1342,6 +1488,32 @@ mod tests {
             assert!(
                 cfg.deny_globs.iter().any(|g| g == pattern),
                 "默认配置必须包含内置模式 {pattern}"
+            );
+        }
+    }
+
+    /// Linux 平台条目必须进入默认清单，且不能命中应用自己的默认工作区
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_platform_deny_globs_are_targeted() {
+        let cfg = ToolConfig::default();
+        for pattern in PLATFORM_DENY_GLOBS {
+            assert!(
+                cfg.deny_globs.iter().any(|g| g == pattern),
+                "Linux 默认配置必须包含 {pattern}"
+            );
+        }
+
+        // 默认工作区：~/.local/share/<app-id>/workspace
+        let workspace =
+            std::path::Path::new("/home/user/.local/share/com.konata-mirror.main/workspace");
+        for pattern in PLATFORM_DENY_GLOBS {
+            let matcher = globset::Glob::new(*pattern)
+                .expect("平台模式必须是合法 glob")
+                .compile_matcher();
+            assert!(
+                !matcher.is_match(workspace),
+                "平台拒绝模式 {pattern} 不能命中默认工作区"
             );
         }
     }
@@ -1475,6 +1647,40 @@ mod tests {
         // 旧配置里没有这个字段时必须落到默认值，而不是 0（0 会导致每次调用立即超时）
         let legacy: ToolConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.call_timeout_secs, 180);
+    }
+
+    /// 截图分辨率/质量可配：0 表示原始分辨率，其余必须落在可辨认的区间
+    #[test]
+    fn screenshot_settings_are_configurable_with_bounds() {
+        let defaults = ToolConfig::default();
+        assert_eq!(defaults.screenshot_max_dim, 1024);
+        assert_eq!(defaults.screenshot_jpeg_quality, 85);
+
+        let mut cfg = AppConfig::default();
+        // 0 = 原始分辨率：合法，而且是"看不清小字"时的正解
+        cfg.tools.screenshot_max_dim = 0;
+        assert!(cfg.validate().is_ok());
+
+        // 太小会让截图糊到无法辨认；超过 8K 没意义
+        cfg.tools.screenshot_max_dim = 320;
+        assert!(cfg.validate().is_err());
+        cfg.tools.screenshot_max_dim = 8000;
+        assert!(cfg.validate().is_err());
+
+        cfg.tools.screenshot_max_dim = 1920;
+        assert!(cfg.validate().is_ok());
+
+        cfg.tools.screenshot_jpeg_quality = 39;
+        assert!(cfg.validate().is_err());
+        cfg.tools.screenshot_jpeg_quality = 101;
+        assert!(cfg.validate().is_err());
+        cfg.tools.screenshot_jpeg_quality = 95;
+        assert!(cfg.validate().is_ok());
+
+        // 旧配置没有这两个字段时落到默认值（否则会按 0 像素截图 / 质量 0）
+        let legacy: ToolConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.screenshot_max_dim, 1024);
+        assert_eq!(legacy.screenshot_jpeg_quality, 85);
     }
 
     // ─── 模型路由（自动选择） ───────────────────────

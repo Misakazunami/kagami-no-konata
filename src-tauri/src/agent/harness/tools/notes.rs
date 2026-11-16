@@ -1,12 +1,8 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::agent::harness::traits::{
-    Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput,
-};
-use crate::agent::notes::{
-    sanitize_note, SessionNote, MAX_NOTES, MAX_NOTE_BYTES, MAX_TOTAL_BYTES,
-};
+use crate::agent::harness::traits::{Permission, Tool, ToolCtx, ToolDescriptor, ToolOutput};
+use crate::agent::notes::{sanitize_note, SessionNote, MAX_NOTES, MAX_NOTE_BYTES, MAX_TOTAL_BYTES};
 
 /// 记下一条跨轮有效的工作记忆
 ///
@@ -82,8 +78,11 @@ impl Tool for SaveNote {
             note.label(),
             note.content
         );
-        Ok(ToolOutput::text(body.clone())
-            .with_preview(format!("工作记忆 {} 条 · {}", remaining, note.label())))
+        Ok(ToolOutput::text(body.clone()).with_preview(format!(
+            "工作记忆 {} 条 · {}",
+            remaining,
+            note.label()
+        )))
     }
 }
 
@@ -203,8 +202,8 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("konata-note-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("konata-note-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let conn = db::init_db(&dir).unwrap();
             let store = Arc::new(Mutex::new(ChatStore::new(conn)));
@@ -287,13 +286,16 @@ mod tests {
         let err = block_on(SaveNote.call(json!({"content": "   "}), &cx)).unwrap_err();
         assert!(err.to_string().contains("不能为空"), "{err}");
 
-        let err = block_on(SaveNote.call(
-            json!({"content": "x".repeat(MAX_NOTE_BYTES + 1)}),
-            &cx,
-        ))
-        .unwrap_err();
+        let err = block_on(SaveNote.call(json!({"content": "x".repeat(MAX_NOTE_BYTES + 1)}), &cx))
+            .unwrap_err();
         assert!(err.to_string().contains("过长"), "{err}");
-        assert!(fx.store.lock().unwrap().list_notes(&fx.session_id).unwrap().is_empty());
+        assert!(fx
+            .store
+            .lock()
+            .unwrap()
+            .list_notes(&fx.session_id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -323,7 +325,15 @@ mod tests {
 
         let out = block_on(ForgetNote.call(json!({"id": id}), &cx)).unwrap();
         assert!(out.content.contains("已删除 1 条"), "{}", out.content);
-        assert_eq!(fx.store.lock().unwrap().list_notes(&fx.session_id).unwrap().len(), 1);
+        assert_eq!(
+            fx.store
+                .lock()
+                .unwrap()
+                .list_notes(&fx.session_id)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // 不存在的 id 必须报错，而不是静默显示"删了 0 条"
         let err = block_on(ForgetNote.call(json!({"id": "ghost"}), &cx)).unwrap_err();
@@ -331,7 +341,13 @@ mod tests {
 
         let out = block_on(ForgetNote.call(json!({}), &cx)).unwrap();
         assert!(out.content.contains("已清空"), "{}", out.content);
-        assert!(fx.store.lock().unwrap().list_notes(&fx.session_id).unwrap().is_empty());
+        assert!(fx
+            .store
+            .lock()
+            .unwrap()
+            .list_notes(&fx.session_id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -349,7 +365,10 @@ mod tests {
     fn tools_need_no_approval_and_are_visible_in_read_only() {
         for descriptor in [SaveNote.descriptor(), ForgetNote.descriptor()] {
             assert_eq!(descriptor.permission, Permission::WriteSession);
-            assert!(!descriptor.permission.requires_approval(), "写会话内数据不该弹窗");
+            assert!(
+                !descriptor.permission.requires_approval(),
+                "写会话内数据不该弹窗"
+            );
             // Plan 模式（只读）要能把调查结论跨轮保留下来
             assert!(descriptor.permission.visible_in(ToolMode::ReadOnly));
             assert!(descriptor.permission.visible_in(ToolMode::Standard));

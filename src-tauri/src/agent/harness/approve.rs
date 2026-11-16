@@ -186,7 +186,11 @@ mod tests {
 
         assert_eq!(cancel_pending_for_stream(&map, "stream-1"), 1);
         assert_eq!(rx1.try_recv().unwrap(), ToolDecision::Deny);
-        assert_eq!(map.lock().unwrap().len(), 1, "另一个 stream 的审批不应被清理");
+        assert_eq!(
+            map.lock().unwrap().len(),
+            1,
+            "另一个 stream 的审批不应被清理"
+        );
 
         // 清理不存在的 stream 是安全的空操作
         assert_eq!(cancel_pending_for_stream(&map, "nope"), 0);

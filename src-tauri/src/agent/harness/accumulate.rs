@@ -105,7 +105,10 @@ impl ToolCallAccumulator {
                             serde_json::json!({}),
                             Some("参数必须是 JSON 对象".to_string()),
                         ),
-                        Err(e) => (serde_json::json!({}), Some(format!("参数不是合法 JSON：{}", e))),
+                        Err(e) => (
+                            serde_json::json!({}),
+                            Some(format!("参数不是合法 JSON：{}", e)),
+                        ),
                     }
                 };
                 AssembledCall {
@@ -126,7 +129,12 @@ impl ToolCallAccumulator {
 mod tests {
     use super::*;
 
-    fn delta(index: usize, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> ToolCallDelta {
+    fn delta(
+        index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> ToolCallDelta {
         ToolCallDelta {
             index: Some(index),
             id: id.map(|s| s.to_string()),

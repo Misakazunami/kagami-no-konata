@@ -91,9 +91,14 @@ pub fn connect_configured(app_config: &Arc<Mutex<AppConfig>>) -> Vec<Arc<dyn Too
             .collect();
         handles
             .into_iter()
-            .map(|handle| handle.join().unwrap_or_else(|_| {
-                ("unknown".to_string(), Err(anyhow::anyhow!("MCP 连接线程 panic")))
-            }))
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    (
+                        "unknown".to_string(),
+                        Err(anyhow::anyhow!("MCP 连接线程 panic")),
+                    )
+                })
+            })
             .collect()
     });
 
@@ -178,7 +183,9 @@ fn probe_blocking(server: &McpServerConfig) -> McpServerStatus {
         enabled: server.enabled,
         trusted: server.trusted,
         permission: server.permission.as_str().to_string(),
-        command: format!("{} {}", server.command, server.args.join(" ")).trim().to_string(),
+        command: format!("{} {}", server.command, server.args.join(" "))
+            .trim()
+            .to_string(),
         connected: false,
         tools: Vec::new(),
         error: None,
@@ -360,7 +367,11 @@ impl Tool for McpTool {
             .with_preview(format!(
                 "MCP {}{}",
                 self.info.name,
-                if result.is_error { "（服务器报告失败）" } else { "" }
+                if result.is_error {
+                    "（服务器报告失败）"
+                } else {
+                    ""
+                }
             ))
             .with_status(status))
     }
@@ -450,8 +461,8 @@ rl.on("line", (line) => {
 
     impl FakeFixture {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("konata-mcp-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("konata-mcp-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let script = dir.join("fake-server.js");
             let mut file = std::fs::File::create(&script).unwrap();
@@ -525,7 +536,10 @@ rl.on("line", (line) => {
         let tools = connect_configured(&config_with_servers(vec![fx.config(McpPermission::Read)]));
         assert_eq!(tools.len(), 2, "两个工具都应当被注册");
 
-        let names: Vec<String> = tools.iter().map(|t| t.descriptor().name.to_string()).collect();
+        let names: Vec<String> = tools
+            .iter()
+            .map(|t| t.descriptor().name.to_string())
+            .collect();
         assert!(names.contains(&"mcp:fake:echo".to_string()), "{names:?}");
         assert!(names.contains(&"mcp:fake:boom".to_string()), "{names:?}");
 
@@ -535,8 +549,15 @@ rl.on("line", (line) => {
             .unwrap();
         let descriptor = echo.descriptor();
         assert_eq!(descriptor.permission, Permission::Read, "按配置映射为只读");
-        assert!(descriptor.description.contains("不可信"), "{}", descriptor.description);
-        assert!(descriptor.parameters.get("properties").is_some(), "应当透传 inputSchema");
+        assert!(
+            descriptor.description.contains("不可信"),
+            "{}",
+            descriptor.description
+        );
+        assert!(
+            descriptor.parameters.get("properties").is_some(),
+            "应当透传 inputSchema"
+        );
 
         let cx = ctx_with(&services, cancel.clone());
         let out = block_on(echo.call(json!({"text": "你好"}), &cx)).unwrap();
@@ -646,7 +667,10 @@ rl.on("line", (line) => {
 
         // 撤销后直接调用也必须被拒绝（防御性复查，不依赖注册表）
         let services = test_services(&fx.dir);
-        let cx = ctx_with(&services, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let cx = ctx_with(
+            &services,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let err = block_on(echo.call(json!({"text": "hi"}), &cx)).unwrap_err();
         assert!(err.to_string().contains("停用或取消信任"), "{err}");
     }
@@ -681,7 +705,10 @@ rl.on("line", (line) => {
         }
         assert!(echo.enabled(), "重新信任后工具恢复可见");
         let services = test_services(&fx.dir);
-        let cx = ctx_with(&services, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let cx = ctx_with(
+            &services,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let out = block_on(echo.call(json!({"text": "hi"}), &cx)).unwrap();
         assert_eq!(
             out.status,
@@ -710,7 +737,10 @@ rl.on("line", (line) => {
         echo.shutdown_disabled(); // 未停用 → 空操作
 
         let services = test_services(&fx.dir);
-        let cx = ctx_with(&services, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let cx = ctx_with(
+            &services,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let out = block_on(echo.call(json!({"text": "still alive"}), &cx)).unwrap();
         assert_eq!(out.status, ToolStatus::Ok, "{}", out.content);
         assert!(out.content.contains("still alive"), "{}", out.content);
@@ -744,8 +774,14 @@ rl.on("line", (line) => {
 
         let tools = connect_configured(&config_with_servers(vec![first, second]));
         assert_eq!(tools.len(), 2, "重复 id 的第二个服务器必须被忽略");
-        let names: Vec<String> = tools.iter().map(|t| t.descriptor().name.to_string()).collect();
-        assert!(names.iter().all(|name| name.starts_with("mcp:dup:")), "{names:?}");
+        let names: Vec<String> = tools
+            .iter()
+            .map(|t| t.descriptor().name.to_string())
+            .collect();
+        assert!(
+            names.iter().all(|name| name.starts_with("mcp:dup:")),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -761,7 +797,10 @@ rl.on("line", (line) => {
             .iter()
             .find(|t| t.descriptor().name == "mcp:fake:echo")
             .unwrap();
-        let cx = ctx_with(&services, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let cx = ctx_with(
+            &services,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let summary = tool.approval_summary(&json!({}), &cx).unwrap();
         assert!(summary.contains("fake"), "{summary}");
         assert!(summary.contains("echo"), "{summary}");

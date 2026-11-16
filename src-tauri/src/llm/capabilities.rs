@@ -69,7 +69,10 @@ mod tests {
             "kimi-k2-thinking",
             "magistral-small",
         ] {
-            assert!(supports_thinking(model), "{model} 应被判定为支持深度思考开关");
+            assert!(
+                supports_thinking(model),
+                "{model} 应被判定为支持深度思考开关"
+            );
         }
     }
 
@@ -100,7 +103,10 @@ mod tests {
             "claude-3-5-sonnet",
             "",
         ] {
-            assert!(!supports_thinking(model), "{model} 不应被判定为支持思考开关");
+            assert!(
+                !supports_thinking(model),
+                "{model} 不应被判定为支持思考开关"
+            );
         }
     }
 
@@ -111,7 +117,9 @@ mod tests {
         // 原生推理模型也可以通过显式声明打开（自建网关确实支持该字段时）
         assert!(!provider_supports_thinking(&provider, "deepseek-r1"));
 
-        provider.thinking_models.push("my-private-model".to_string());
+        provider
+            .thinking_models
+            .push("my-private-model".to_string());
         provider.thinking_models.push("deepseek-r1".to_string());
         assert!(
             provider_supports_thinking(&provider, "my-private-model"),
@@ -122,6 +130,9 @@ mod tests {
         assert!(provider_supports_thinking(&provider, "My-Private-Model"));
         assert!(provider_supports_thinking(&provider, "  DEEPSEEK-R1 "));
         // 声明只影响被点名的模型
-        assert!(!provider_supports_thinking(&provider, "another-private-model"));
+        assert!(!provider_supports_thinking(
+            &provider,
+            "another-private-model"
+        ));
     }
 }

@@ -33,9 +33,13 @@ pub const KEEP_DAYS: i64 = 7;
 /// 一次备份尝试的结果
 #[derive(Debug, Clone)]
 pub enum Capture {
-    Captured { bytes: u64 },
+    Captured {
+        bytes: u64,
+    },
     /// 跳过备份的原因（必须原样写进工具结果，不能静默）
-    Skipped { reason: String },
+    Skipped {
+        reason: String,
+    },
 }
 
 impl Capture {
@@ -135,8 +139,7 @@ impl SnapshotStore {
             Some(rel) => rel.to_string(),
             None => {
                 return Capture::Skipped {
-                    reason: "路径包含非 UTF-8 字符，无法可靠记录与回滚（已跳过备份）"
-                        .to_string(),
+                    reason: "路径包含非 UTF-8 字符，无法可靠记录与回滚（已跳过备份）".to_string(),
                 }
             }
         };
@@ -326,9 +329,11 @@ impl SnapshotStore {
             }
             match fs::copy(&backup_path, &resolved.abs_path) {
                 Ok(_) => report.restored += 1,
-                Err(e) => report
-                    .errors
-                    .push(format!("还原 {} 失败：{}", resolved.abs_path.display(), e)),
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("还原 {} 失败：{}", resolved.abs_path.display(), e))
+                }
             }
         }
         report
@@ -449,8 +454,8 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("konata-snap-{}-{}", tag, uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("konata-snap-{}-{}", tag, uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let conn = db::init_db(&dir).unwrap();
             let store = Arc::new(Mutex::new(ChatStore::new(conn)));
@@ -493,7 +498,9 @@ mod tests {
         assert_eq!(info.files, 1);
         assert!(info.bytes > 0);
 
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
+        let report = fx
+            .snapshots
+            .restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "原始内容");
@@ -524,7 +531,9 @@ mod tests {
         let info = fx.snapshots.info(&fx.session_id, &fx.stream_id);
         assert_eq!(info.files, 1, "同一路径不能被计成两个文件");
 
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
+        let report = fx
+            .snapshots
+            .restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "v0");
     }
@@ -561,7 +570,9 @@ mod tests {
             }
         }
 
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
+        let report = fx
+            .snapshots
+            .restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "原始版本");
     }
@@ -602,7 +613,9 @@ mod tests {
         std::fs::remove_file(&abs).unwrap();
         assert!(!abs.exists());
 
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
+        let report = fx
+            .snapshots
+            .restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(std::fs::read_to_string(&abs).unwrap(), "要找回我");
     }
@@ -652,7 +665,9 @@ mod tests {
         for entry in std::fs::read_dir(&backup_dir).unwrap() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
-        let report = fx.snapshots.restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
+        let report = fx
+            .snapshots
+            .restore(&fx.stream_id, &fx.session_id, &fx.workspaces);
         assert_eq!(report.restored, 0);
         assert_eq!(report.missing, 1, "{report:?}");
     }

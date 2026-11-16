@@ -1,0 +1,404 @@
+//! Linux 平台实现。
+//!
+//! - X11：通过 x11rb 做光标定位、绝对移动和 EWMH 窗口激活。
+//! - Wayland：默认不做“假装支持”的尝试；只有显式 opt-in 的只读截图例外。
+
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{
+    AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt, EventMask, Window,
+};
+
+use super::{PlatformCapabilities, SessionType};
+
+const CURRENT_TIME: u32 = 0;
+
+/// Wayland 只读截图的显式 opt-in 开关
+const WAYLAND_SCREENSHOT_ENV: &str = "KONATA_WAYLAND_SCREENSHOT";
+
+/// 解析环境变量开关：空值与 "0" 视为关闭，其余非空值视为开启
+fn env_flag(value: Option<&std::ffi::OsStr>) -> bool {
+    value
+        .map(|value| {
+            let text = value.to_string_lossy();
+            let text = text.trim();
+            !text.is_empty() && text != "0"
+        })
+        .unwrap_or(false)
+}
+
+fn wayland_screenshot_opt_in() -> bool {
+    env_flag(std::env::var_os(WAYLAND_SCREENSHOT_ENV).as_deref())
+}
+
+/// Wayland 只读截图是否具备运行条件。
+///
+/// `screenshots` 的 Wayland 后端仍需要 XWayland（`DISPLAY`）枚举显示器，
+/// 并通过 DBus 访问 GNOME Shell / xdg-desktop-portal；缺一不可。纯 Wayland
+/// 且关闭 XWayland 时明确不可用，而不是尝试后返回一张错图。
+fn wayland_screenshot_available() -> bool {
+    wayland_screenshot_opt_in()
+        && std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+}
+
+pub fn detect() -> PlatformCapabilities {
+    let mut session = current_session();
+    let mut notes = Vec::new();
+
+    // 用户显式要求 XWayland（KONATA_FORCE_X11=1 会设置 GDK_BACKEND=x11，
+    // 也可以自行设置）：窗口由 XWayland 提供，X11 桌面能力可用。
+    // 注意：这只覆盖本应用窗口；其它原生 Wayland 窗口仍无法被截图/注入。
+    let forced_x11 = session == SessionType::Wayland
+        && std::env::var("GDK_BACKEND")
+            .map(|value| value.eq_ignore_ascii_case("x11"))
+            .unwrap_or(false)
+        && std::env::var_os("DISPLAY").is_some();
+    if forced_x11 {
+        session = SessionType::X11;
+        notes.push(
+            "已启用 XWayland（GDK_BACKEND=x11）：本应用的窗口定位/截图/桌面控制走 X11 后端；\
+             原生 Wayland 窗口仍无法被截图或注入输入。"
+                .to_string(),
+        );
+    }
+
+    let x11 = session == SessionType::X11;
+    let wayland_screenshot = session == SessionType::Wayland && wayland_screenshot_available();
+    match session {
+        SessionType::X11 if !forced_x11 => {
+            notes.push("X11 会话：窗口定位、置顶、截图和桌面控制可用。".to_string());
+        }
+        SessionType::Wayland => {
+            notes.push(
+                "Wayland 会话：窗口绝对定位、置顶、全局快捷键和桌面控制不可用；\
+                 需要完整桌面能力请改用 X11/Xorg 会话。"
+                    .to_string(),
+            );
+        }
+        SessionType::Unknown => {
+            notes.push("未检测到 DISPLAY/WAYLAND_DISPLAY：桌面能力不可用。".to_string());
+        }
+        _ => {}
+    }
+
+    if session == SessionType::Wayland {
+        if wayland_screenshot {
+            notes.push(
+                "Wayland 只读截图已启用（实验）：只能查看屏幕，不能点击/输入/切换窗口；\
+                 首次截图可能弹出系统授权，多屏或分数缩放下画面可能不准确。"
+                    .to_string(),
+            );
+        } else if wayland_screenshot_opt_in() {
+            notes.push(
+                "已设置 KONATA_WAYLAND_SCREENSHOT=1，但缺少 DISPLAY 或 \
+                 DBUS_SESSION_BUS_ADDRESS：Wayland 截图需要 XWayland 枚举显示器并依赖 DBus 会话，\
+                 当前不可用。"
+                    .to_string(),
+            );
+        } else {
+            notes.push(
+                "Wayland 只读截图默认关闭；设置 KONATA_WAYLAND_SCREENSHOT=1 并重启可启用\
+                 （实验，需要 XWayland 与系统授权；仍然不能控制键鼠）。"
+                    .to_string(),
+            );
+        }
+    }
+
+    PlatformCapabilities {
+        os: "linux",
+        session_type: session,
+        // AppIndicator 通常只弹菜单，不产生 TrayIconEvent。
+        tray_click_events: false,
+        tray_menu: true,
+        // GNOME 默认不显示 AppIndicator；其它桌面通常有 StatusNotifier 宿主。
+        tray_reliable: tray_reliable(),
+        window_positioning: x11,
+        always_on_top: x11,
+        global_shortcut: x11,
+        screen_capture: x11 || wayland_screenshot,
+        screen_capture_only: wayland_screenshot,
+        input_injection: x11,
+        activate_window: x11,
+        os_control: x11,
+        close_action_default: "hide_and_float",
+        notes,
+    }
+}
+
+/// 托盘是否大概率可见。
+///
+/// GNOME 需要额外安装 AppIndicator 扩展；无法从进程内可靠探测扩展是否启用，
+/// 因此对 GNOME 保守返回 false。其它桌面（KDE/XFCE/MATE 等）通常自带
+/// StatusNotifierWatcher。
+fn tray_reliable() -> bool {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .or_else(|_| std::env::var("DESKTOP_SESSION"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !desktop.is_empty() && !desktop.contains("gnome")
+}
+
+pub fn apply_startup_env() {
+    let session = current_session();
+
+    // 高级 opt-in：Wayland 用户如果更在意窗口定位/键鼠，可以强制走 XWayland。
+    // 不默认开启，避免 HiDPI 模糊和原生 Wayland 应用截图失败。
+    if session == SessionType::Wayland
+        && std::env::var_os("KONATA_FORCE_X11").is_some()
+        && std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("GDK_BACKEND").is_none()
+    {
+        std::env::set_var("GDK_BACKEND", "x11");
+        eprintln!("[platform] KONATA_FORCE_X11=1：使用 XWayland（GDK_BACKEND=x11）");
+    }
+
+    if session == SessionType::Wayland && wayland_screenshot_opt_in() {
+        eprintln!("[platform] KONATA_WAYLAND_SCREENSHOT=1：请求启用 Wayland 只读截图（实验）");
+    }
+
+    let safe_mode = std::env::var_os("KONATA_WEBKIT_SAFE").is_some();
+    let nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists();
+
+    if safe_mode {
+        set_env_if_absent("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        set_env_if_absent("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        set_env_if_absent("__NV_DISABLE_EXPLICIT_SYNC", "1");
+        eprintln!("[platform] KONATA_WEBKIT_SAFE=1：已启用 WebKitGTK 兼容环境变量");
+    } else if nvidia {
+        // Tauri 官方对 NVIDIA + WebKitGTK 的首选 workaround。
+        // 只设置这一项，保留 compositing 性能；仍异常时用户可再开 KONATA_WEBKIT_SAFE。
+        set_env_if_absent("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        eprintln!("[platform] 检测到 NVIDIA 驱动，已设置 WEBKIT_DISABLE_DMABUF_RENDERER=1");
+    }
+}
+
+fn set_env_if_absent(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value);
+    }
+}
+
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen_num)?.root;
+    let reply = conn.query_pointer(root).ok()?.reply().ok()?;
+    Some((reply.root_x as i32, reply.root_y as i32))
+}
+
+pub fn move_cursor(x: i32, y: i32) -> Result<()> {
+    let (conn, screen_num) = x11rb::connect(None).map_err(|e| anyhow!("连接 X11 失败：{e}"))?;
+    let root = conn
+        .setup()
+        .roots
+        .get(screen_num)
+        .ok_or_else(|| anyhow!("X11 screen {screen_num} 不存在"))?
+        .root;
+
+    // 绝对坐标走 WarpPointer，而不是 enigo 的 Coordinate::Abs：
+    // enigo 0.2 只按主屏归一化，副屏在左侧时的负坐标会点错。
+    conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, x as i16, y as i16)
+        .map_err(|e| anyhow!("把鼠标移到 ({x}, {y}) 失败：{e}"))?;
+    conn.flush()
+        .map_err(|e| anyhow!("刷新 X11 请求失败：{e}"))?;
+    Ok(())
+}
+
+pub fn activate_window(title: &str, settle: Duration) -> Result<String> {
+    let needle = title.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err(anyhow!("窗口标题不能为空"));
+    }
+
+    let (conn, screen_num) = x11rb::connect(None).map_err(|e| anyhow!("连接 X11 失败：{e}"))?;
+    let root = conn
+        .setup()
+        .roots
+        .get(screen_num)
+        .ok_or_else(|| anyhow!("X11 screen {screen_num} 不存在"))?
+        .root;
+
+    let client_list = intern_atom(&conn, b"_NET_CLIENT_LIST")?;
+    let net_wm_name = intern_atom(&conn, b"_NET_WM_NAME")?;
+    let utf8_string = intern_atom(&conn, b"UTF8_STRING")?;
+    let net_active_window = intern_atom(&conn, b"_NET_ACTIVE_WINDOW")?;
+    let net_wm_state = intern_atom(&conn, b"_NET_WM_STATE")?;
+    let net_wm_state_hidden = intern_atom(&conn, b"_NET_WM_STATE_HIDDEN")?;
+
+    let reply = conn
+        .get_property(false, root, client_list, AtomEnum::WINDOW, 0, u32::MAX)
+        .map_err(|e| anyhow!("读取 _NET_CLIENT_LIST 失败：{e}"))?
+        .reply()
+        .map_err(|e| anyhow!("读取 _NET_CLIENT_LIST 失败：{e}"))?;
+    let windows: Vec<Window> = reply
+        .value32()
+        .map(|values| values.collect())
+        .unwrap_or_default();
+
+    if windows.is_empty() {
+        return Err(anyhow!(
+            "当前窗口管理器没有提供 _NET_CLIENT_LIST，无法按标题激活窗口"
+        ));
+    }
+
+    let mut exact = None;
+    let mut partial = None;
+    for window in windows {
+        let Some(name) = window_title(&conn, window, net_wm_name, utf8_string)? else {
+            continue;
+        };
+        let lower = name.to_lowercase();
+        if lower == needle {
+            exact = Some((window, name));
+            break;
+        }
+        if partial.is_none() && lower.contains(&needle) {
+            partial = Some((window, name));
+        }
+    }
+
+    let (window, name) = exact.or(partial).ok_or_else(|| {
+        anyhow!("没有找到标题包含「{title}」的窗口。若它最小化在托盘里，需要先让用户从托盘唤出")
+    })?;
+
+    // 先从最小化状态恢复。_NET_ACTIVE_WINDOW 本身也应让 WM 取消最小化，
+    // 但部分 WM 需要显式移除 _NET_WM_STATE_HIDDEN。
+    send_client_message(
+        &conn,
+        root,
+        window,
+        net_wm_state,
+        [0, net_wm_state_hidden, 0, 2, 0],
+    )?;
+    send_client_message(
+        &conn,
+        root,
+        window,
+        net_active_window,
+        [2, CURRENT_TIME, 0, 0, 0],
+    )?;
+    conn.flush()
+        .map_err(|e| anyhow!("刷新 X11 请求失败：{e}"))?;
+
+    std::thread::sleep(settle);
+    Ok(format!("已把窗口「{name}」切到前台"))
+}
+
+fn intern_atom(conn: &impl Connection, name: &[u8]) -> Result<u32> {
+    conn.intern_atom(false, name)
+        .map_err(|e| anyhow!("创建 X11 atom 失败：{e}"))?
+        .reply()
+        .map(|reply| reply.atom)
+        .map_err(|e| anyhow!("创建 X11 atom 失败：{e}"))
+}
+
+fn window_title(
+    conn: &impl Connection,
+    window: Window,
+    net_wm_name: u32,
+    utf8_string: u32,
+) -> Result<Option<String>> {
+    let reply = conn
+        .get_property(false, window, net_wm_name, utf8_string, 0, 1024)
+        .map_err(|e| anyhow!("读取窗口标题失败：{e}"))?
+        .reply()
+        .map_err(|e| anyhow!("读取窗口标题失败：{e}"))?;
+    if !reply.value.is_empty() {
+        return Ok(Some(String::from_utf8_lossy(&reply.value).to_string()));
+    }
+
+    let reply = conn
+        .get_property(false, window, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)
+        .map_err(|e| anyhow!("读取窗口标题失败：{e}"))?
+        .reply()
+        .map_err(|e| anyhow!("读取窗口标题失败：{e}"))?;
+    if reply.value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&reply.value).to_string()))
+    }
+}
+
+fn send_client_message(
+    conn: &impl Connection,
+    root: Window,
+    window: Window,
+    type_: u32,
+    data: [u32; 5],
+) -> Result<()> {
+    let event = ClientMessageEvent::new(32, window, type_, ClientMessageData::from(data));
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )
+    .map_err(|e| anyhow!("发送 X11 客户端消息失败：{e}"))?;
+    Ok(())
+}
+
+fn current_session() -> SessionType {
+    let xdg = std::env::var("XDG_SESSION_TYPE").ok();
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").map(|_| ());
+    let display = std::env::var_os("DISPLAY").map(|_| ());
+    classify_session(xdg.as_deref(), wayland.is_some(), display.is_some())
+}
+
+fn classify_session(
+    xdg_session_type: Option<&str>,
+    has_wayland_display: bool,
+    has_display: bool,
+) -> SessionType {
+    match xdg_session_type
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("wayland") => SessionType::Wayland,
+        Some("x11") => SessionType::X11,
+        _ if has_wayland_display => SessionType::Wayland,
+        _ if has_display => SessionType::X11,
+        _ => SessionType::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_session_prefers_explicit_xdg_type() {
+        assert_eq!(
+            classify_session(Some("wayland"), true, true),
+            SessionType::Wayland
+        );
+        assert_eq!(classify_session(Some("x11"), true, true), SessionType::X11);
+    }
+
+    #[test]
+    fn classify_session_falls_back_to_display_vars() {
+        assert_eq!(classify_session(None, true, true), SessionType::Wayland);
+        assert_eq!(classify_session(None, false, true), SessionType::X11);
+        assert_eq!(classify_session(None, false, false), SessionType::Unknown);
+    }
+
+    #[test]
+    fn classify_session_ignores_blank_xdg_type() {
+        assert_eq!(classify_session(Some("  "), false, true), SessionType::X11);
+    }
+
+    /// 只读截图的 opt-in 开关：空值与 "0" 必须是关闭，避免
+    /// `KONATA_WAYLAND_SCREENSHOT=0` 被误判成启用
+    #[test]
+    fn env_flag_treats_zero_and_empty_as_off() {
+        use std::ffi::OsStr;
+
+        assert!(env_flag(Some(OsStr::new("1"))));
+        assert!(env_flag(Some(OsStr::new("true"))));
+        assert!(!env_flag(Some(OsStr::new("0"))));
+        assert!(!env_flag(Some(OsStr::new(""))));
+        assert!(!env_flag(Some(OsStr::new("  "))));
+        assert!(!env_flag(None));
+    }
+}

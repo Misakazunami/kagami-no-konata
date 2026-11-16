@@ -1,0 +1,41 @@
+//! 其它平台兜底：明确返回“不可用”，不伪装成功。
+
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
+
+use super::{PlatformCapabilities, SessionType};
+
+pub fn detect() -> PlatformCapabilities {
+    PlatformCapabilities {
+        os: std::env::consts::OS,
+        session_type: SessionType::Unknown,
+        tray_click_events: false,
+        tray_menu: false,
+        tray_reliable: false,
+        window_positioning: false,
+        always_on_top: false,
+        global_shortcut: false,
+        screen_capture: false,
+        screen_capture_only: false,
+        input_injection: false,
+        activate_window: false,
+        os_control: false,
+        close_action_default: "hide",
+        notes: vec!["当前平台未实现桌面集成，桌面能力不可用。".to_string()],
+    }
+}
+
+pub fn apply_startup_env() {}
+
+pub fn cursor_position() -> Option<(i32, i32)> {
+    None
+}
+
+pub fn move_cursor(_x: i32, _y: i32) -> Result<()> {
+    Err(anyhow!("当前平台不支持鼠标绝对定位"))
+}
+
+pub fn activate_window(_title: &str, _settle: Duration) -> Result<String> {
+    Err(anyhow!("当前平台不支持按标题激活窗口"))
+}

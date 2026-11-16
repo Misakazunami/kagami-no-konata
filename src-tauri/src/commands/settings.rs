@@ -108,7 +108,10 @@ pub async fn test_provider_connection(
     let test_msg = vec![crate::llm::types::LlmMessage::user("Hi")];
     match proxy.chat(test_msg).await {
         // 按字符截断：`&response[..100]` 会在中文回复上切到多字节边界并直接 panic
-        Ok(response) => Ok(format!("连接成功！模型响应: {}", truncate_chars(&response, 100))),
+        Ok(response) => Ok(format!(
+            "连接成功！模型响应: {}",
+            truncate_chars(&response, 100)
+        )),
         Err(e) => Err(format!(
             "连接失败: {}",
             truncate_chars(&e.to_string(), MAX_ERROR_BODY_CHARS)
@@ -216,7 +219,9 @@ pub async fn delete_provider(
     state: State<'_, AppState>,
     provider_id: String,
 ) -> Result<(), String> {
-    mutate_config(&state, move |config| config.llm.remove_provider(&provider_id))?;
+    mutate_config(&state, move |config| {
+        config.llm.remove_provider(&provider_id)
+    })?;
 
     let _ = app.emit("config-updated", ());
     Ok(())
@@ -342,7 +347,9 @@ pub async fn get_model_catalog(state: State<'_, AppState>) -> Result<ModelCatalo
                 models: ids
                     .into_iter()
                     .map(|id| ModelOption {
-                        supports_thinking: crate::llm::capabilities::provider_supports_thinking(p, &id),
+                        supports_thinking: crate::llm::capabilities::provider_supports_thinking(
+                            p, &id,
+                        ),
                         is_current: id == p.model,
                         id,
                     })

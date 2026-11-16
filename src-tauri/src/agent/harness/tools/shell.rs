@@ -210,7 +210,11 @@ impl Tool for RunCommand {
                         .unwrap_or_else(|| "被信号终止".to_string());
                     let ok = exit_status.success();
                     (
-                        if ok { ToolStatus::Ok } else { ToolStatus::Error },
+                        if ok {
+                            ToolStatus::Ok
+                        } else {
+                            ToolStatus::Error
+                        },
                         code,
                     )
                 }
@@ -273,10 +277,7 @@ impl Tool for RunCommand {
 /// 解析 `steps` 或单条命令形式；两者同时出现视为调用错误
 fn parse_steps(args: &Value) -> Result<Vec<PlannedStep>> {
     let has_steps = matches!(args.get("steps"), Some(Value::Array(_)));
-    let has_program = args
-        .get("program")
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
+    let has_program = args.get("program").map(|v| !v.is_null()).unwrap_or(false);
 
     if has_steps && has_program {
         anyhow::bail!("steps 与 program 不能同时提供：多步请只用 steps");
@@ -343,6 +344,26 @@ fn parse_arg_list(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
     }
 }
 
+/// 杀掉子进程及其派生进程
+///
+/// Unix 上 `cargo` / `npm` 会再拉起 rustc / node；只杀直接子进程会让它们
+/// 变成孤儿继续占着 CPU 和端口。spawn 时已让子进程成为新进程组组长，
+/// 这里用负 PID 一次性回收整组。
+///
+/// Windows 没有等价的进程组语义（需要 Job Object，未接入），维持原有
+/// `start_kill`：至少保证直接子进程不会泄漏。
+fn kill_child_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: kill(2) 只读取整数参数；负值表示"整个进程组"。
+        // 失败（进程已退出等）无副作用，继续走 start_kill 兜底。
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+}
+
 /// 执行一步：流式转发输出、按截止时间/取消标志提前收手
 ///
 /// 返回 `(文本报告, 结局, 是否被截断)`。stdout / stderr 都是**增量**收集的
@@ -357,9 +378,8 @@ async fn run_step(
     // 命令串已在 command_guard 里做过元字符审查，见 `build_cmd_script_arg`。
     // 其它情况直接以 argv 方式 spawn，不使用 shell。
     let mut child = if let Some(cmd_arg) = &command.windows_cmd_arg {
-        let mut cmd = tokio::process::Command::new(
-            crate::agent::harness::command_guard::windows_cmd_exe(),
-        );
+        let mut cmd =
+            tokio::process::Command::new(crate::agent::harness::command_guard::windows_cmd_exe());
         // /d 跳过 AutoRun，/s 配合最外层引号保证含空格路径不被截断
         cmd.arg("/d").arg("/s").arg("/c").arg(cmd_arg);
         cmd
@@ -376,6 +396,11 @@ async fn run_step(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    // Unix：让子进程自成一个进程组（pgid == pid），超时/取消时可整组回收。
+    // 必须在 spawn 之前设置。
+    #[cfg(unix)]
+    child.process_group(0);
 
     let mut child = child
         .spawn()
@@ -402,7 +427,7 @@ async fn run_step(
     // 有 50ms 级的响应，还要能在收手前把已经收到的输出留在缓冲里
     let outcome = loop {
         if cx.cancelled() {
-            let _ = child.start_kill();
+            kill_child_tree(&mut child);
             let _ = tokio::time::timeout(READER_GRACE, child.wait()).await;
             break StepOutcome::Cancelled;
         }
@@ -412,7 +437,7 @@ async fn run_step(
             Err(e) => anyhow::bail!("等待命令退出失败：{}", e),
         }
         if Instant::now() >= deadline {
-            let _ = child.start_kill();
+            kill_child_tree(&mut child);
             let _ = tokio::time::timeout(READER_GRACE, child.wait()).await;
             break StepOutcome::TimedOut;
         }
@@ -500,12 +525,16 @@ fn snapshot(buffer: &Arc<Mutex<HeadTailBuffer>>) -> (String, bool) {
 mod tests {
     use super::*;
     use crate::agent::harness::jail::WorkspaceSet;
-    use crate::agent::harness::traits::{
-        DenyAllApprover, EventSink, ToolLimits, ToolServices, EVENT_TOOL_OUTPUT,
-    };
-    use crate::config::types::{ToolConfig, ToolMode, DEFAULT_COMMAND_ALLOWLIST};
+    #[cfg(unix)]
+    use crate::agent::harness::traits::EVENT_TOOL_OUTPUT;
+    use crate::agent::harness::traits::{DenyAllApprover, EventSink, ToolLimits, ToolServices};
+    #[cfg(unix)]
+    use crate::config::types::DEFAULT_COMMAND_ALLOWLIST;
+    use crate::config::types::{ToolConfig, ToolMode};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    #[cfg(unix)]
+    use std::sync::atomic::Ordering;
 
     /// 记录事件的 sink（用于断言流式输出事件）
     struct RecordingSink {
@@ -519,6 +548,7 @@ mod tests {
             })
         }
 
+        #[cfg(unix)]
         fn payloads(&self, name: &str) -> Vec<Value> {
             self.events
                 .lock()
@@ -570,6 +600,7 @@ mod tests {
         }
 
         /// 允许列表里补上测试所需的程序（默认列表不含 false / sleep / seq）
+        #[cfg(unix)]
         fn allow(&mut self, extra: &[&str]) {
             self.services.command_allowlist = DEFAULT_COMMAND_ALLOWLIST
                 .iter()
@@ -597,6 +628,7 @@ mod tests {
         }
 
         /// 写一个多行文件到工作区
+        #[cfg(unix)]
         fn write_lines(&self, name: &str, count: usize) {
             let mut data = String::new();
             for i in 0..count {
@@ -649,11 +681,8 @@ mod tests {
     fn rejects_non_array_args() {
         let fx = Fixture::new("badargs");
         let cx = fx.ctx();
-        let err = block_on(RunCommand.call(
-            json!({"program": "cargo", "args": "build"}),
-            &cx,
-        ))
-        .unwrap_err();
+        let err = block_on(RunCommand.call(json!({"program": "cargo", "args": "build"}), &cx))
+            .unwrap_err();
         assert!(err.to_string().contains("字符串数组"), "{err}");
     }
 
@@ -666,11 +695,8 @@ mod tests {
         } else {
             "/etc/hosts"
         };
-        let err = block_on(RunCommand.call(
-            json!({"program": "cat", "args": [outside]}),
-            &cx,
-        ))
-        .unwrap_err();
+        let err = block_on(RunCommand.call(json!({"program": "cargo", "args": [outside]}), &cx))
+            .unwrap_err();
         assert!(err.to_string().contains("阻止"), "{err}");
     }
 
@@ -725,10 +751,13 @@ mod tests {
         let fx = Fixture::new("summary");
         let cx = fx.ctx();
         let summary = RunCommand
-            .approval_summary(&json!({"steps": [
-                {"program": "cargo", "args": ["build", "--release"]},
-                {"program": "cargo", "args": ["test"]}
-            ]}), &cx)
+            .approval_summary(
+                &json!({"steps": [
+                    {"program": "cargo", "args": ["build", "--release"]},
+                    {"program": "cargo", "args": ["test"]}
+                ]}),
+                &cx,
+            )
             .expect("多步命令必须给出摘要");
         assert!(summary.contains("2 条命令"), "{summary}");
         assert!(summary.contains("1. cargo build --release"), "{summary}");
@@ -827,10 +856,14 @@ mod tests {
         fx.write_lines("big.txt", 16384);
 
         let cx = fx.ctx();
-        let out = block_on(RunCommand.call(json!({"program": "cat", "args": ["big.txt"]}), &cx))
-            .unwrap();
+        let out =
+            block_on(RunCommand.call(json!({"program": "cat", "args": ["big.txt"]}), &cx)).unwrap();
         assert!(out.truncated, "超长输出必须标记截断");
-        assert!(out.content.contains("已省略"), "{}", &out.content[..200.min(out.content.len())]);
+        assert!(
+            out.content.contains("已省略"),
+            "{}",
+            &out.content[..200.min(out.content.len())]
+        );
         assert!(out.content.contains("row-0000"), "头部必须保留");
         assert!(out.content.contains("row-16383"), "尾部必须保留");
         assert!(
@@ -894,11 +927,8 @@ mod tests {
         fx.timeout = Duration::from_millis(300);
         let cx = fx.ctx();
         let started = Instant::now();
-        let out = block_on(RunCommand.call(
-            json!({"program": "sleep", "args": ["5"]}),
-            &cx,
-        ))
-        .unwrap();
+        let out =
+            block_on(RunCommand.call(json!({"program": "sleep", "args": ["5"]}), &cx)).unwrap();
         assert_eq!(out.status, ToolStatus::Timeout);
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -932,5 +962,56 @@ mod tests {
         });
         assert_eq!(out.status, ToolStatus::Cancelled);
         assert!(out.content.contains("已停止"), "{}", out.content);
+    }
+
+    /// 超时/取消必须回收整个进程组，而不只是直接子进程。
+    ///
+    /// `cargo`/`npm` 会再拉起 rustc/node；只杀直接子进程会让它们变成孤儿。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_child_tree_reaps_grandchildren() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $!; wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        cmd.process_group(0);
+
+        let mut child = cmd.spawn().expect("spawn sh");
+        let mut stdout = child.stdout.take().expect("stdout");
+        let mut reader = BufReader::new(&mut stdout);
+        let mut line = String::new();
+        let grandchild: i32 = block_on(async {
+            reader.read_line(&mut line).await.expect("read pid");
+            line.trim().parse().expect("pid")
+        });
+
+        kill_child_tree(&mut child);
+        let status = block_on(tokio::time::timeout(Duration::from_secs(3), child.wait()))
+            .expect("sh 必须退出")
+            .expect("wait");
+        assert!(!status.success(), "被 SIGKILL 的进程不应成功退出");
+
+        // 僵尸进程也算“已停止”；只要不是 R/S/D 等运行态即可。
+        let running = |pid: i32| -> bool {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+                })
+                .is_some_and(|state| state != "Z")
+        };
+        let mut gone = false;
+        for _ in 0..50 {
+            if !running(grandchild) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "进程组里的 sleep({grandchild}) 仍然存活");
     }
 }

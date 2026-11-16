@@ -64,8 +64,10 @@ impl Tool for SearchMemory {
         };
 
         if entries.is_empty() {
-            return Ok(ToolOutput::text(format!("没有检索到与「{}」相关的记忆。", query))
-                .with_preview("没有相关记忆"));
+            return Ok(
+                ToolOutput::text(format!("没有检索到与「{}」相关的记忆。", query))
+                    .with_preview("没有相关记忆"),
+            );
         }
 
         let mut body = format!("与「{}」相关的记忆（{} 条）：\n", query, entries.len());
@@ -136,8 +138,11 @@ impl Tool for SaveMemory {
             let store = store.lock().unwrap_or_else(|e| e.into_inner());
             let existing = store.list_memories(Some(200)).unwrap_or_default();
             if let Some(hit) = existing.iter().find(|m| m.content.trim() == content.trim()) {
-                return Ok(ToolOutput::text(format!("这条记忆已经存在，无需重复记录：{}", hit.content))
-                    .with_preview("已存在，未重复写入"));
+                return Ok(ToolOutput::text(format!(
+                    "这条记忆已经存在，无需重复记录：{}",
+                    hit.content
+                ))
+                .with_preview("已存在，未重复写入"));
             }
         }
 
@@ -264,7 +269,10 @@ impl Tool for ReadPersona {
             persona.name, persona.id, persona.version
         );
         if !persona.personality.traits.is_empty() {
-            body.push_str(&format!("性格：{}\n", persona.personality.traits.join("、")));
+            body.push_str(&format!(
+                "性格：{}\n",
+                persona.personality.traits.join("、")
+            ));
         }
         if !persona.personality.speech_style.is_empty() {
             body.push_str(&format!("说话风格：{}\n", persona.personality.speech_style));
@@ -296,11 +304,7 @@ mod tests {
     fn services_with_personas(tag: &str) -> (std::path::PathBuf, ToolServices) {
         let dir = std::env::temp_dir().join(format!("konata-mem-{}-{}", tag, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = ToolConfig::with_single_root(
-            &dir,
-            true,
-            "测试",
-        );
+        let cfg = ToolConfig::with_single_root(&dir, true, "测试");
         let set = WorkspaceSet::from_config(&cfg, &dir);
         let mut services = ToolServices::minimal(dir.clone(), set, ToolMode::Standard);
         services.personas = Some(Arc::new(RwLock::new(PersonaEngine::new().unwrap())));

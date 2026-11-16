@@ -52,7 +52,10 @@ impl MemoryExtractor {
                     MemoryType::Experience => "经历",
                     MemoryType::Emotional => "情感",
                 };
-                lines.push(format!("[{}] {}（ID: {}）", type_label, mem.content, mem.id));
+                lines.push(format!(
+                    "[{}] {}（ID: {}）",
+                    type_label, mem.content, mem.id
+                ));
             }
             format!(
                 "\n\n已有记忆（如果新信息与已有记忆重复或矛盾，请使用 update 操作更新，skip 表示跳过）：\n{}",
@@ -90,9 +93,7 @@ impl MemoryExtractor {
 
         // 调用 LLM 提取
         let proxy = LlmProxy::new(llm_provider);
-        let response = proxy
-            .chat(vec![LlmMessage::user(prompt)])
-            .await?;
+        let response = proxy.chat(vec![LlmMessage::user(prompt)]).await?;
 
         // 解析 JSON 响应
         let facts = parse_extracted_facts(&response);
@@ -110,7 +111,8 @@ impl MemoryExtractor {
         }
 
         // 内容未变化的 update 操作直接复用已有向量，其余统一批量嵌入（单次 API 调用）
-        let mut planned: Vec<(ExtractedFact, Option<Vec<f32>>)> = Vec::with_capacity(actionable.len());
+        let mut planned: Vec<(ExtractedFact, Option<Vec<f32>>)> =
+            Vec::with_capacity(actionable.len());
         let mut need_embed: Vec<String> = Vec::new();
         for fact in actionable {
             let reuse = if fact.action == "update" && !fact.update_id.is_empty() {
@@ -137,7 +139,10 @@ impl MemoryExtractor {
                     // 绝不把"没有向量"的记忆写进库：它们不会被检索到（数据黑洞），
                     // 而且下一轮会重复提取一遍、白白多花一次 LLM 调用。
                     // 整轮放弃并如实记录，下次对话自然重试。
-                    anyhow::bail!("记忆向量化失败，本轮不写入任何记忆（下次对话会重试）：{}", e);
+                    anyhow::bail!(
+                        "记忆向量化失败，本轮不写入任何记忆（下次对话会重试）：{}",
+                        e
+                    );
                 }
             }
         };

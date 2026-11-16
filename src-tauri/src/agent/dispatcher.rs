@@ -6,7 +6,9 @@ use std::sync::{Arc, RwLock};
 use super::chat_agent::ChatAgent;
 use super::router::{IntentRouter, RouteDecision};
 use super::system_agent::SystemAgent;
-use super::traits::{Agent, AgentContext, AgentResponse, StreamChunkCallback, StreamThinkingCallback};
+use super::traits::{
+    Agent, AgentContext, AgentResponse, StreamChunkCallback, StreamThinkingCallback,
+};
 
 /// 构造"人设包裹"用的转述指令
 ///

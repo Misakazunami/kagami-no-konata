@@ -7,9 +7,7 @@ use tauri::{AppHandle, Emitter, State, WebviewWindow};
 
 use crate::agent::context::{Message, Role, Session};
 use crate::agent::harness::approve::TauriApprover;
-use crate::agent::harness::{
-    ToolLimits, ToolRuntime, ToolServices, WorkspaceSet,
-};
+use crate::agent::harness::{ToolLimits, ToolRuntime, ToolServices, WorkspaceSet};
 use crate::agent::traits::AgentContext;
 use crate::commands::tools::{ensure_main_window, TauriEventSink, TauriOpener};
 use crate::config::types::LlmProvider;
@@ -170,7 +168,10 @@ async fn summarize_messages(
 /// **失败必须降级而不是中断**：摘要只是"锦上添花"的上下文，缺了它用户仍应能正常聊天。
 /// 历史实现这里是 `?`，于是任何一次查询失败（例如旧库缺少 `context_summary` 列）
 /// 都会让「发送」直接失败——用户看到的就是"发送失败"。
-fn read_summary(store: &crate::store::chat_store::ChatStore, session_id: &str) -> (Option<String>, i64) {
+fn read_summary(
+    store: &crate::store::chat_store::ChatStore,
+    session_id: &str,
+) -> (Option<String>, i64) {
     match store.get_summary_with_count(session_id) {
         Ok((summary, count)) => {
             let summary = if summary.trim().is_empty() {
@@ -242,7 +243,9 @@ async fn load_context(
 ) -> Result<(Vec<Message>, Option<String>), String> {
     let (total, summary, summarized_count) = {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-        let total = store.count_messages(session_id).map_err(|e| e.to_string())?;
+        let total = store
+            .count_messages(session_id)
+            .map_err(|e| e.to_string())?;
         let (summary, count) = read_summary(&store, session_id);
         (total, summary, count)
     };
@@ -265,11 +268,8 @@ async fn load_context(
             if pending.is_empty() {
                 // 没有可摘要的新增内容（例如消息被删除），直接推进水位
                 let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-                let _ = store.set_session_summary(
-                    session_id,
-                    summary.as_deref().unwrap_or(""),
-                    target,
-                );
+                let _ =
+                    store.set_session_summary(session_id, summary.as_deref().unwrap_or(""), target);
             } else {
                 match summarize_messages(llm_provider, summary.as_deref(), &pending).await {
                     Ok(new_summary) => {
@@ -414,6 +414,8 @@ fn build_tool_runtime(
         app_data_dir,
         workspaces,
         mode: effective_mode,
+        screenshot_max_dim: tools_cfg.screenshot_max_dim,
+        screenshot_jpeg_quality: tools_cfg.screenshot_jpeg_quality,
         llm_provider: Some(llm_provider.clone()),
         memory: Some(state.memory_store.clone()),
         personas: Some(state.personas.clone()),
@@ -520,10 +522,7 @@ fn reserve_session(
 ) -> Result<Arc<AtomicBool>, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut flags = state.cancel_flags.lock().map_err(|e| e.to_string())?;
-    if flags
-        .values()
-        .any(|active| active.session_id == session_id)
-    {
+    if flags.values().any(|active| active.session_id == session_id) {
         return Err("该会话正在生成中，请先停止或等待完成".to_string());
     }
     flags.insert(
@@ -654,7 +653,15 @@ async fn run_generation(
     let mut user_message_id: Option<String> = None;
     if persist && persist_user {
         let store = state.chat_store.lock().map_err(|e| e.to_string())?;
-        match store.add_message(&session_id, Role::User, &content, user_tokens, 0, None, None) {
+        match store.add_message(
+            &session_id,
+            Role::User,
+            &content,
+            user_tokens,
+            0,
+            None,
+            None,
+        ) {
             Ok(message) => user_message_id = Some(message.id),
             Err(e) => return Err(persist_failure(&store, &session_id, e)),
         }
@@ -722,7 +729,9 @@ async fn run_generation(
             Ok(mut embeddings) => match embeddings.pop() {
                 Some(query_embedding) => {
                     let mem_store = state.memory_store.lock().map_err(|e| e.to_string())?;
-                    mem_store.recall(&query_embedding, max_memories).unwrap_or_default()
+                    mem_store
+                        .recall(&query_embedding, max_memories)
+                        .unwrap_or_default()
                 }
                 None => Vec::new(),
             },
@@ -834,7 +843,10 @@ async fn run_generation(
         Ok(response) => response,
         Err(e) => {
             let message = e.to_string();
-            eprintln!("[chat] 生成失败 session={} stream={}: {}", session_id, stream_id, message);
+            eprintln!(
+                "[chat] 生成失败 session={} stream={}: {}",
+                session_id, stream_id, message
+            );
             // 出错也必须通知前端：否则前端会永远停在"正在生成"状态
             let _ = app.emit(
                 "stream-error",
@@ -953,7 +965,8 @@ async fn run_generation(
             if let Err(e) = store.record_tool_invocations(&rows) {
                 eprintln!("[harness] 工具轨迹落库失败: {}", e);
             }
-            if let Err(e) = store.attach_tool_invocations_to_message(&stream_id, &assistant_message.id)
+            if let Err(e) =
+                store.attach_tool_invocations_to_message(&stream_id, &assistant_message.id)
             {
                 eprintln!("[harness] 工具轨迹关联消息失败: {}", e);
             }
@@ -1115,7 +1128,9 @@ pub async fn preview_rewind(
             .preview_rewind(&session_id, &message_id, inclusive)
             .map_err(|e| e.to_string())?;
         // 快照清单失败只影响"文件数"展示，不阻断回退预览
-        let rows = store.list_session_snapshots(&session_id).unwrap_or_default();
+        let rows = store
+            .list_session_snapshots(&session_id)
+            .unwrap_or_default();
         (outcome, rows)
     };
 
@@ -1562,9 +1577,7 @@ pub async fn set_session_workspace(
 
 /// 查找或创建今日会话（优先复用空会话）
 #[tauri::command]
-pub async fn find_or_create_today_session(
-    state: State<'_, AppState>,
-) -> Result<Session, String> {
+pub async fn find_or_create_today_session(state: State<'_, AppState>) -> Result<Session, String> {
     let store = state.chat_store.lock().map_err(|e| e.to_string())?;
 
     // 1. 优先查找最近的空会话（无消息），直接复用。必须是普通会话：
@@ -1628,9 +1641,7 @@ pub async fn get_messages(
     let store = state.chat_store.clone();
     tokio::task::spawn_blocking(move || {
         let store = store.lock().map_err(|e| e.to_string())?;
-        store
-            .get_messages(&session_id)
-            .map_err(|e| e.to_string())
+        store.get_messages(&session_id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("读取消息失败：{}", e))?
@@ -1674,9 +1685,7 @@ pub async fn delete_session(
     let store = state.chat_store.lock().map_err(|e| e.to_string())?;
     // 快照索引行会随会话级联删除，但磁盘上的备份目录不会：
     // 必须在删行前把 stream 清单取出来，删完会话后清理目录
-    let snapshot_streams = store
-        .list_snapshot_streams(&session_id)
-        .unwrap_or_default();
+    let snapshot_streams = store.list_snapshot_streams(&session_id).unwrap_or_default();
     store
         .delete_session(&session_id)
         .map_err(|e| e.to_string())?;
@@ -1819,9 +1828,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conn = crate::store::db::init_db(&dir).unwrap();
         let store = ChatStore::new(conn);
-        store.create_session("konata-default", "t", None, None, None).unwrap();
+        store
+            .create_session("konata-default", "t", None, None, None)
+            .unwrap();
         let session_id = store.list_sessions().unwrap()[0].id.clone();
-        store.set_session_summary(&session_id, "之前聊过猫", 3).unwrap();
+        store
+            .set_session_summary(&session_id, "之前聊过猫", 3)
+            .unwrap();
 
         let (summary, count) = read_summary(&store, &session_id);
         assert_eq!(summary.as_deref(), Some("之前聊过猫"));
@@ -1877,7 +1890,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_payload_carries_session_and_stream_id() {        let payload = stream_payload("sess-1", "stream-1", "你好");
+    fn stream_payload_carries_session_and_stream_id() {
+        let payload = stream_payload("sess-1", "stream-1", "你好");
         assert_eq!(payload["session_id"], "sess-1");
         assert_eq!(payload["stream_id"], "stream-1");
         assert_eq!(payload["data"], "你好");
@@ -1887,10 +1901,7 @@ mod tests {
 
     #[test]
     fn build_retrieval_query_puts_current_input_last() {
-        let conversation = vec![
-            msg(Role::User, "旧问题"),
-            msg(Role::Assistant, "旧回答"),
-        ];
+        let conversation = vec![msg(Role::User, "旧问题"), msg(Role::Assistant, "旧回答")];
         let query = build_retrieval_query("新问题", &conversation);
         assert!(query.ends_with("新问题"));
         assert!(query.contains("旧问题"));

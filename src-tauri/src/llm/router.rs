@@ -152,11 +152,16 @@ impl ModelPlan {
     /// 便于子代理卡片显示实际使用的模型。
     pub fn child_models(&self) -> Vec<ChildModel> {
         if self.subs.is_empty() {
-            return vec![ChildModel::new(self.main_backend(), self.main.model.clone())];
+            return vec![ChildModel::new(
+                self.main_backend(),
+                self.main.model.clone(),
+            )];
         }
         self.subs
             .iter()
-            .map(|provider| ChildModel::new(backend_for(provider, self.thinking), provider.model.clone()))
+            .map(|provider| {
+                ChildModel::new(backend_for(provider, self.thinking), provider.model.clone())
+            })
             .collect()
     }
 
@@ -291,10 +296,7 @@ fn resolve_auto(cfg: &AppConfig, thinking: Option<bool>, task_mode: &str) -> Mod
         match provider_by_id(cfg, &sub.provider_id) {
             Some(provider) => subs.push(with_model(provider, &sub.model)),
             None => {
-                eprintln!(
-                    "[models] 子模型 {} 引用的提供商不存在，已跳过",
-                    sub.label()
-                );
+                eprintln!("[models] 子模型 {} 引用的提供商不存在，已跳过", sub.label());
                 degraded = true;
             }
         }
@@ -485,10 +487,7 @@ mod tests {
     fn empty_model_ids_degrade_instead_of_being_sent() {
         let (mut cfg, a_id, b_id) = auto_config();
         cfg.models.main = Some(ModelRef::new(a_id.clone(), "   "));
-        cfg.models.subs = vec![
-            ModelRef::new(b_id, ""),
-            ModelRef::new(a_id, "a-fast"),
-        ];
+        cfg.models.subs = vec![ModelRef::new(b_id, ""), ModelRef::new(a_id, "a-fast")];
 
         let plan = resolve(&cfg, Some(&SessionModelPref::auto()), "task", "work");
         assert_eq!(
@@ -523,7 +522,9 @@ mod tests {
 
         // 用户显式声明的模型同样生效
         provider.model = "my-private-model".to_string();
-        provider.thinking_models.push("my-private-model".to_string());
+        provider
+            .thinking_models
+            .push("my-private-model".to_string());
         assert_eq!(overrides_for(&provider, Some(true)).thinking, Some(true));
     }
 

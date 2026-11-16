@@ -60,8 +60,7 @@ impl ToolRegistry {
     pub fn excluding(mut self, names: &[&str]) -> Self {
         self.tools
             .retain(|tool| !names.contains(&tool.descriptor().name));
-        self.by_name
-            .retain(|name, _| !names.contains(name));
+        self.by_name.retain(|name, _| !names.contains(name));
         self
     }
 
@@ -144,13 +143,19 @@ impl ToolRegistry {
             .iter()
             .map(|tool| {
                 let d = tool.descriptor();
+                let tool_enabled = tool.enabled();
                 ToolInfo {
                     name: d.name.to_string(),
                     label: d.label.to_string(),
                     description: d.description.clone(),
                     permission: d.permission,
                     read_only: d.permission.is_read_only(),
-                    enabled: tool.enabled() && d.permission.visible_in(mode),
+                    enabled: tool_enabled && d.permission.visible_in(mode),
+                    unavailable_reason: if tool_enabled {
+                        None
+                    } else {
+                        tool.unavailable_reason()
+                    },
                 }
             })
             .collect();
@@ -170,7 +175,8 @@ impl ToolRegistry {
         plan_network: bool,
     ) -> Option<Arc<dyn Tool>> {
         let tool = self.by_name.get(name)?;
-        if !tool.enabled() || !permission_visible(&tool.descriptor().permission, mode, plan_network) {
+        if !tool.enabled() || !permission_visible(&tool.descriptor().permission, mode, plan_network)
+        {
             return None;
         }
         Some(tool.clone())
@@ -181,6 +187,10 @@ impl ToolRegistry {
     }
 
     /// 描述该工具是否需要审批
+    pub fn contains_tool(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
     pub fn permission_of(&self, name: &str) -> Option<Permission> {
         self.by_name.get(name).map(|t| t.descriptor().permission)
     }
@@ -241,9 +251,15 @@ mod tests {
     fn plan_network_exception_only_opens_network_tools() {
         let reg = registry();
         assert!(reg.find("net_thing", ToolMode::ReadOnly).is_none());
-        assert!(reg.find_with("net_thing", ToolMode::ReadOnly, true).is_some());
-        assert!(reg.find_with("write_thing", ToolMode::ReadOnly, true).is_none());
-        assert!(reg.find_with("run_thing", ToolMode::ReadOnly, true).is_none());
+        assert!(reg
+            .find_with("net_thing", ToolMode::ReadOnly, true)
+            .is_some());
+        assert!(reg
+            .find_with("write_thing", ToolMode::ReadOnly, true)
+            .is_none());
+        assert!(reg
+            .find_with("run_thing", ToolMode::ReadOnly, true)
+            .is_none());
         let names = reg.visible_names_with(ToolMode::ReadOnly, true);
         assert!(names.contains(&"net_thing".to_string()));
         assert!(names.contains(&"read_thing".to_string()));

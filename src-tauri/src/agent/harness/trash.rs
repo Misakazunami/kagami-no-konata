@@ -69,8 +69,12 @@ pub fn move_to_trash(target: &Path) -> Result<PathBuf> {
     // trash crate 在 Windows 上走 IFileOperation（与资源管理器同一个回收站），
     // 目录会被递归回收。回收站不可用的卷（网络盘/FAT）会返回错误——保持
     // fail-closed，绝不退化成"永久删除"。
-    ::trash::delete(target)
-        .map_err(|e| anyhow::anyhow!("移入回收站失败：{}（如需永久删除请显式设置 permanent=true）", e))?;
+    ::trash::delete(target).map_err(|e| {
+        anyhow::anyhow!(
+            "移入回收站失败：{}（如需永久删除请显式设置 permanent=true）",
+            e
+        )
+    })?;
     Ok(target.to_path_buf())
 }
 
@@ -90,8 +94,10 @@ pub fn move_to_trash(target: &Path) -> Result<PathBuf> {
 /// 否则测试要么污染用户真实回收站、要么去改 `XDG_DATA_HOME` 这个全局变量
 /// （并行跑测试时会互相打架）。
 fn move_to_trash_in(target: &Path, files_dir: &Path, info_dir: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(files_dir).with_context(|| format!("创建回收站目录失败：{}", files_dir.display()))?;
-    fs::create_dir_all(info_dir).with_context(|| format!("创建回收站信息目录失败：{}", info_dir.display()))?;
+    fs::create_dir_all(files_dir)
+        .with_context(|| format!("创建回收站目录失败：{}", files_dir.display()))?;
+    fs::create_dir_all(info_dir)
+        .with_context(|| format!("创建回收站信息目录失败：{}", info_dir.display()))?;
 
     let name = target
         .file_name()
@@ -151,13 +157,12 @@ fn move_to_trash_in(target: &Path, files_dir: &Path, info_dir: &Path) -> Result<
 
 /// 永久删除（调用方必须已经在审批里明确告知用户）
 pub fn remove_permanently(target: &Path) -> Result<()> {
-    remove_any(target)
-        .with_context(|| format!("永久删除失败：{}", target.display()))
+    remove_any(target).with_context(|| format!("永久删除失败：{}", target.display()))
 }
 
 fn remove_any(target: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(target)
-        .with_context(|| format!("无法读取 {}", target.display()))?;
+    let metadata =
+        fs::symlink_metadata(target).with_context(|| format!("无法读取 {}", target.display()))?;
     if metadata.is_dir() {
         fs::remove_dir_all(target).map_err(|e| anyhow::anyhow!(e))
     } else {
@@ -202,16 +207,12 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 #[cfg(unix)]
 fn copy_symlink(from: &Path, to: &Path) -> Result<()> {
     let target = fs::read_link(from)?;
-    std::os::unix::fs::symlink(&target, to)
-        .map_err(|e| anyhow::anyhow!("创建符号链接失败：{}", e))
+    std::os::unix::fs::symlink(&target, to).map_err(|e| anyhow::anyhow!("创建符号链接失败：{}", e))
 }
 
 #[cfg(not(unix))]
 fn copy_symlink(from: &Path, _to: &Path) -> Result<()> {
-    anyhow::bail!(
-        "暂不支持跨卷移动包含符号链接的目录：{}",
-        from.display()
-    )
+    anyhow::bail!("暂不支持跨卷移动包含符号链接的目录：{}", from.display())
 }
 
 /// 找一个还没被占用的条目名并**原子占位**
@@ -229,9 +230,8 @@ fn pick_free_name(
     name: &str,
     is_dir: bool,
 ) -> Result<(String, PathBuf, PathBuf)> {
-    let candidates = std::iter::once(name.to_string()).chain(
-        (0..64).map(|_| format!("{}.{}", name, uuid::Uuid::new_v4().simple())),
-    );
+    let candidates = std::iter::once(name.to_string())
+        .chain((0..64).map(|_| format!("{}.{}", name, uuid::Uuid::new_v4().simple())));
     for candidate in candidates {
         let files_path = files_dir.join(&candidate);
         let info_path = info_dir.join(format!("{}.trashinfo", candidate));
@@ -266,11 +266,13 @@ fn trash_root() -> Result<PathBuf> {
         if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
             return Ok(PathBuf::from(data_home).join("Trash"));
         }
-        let home = home_dir().ok_or_else(|| anyhow::anyhow!("无法确定用户主目录（HOME 未设置）"))?;
+        let home =
+            home_dir().ok_or_else(|| anyhow::anyhow!("无法确定用户主目录（HOME 未设置）"))?;
         return Ok(home.join(".local").join("share").join("Trash"));
     }
     if cfg!(target_os = "macos") {
-        let home = home_dir().ok_or_else(|| anyhow::anyhow!("无法确定用户主目录（HOME 未设置）"))?;
+        let home =
+            home_dir().ok_or_else(|| anyhow::anyhow!("无法确定用户主目录（HOME 未设置）"))?;
         return Ok(home.join(".Trash"));
     }
     anyhow::bail!("{}", unsupported_reason())
@@ -305,8 +307,7 @@ fn encode_path(path: &Path) -> String {
 
     let mut out = String::with_capacity(bytes.len() + 8);
     for byte in bytes {
-        let keep = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~');
+        let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~');
         if keep {
             out.push(byte as char);
         } else {
@@ -335,8 +336,8 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("konata-trash-{}-{}", tag, uuid::Uuid::new_v4()));
+            let root =
+                std::env::temp_dir().join(format!("konata-trash-{}-{}", tag, uuid::Uuid::new_v4()));
             let files_dir = root.join("Trash/files");
             let info_dir = root.join("Trash/info");
             std::fs::create_dir_all(&root).unwrap();
@@ -444,7 +445,10 @@ mod tests {
             encode_path(Path::new("/home/me/a b.txt")),
             "/home/me/a%20b.txt"
         );
-        assert_eq!(encode_path(Path::new("/tmp/中文.txt")), "/tmp/%E4%B8%AD%E6%96%87.txt");
+        assert_eq!(
+            encode_path(Path::new("/tmp/中文.txt")),
+            "/tmp/%E4%B8%AD%E6%96%87.txt"
+        );
         // 安全字符保持原样，便于人读
         assert_eq!(encode_path(Path::new("/a-b_c.d~e/f")), "/a-b_c.d~e/f");
     }

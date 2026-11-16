@@ -58,7 +58,7 @@ pub fn dedupe_trailing_input<'a>(
     match conversation.last() {
         Some(last)
             if last.role == crate::agent::context::Role::User
-                && strip_think_tags(&last.content) == user_input =>
+                && strip_think_tags(last.content_as_str()) == user_input =>
         {
             &conversation[..conversation.len() - 1]
         }
@@ -283,7 +283,7 @@ impl ChatAgent {
         for msg in history {
             messages.push(LlmMessage {
                 role: msg.role.to_string(),
-                content: strip_think_tags(&msg.content),
+                content: crate::llm::types::MessageContent::Text(strip_think_tags(&msg.content)),
                 ..Default::default()
             });
         }
@@ -410,7 +410,9 @@ impl Agent for ChatAgent {
                     eprintln!("[harness] 提供商不支持工具调用，降级为纯对话：{}", e);
                     let plain = plain_context(ctx);
                     let messages = self.build_messages(&plain)?;
-                    return self.plain_stream_response(&main_backend, messages, None).await;
+                    return self
+                        .plain_stream_response(&main_backend, messages, None)
+                        .await;
                 }
                 Err(e) => return Err(e),
             }
@@ -425,7 +427,7 @@ impl Agent for ChatAgent {
                 StreamChunk::Content(text) => full_response.push_str(&text),
                 StreamChunk::Thinking(_) => {} // 非流式模式下忽略思考内容
                 StreamChunk::ToolCallDelta(_) => {} // 未启用工具时不会出现
-                StreamChunk::Finish(_) => {} // 结束原因只对工具循环有意义
+                StreamChunk::Finish(_) => {}   // 结束原因只对工具循环有意义
             }
         }
 
@@ -536,10 +538,7 @@ impl ChatAgent {
                     if full_response.trim().is_empty() {
                         return Err(e);
                     }
-                    let note = format!(
-                        "\n\n（连接中断：{}。以上为已生成的部分内容）",
-                        e
-                    );
+                    let note = format!("\n\n（连接中断：{}。以上为已生成的部分内容）", e);
                     full_response.push_str(&note);
                     if let Some((_, on_chunk, _)) = &callbacks {
                         on_chunk(&note);
@@ -601,10 +600,7 @@ mod tests {
 
     #[test]
     fn dedupe_keeps_history_when_no_duplicate() {
-        let conv = vec![
-            msg(Role::User, "你好"),
-            msg(Role::Assistant, "你好呀～"),
-        ];
+        let conv = vec![msg(Role::User, "你好"), msg(Role::Assistant, "你好呀～")];
         let out = dedupe_trailing_input(&conv, "新问题");
         assert_eq!(out.len(), 2);
     }
@@ -673,11 +669,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("konata-agent-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = ToolConfig::with_single_root(
-            &dir,
-            true,
-            "应用工作区",
-        );
+        let cfg = ToolConfig::with_single_root(&dir, true, "应用工作区");
         let set = WorkspaceSet::from_config(&cfg, &dir);
         ToolRuntime {
             services: ToolServices::minimal(dir.clone(), set, ToolMode::Standard),
@@ -705,14 +697,17 @@ mod tests {
         let plain = base_ctx("你好", vec![]);
         let messages = agent.build_messages(&plain).unwrap();
         assert!(
-            !messages[0].content.contains("【工具使用规则】"),
+            !messages[0]
+                .content
+                .content_as_str()
+                .contains("【工具使用规则】"),
             "纯对话（悬浮窗）链路不得注入工具规则"
         );
 
         let mut with_tools = base_ctx("你好", vec![]);
         with_tools.tools = Some(test_runtime());
         let messages = agent.build_messages(&with_tools).unwrap();
-        let system = &messages[0].content;
+        let system = messages[0].content.content_as_str();
         assert!(system.contains("【工具使用规则】"));
         assert!(system.contains("不会保留到下一轮"));
         assert!(system.contains("untrusted"));
@@ -744,7 +739,10 @@ mod tests {
         plain.plan = Some(plan.clone());
         let messages = agent.build_messages(&plain).unwrap();
         assert!(
-            !messages[0].content.contains("【当前任务计划】"),
+            !messages[0]
+                .content
+                .content_as_str()
+                .contains("【当前任务计划】"),
             "纯对话链路不得注入计划"
         );
 
@@ -753,7 +751,7 @@ mod tests {
         with_tools.tools = Some(test_runtime());
         with_tools.plan = Some(plan);
         let messages = agent.build_messages(&with_tools).unwrap();
-        let system = &messages[0].content;
+        let system = messages[0].content.content_as_str();
         let rules_at = system.find("【工具使用规则】").expect("工具规则");
         let plan_at = system.find("【当前任务计划】").expect("计划段落");
         assert!(plan_at > rules_at, "计划应排在工具规则之后");
@@ -774,7 +772,7 @@ mod tests {
         task.task_mode = "work".to_string();
         task.tools = Some(test_runtime());
         let messages = agent.build_messages(&task).unwrap();
-        let system = &messages[0].content;
+        let system = messages[0].content.content_as_str();
 
         // 任务模式的规则仍在，且人设块也在（历史实现只有名字）
         assert!(system.contains("# 运行模式：专业技术任务智能体"));
@@ -788,7 +786,8 @@ mod tests {
 
         // 对话链路不注入任务模式的规则
         let chat = base_ctx("你好", vec![]);
-        let chat_system = &agent.build_messages(&chat).unwrap()[0].content;
+        let chat_messages = agent.build_messages(&chat).unwrap();
+        let chat_system = chat_messages[0].content.content_as_str();
         assert!(!chat_system.contains("# 运行模式：专业技术任务智能体"));
     }
 
@@ -800,7 +799,8 @@ mod tests {
         let mut task = base_ctx("你好", vec![]);
         task.session_type = "task".to_string();
         task.persona_id = "被删掉的人格".to_string();
-        let system = &agent.build_messages(&task).unwrap()[0].content;
+        let task_messages = agent.build_messages(&task).unwrap();
+        let system = task_messages[0].content.content_as_str();
 
         assert!(system.contains("### 角色原始设定"), "{system}");
         assert!(system.contains("全名泉此方"), "应回退到内置默认人格");
@@ -956,7 +956,10 @@ mod tests {
         let mut ctx = base_ctx("你好", vec![]);
         ctx.tools = Some(test_runtime());
         let messages = agent.build_messages(&ctx).unwrap();
-        assert!(messages[0].content.contains("没有任何可用工具"));
+        assert!(messages[0]
+            .content
+            .content_as_str()
+            .contains("没有任何可用工具"));
     }
 
     #[test]
@@ -978,7 +981,7 @@ mod tests {
         let user_contents: Vec<&str> = messages
             .iter()
             .filter(|m| m.role == "user")
-            .map(|m| m.content.as_str())
+            .map(|m| m.content.content_as_str())
             .collect();
         assert_eq!(
             user_contents,
@@ -996,7 +999,7 @@ mod tests {
 
         assert_eq!(messages.len(), 2); // system + user
         assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[1].content, "问题\n【保持简短】");
+        assert_eq!(messages[1].content.content_as_str(), "问题\n【保持简短】");
     }
 
     #[test]
@@ -1019,7 +1022,7 @@ mod tests {
         }];
 
         let messages = agent.build_messages(&ctx).expect("messages");
-        let sys = &messages[0].content;
+        let sys = messages[0].content.content_as_str();
         assert!(sys.contains("【之前的对话摘要】"));
         assert!(sys.contains("关于用户的记忆"));
         assert!(sys.contains("偏好"));
@@ -1047,7 +1050,7 @@ mod tests {
         }];
 
         let messages = agent.build_messages(&ctx).expect("messages");
-        let sys = &messages[0].content;
+        let sys = messages[0].content.content_as_str();
         assert!(sys.contains("<untrusted>"), "{sys}");
         assert_eq!(
             sys.matches("</untrusted>").count(),

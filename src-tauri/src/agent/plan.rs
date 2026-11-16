@@ -159,7 +159,9 @@ impl SessionPlan {
             return None;
         }
         let mut out = String::from("\n\n【当前任务计划】\n");
-        out.push_str("（这是你自己维护的进度，用户也看得到。完成一步就更新它，不要在没有进展时反复改写）\n");
+        out.push_str(
+            "（这是你自己维护的进度，用户也看得到。完成一步就更新它，不要在没有进展时反复改写）\n",
+        );
         for (index, item) in self.items.iter().enumerate() {
             out.push_str(&format!(
                 "{}. {} {}\n",
@@ -284,12 +286,15 @@ mod tests {
         assert!(section.contains("[ ] 跑测试"), "{section}");
         assert!(section.contains("备注：等用户确认范围"), "{section}");
         // 空计划不注入任何东西（避免污染纯聊天链路的提示词）
-        assert!(SessionPlan::new(Vec::new(), None).prompt_section().is_none());
+        assert!(SessionPlan::new(Vec::new(), None)
+            .prompt_section()
+            .is_none());
     }
 
     #[test]
     fn sanitize_accepts_plain_strings_and_objects() {
-        let items = sanitize_items(&json!(["读代码", {"title": "改实现", "status": "doing"}])).unwrap();
+        let items =
+            sanitize_items(&json!(["读代码", {"title": "改实现", "status": "doing"}])).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].status, PlanStatus::Pending);
         assert_eq!(items[1].status, PlanStatus::Doing);
@@ -298,7 +303,10 @@ mod tests {
     #[test]
     fn sanitize_rejects_junk() {
         assert!(sanitize_items(&json!("不是数组")).is_err());
-        assert!(sanitize_items(&json!([{"status": "done"}])).is_err(), "缺标题要报错");
+        assert!(
+            sanitize_items(&json!([{"status": "done"}])).is_err(),
+            "缺标题要报错"
+        );
         assert!(sanitize_items(&json!([1, 2])).is_err());
         let too_many: Vec<String> = (0..MAX_PLAN_ITEMS + 1).map(|i| format!("项 {i}")).collect();
         assert!(sanitize_items(&json!(too_many)).is_err(), "超上限要报错");

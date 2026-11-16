@@ -130,7 +130,10 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     let tmp = dir.join(format!(".persona-tmp-{}", uuid::Uuid::new_v4()));
     {
         let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        if let Err(e) = file.write_all(content.as_bytes()).and_then(|_| file.sync_all()) {
+        if let Err(e) = file
+            .write_all(content.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
             drop(file);
             let _ = fs::remove_file(&tmp);
             return Err(e.to_string());
@@ -289,10 +292,7 @@ pub async fn save_persona(
 
 /// 删除用户自定义人格
 #[tauri::command]
-pub async fn delete_persona(
-    state: State<'_, AppState>,
-    persona_id: String,
-) -> Result<(), String> {
+pub async fn delete_persona(state: State<'_, AppState>, persona_id: String) -> Result<(), String> {
     validate_persona_id(&persona_id)?;
 
     let dir = personas_dir(&state.app_data_dir);
@@ -300,7 +300,10 @@ pub async fn delete_persona(
     if let Some(file_path) = find_user_persona_file(&dir, &persona_id) {
         fs::remove_file(&file_path).map_err(|e| e.to_string())?;
         // 热重载：删除的人格立即从聊天中移除
-        state.dispatcher.chat_agent().reload_personas(&state.app_data_dir);
+        state
+            .dispatcher
+            .chat_agent()
+            .reload_personas(&state.app_data_dir);
         Ok(())
     } else if persona_id == DEFAULT_PERSONA_ID {
         Err("该人格为内置人格，无法删除".to_string())
@@ -343,7 +346,10 @@ mod tests {
 
         assert!(is_inside_dir(&dir, &dir.join("ok.yaml")));
         assert!(!is_inside_dir(&dir, &dir.join("../escaped.yaml")));
-        assert!(!is_inside_dir(&dir, Path::new("/tmp/absolutely-outside.yaml")));
+        assert!(!is_inside_dir(
+            &dir,
+            Path::new("/tmp/absolutely-outside.yaml")
+        ));
         assert!(!is_inside_dir(&dir, &root.join("sibling.yaml")));
 
         let _ = fs::remove_dir_all(&root);

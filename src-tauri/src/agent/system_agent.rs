@@ -120,10 +120,7 @@ impl Agent for SystemAgent {
 
         match tool.call(json!({}), &cx).await {
             Ok(output) => Ok(AgentResponse::text(output.content)),
-            Err(e) => Ok(AgentResponse::text(format!(
-                "系统指令执行失败：{}",
-                e
-            ))),
+            Err(e) => Ok(AgentResponse::text(format!("系统指令执行失败：{}", e))),
         }
     }
 
@@ -155,11 +152,17 @@ mod tests {
     #[test]
     fn sys_registry_is_read_only() {
         let registry = sys_registry();
-        assert!(registry.find("get_current_time", crate::config::types::ToolMode::Full).is_some());
+        assert!(registry
+            .find("get_current_time", crate::config::types::ToolMode::Full)
+            .is_some());
         assert!(
-            registry.find("write_file", crate::config::types::ToolMode::Full).is_none(),
+            registry
+                .find("write_file", crate::config::types::ToolMode::Full)
+                .is_none(),
             "系统指令不得触碰写入类工具"
         );
-        assert!(registry.find("run_command", crate::config::types::ToolMode::Full).is_none());
+        assert!(registry
+            .find("run_command", crate::config::types::ToolMode::Full)
+            .is_none());
     }
 }
