@@ -1508,7 +1508,7 @@ mod tests {
         let workspace =
             std::path::Path::new("/home/user/.local/share/com.konata-mirror.main/workspace");
         for pattern in PLATFORM_DENY_GLOBS {
-            let matcher = globset::Glob::new(*pattern)
+            let matcher = globset::Glob::new(pattern)
                 .expect("平台模式必须是合法 glob")
                 .compile_matcher();
             assert!(

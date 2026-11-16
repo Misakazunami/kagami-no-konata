@@ -110,10 +110,14 @@ unsafe fn load_library() -> Result<LayerShellLib> {
                     .get::<GtkLayerSetMonitor>(c"gtk_layer_set_monitor".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_set_monitor")?;
                 let set_exclusive_zone = *library
-                    .get::<GtkLayerSetExclusiveZone>(c"gtk_layer_set_exclusive_zone".to_bytes_with_nul())
+                    .get::<GtkLayerSetExclusiveZone>(
+                        c"gtk_layer_set_exclusive_zone".to_bytes_with_nul(),
+                    )
                     .context("库缺少 gtk_layer_set_exclusive_zone")?;
                 let set_keyboard_mode = *library
-                    .get::<GtkLayerSetKeyboardMode>(c"gtk_layer_set_keyboard_mode".to_bytes_with_nul())
+                    .get::<GtkLayerSetKeyboardMode>(
+                        c"gtk_layer_set_keyboard_mode".to_bytes_with_nul(),
+                    )
                     .context("库缺少 gtk_layer_set_keyboard_mode")?;
 
                 return Ok(LayerShellLib {
