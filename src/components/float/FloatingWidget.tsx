@@ -288,10 +288,14 @@ export function FloatingWidget() {
           let isDrag = false;
           let nativeStarted = false;
 
-          try {
-            target.setPointerCapture(pointerId);
-          } catch {
-            // 某些 WebKitGTK 版本不支持 pointer capture；退化为窗口内拖拽
+          // 只有 layer-shell 需要 pointer capture：窗口移动后指针仍要在
+          // 同一表面上继续收到增量。原生拖拽交给 OS，capture 反而可能干扰。
+          if (layerShellDrag) {
+            try {
+              target.setPointerCapture(pointerId);
+            } catch {
+              // 某些 WebKitGTK 版本不支持 pointer capture；退化为窗口内拖拽
+            }
           }
 
           const handleMove = (ev: PointerEvent) => {

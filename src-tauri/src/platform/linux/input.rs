@@ -9,7 +9,7 @@
 //! 或线程退出都会把能力写回 false，并广播明确原因。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -98,8 +98,15 @@ fn run(app: tauri::AppHandle) {
     // 注意：这里不能在 tokio runtime 上下文中调用 Enigo::new；它的
     // libei_tokio 后端在检测到已有 runtime 时会退回 futures::executor，
     // 反而无法驱动门户的异步 IO。独立 std 线程是正确边界。
-    match Enigo::new(&Settings::default()) {
-        Ok(mut enigo) => {
+    //
+    // enigo 内部对门户错误有 unwrap；用 catch_unwind 兜住，至少把明确
+    // 失败回报给前端，而不是让线程静默消失。
+    let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Enigo::new(&Settings::default())
+    }));
+
+    match init {
+        Ok(Ok(mut enigo)) => {
             let (tx, rx) = mpsc::channel();
             if let Ok(mut slot) = sender_slot().lock() {
                 *slot = Some(tx);
@@ -120,19 +127,26 @@ fn run(app: tauri::AppHandle) {
                         .send(Err("输入命令已超时，未执行".to_string()));
                     continue;
                 }
-                execute(&mut enigo, request.command);
+                let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute(&mut enigo, request.command);
+                }));
+                if executed.is_err() {
+                    publish(
+                        &app,
+                        false,
+                        "Wayland EIS 输入线程在模拟输入时崩溃，已停止；\
+                         请重启应用重新授权，并考虑改用 X11/Xorg 会话。"
+                            .to_string(),
+                    );
+                    break;
+                }
             }
 
             if let Ok(mut slot) = sender_slot().lock() {
                 *slot = None;
             }
-            publish(
-                &app,
-                false,
-                "Wayland EIS 输入服务已停止；如需恢复请重启应用并重新授权。".to_string(),
-            );
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             publish(
                 &app,
                 false,
@@ -141,6 +155,15 @@ fn run(app: tauri::AppHandle) {
                      RemoteDesktop/ConnectToEIS、用户拒绝授权或会话被取消；\
                      需要完整桌面控制请改用 X11/Xorg 会话。"
                 ),
+            );
+        }
+        Err(_) => {
+            publish(
+                &app,
+                false,
+                "Wayland EIS 键鼠输入初始化时发生内部 panic；已停止。\
+                 请查看日志并改用 X11/Xorg 会话，或向项目反馈。"
+                    .to_string(),
             );
         }
     }
@@ -217,10 +240,13 @@ fn dispatch(build: impl FnOnce(Reply) -> Command) -> Result<()> {
     match rx.recv_timeout(COMMAND_TIMEOUT) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(anyhow!("{err}")),
-        Err(_) => Err(anyhow!(
+        Err(RecvTimeoutError::Timeout) => Err(anyhow!(
             "Wayland EIS 输入命令超时（{} 秒）：合成器或门户没有响应",
             COMMAND_TIMEOUT.as_secs()
         )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("Wayland EIS 输入线程已停止；请重启应用重新授权"))
+        }
     }
 }
 

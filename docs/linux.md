@@ -22,15 +22,18 @@ sudo apt-get install -y \
   build-essential curl wget file \
   libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
   librsvg2-dev libxdo-dev libxcb1-dev libxrandr-dev \
-  libdbus-1-dev libssl-dev patchelf rpm
+  libdbus-1-dev libssl-dev libxkbcommon-dev patchelf rpm
 ```
 
 说明：
 
 - `libxdo-dev`：`enigo` 的 X11 键鼠后端。
+- `libxkbcommon-dev`：`enigo` 的 libei/EIS 后端（Wayland 键鼠注入）在编译期需要。
 - `libxcb1-dev` / `libxrandr-dev`：`screenshots` 的 X11 截图后端。
 - `libayatana-appindicator3-dev`：系统托盘。
 - `rpm`：仅在需要构建 `.rpm` 时安装。
+
+> Wayland layer-shell 定位（P3.3）运行时才 `dlopen` `libgtk-layer-shell.so.0`，不参与编译依赖；需要该能力时再安装 `libgtk-layer-shell0`（Debian/Ubuntu）或 `gtk-layer-shell`（Fedora/Arch）。
 
 还需要：
 

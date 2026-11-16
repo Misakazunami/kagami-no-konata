@@ -970,28 +970,38 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kill_child_tree_reaps_grandchildren() {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg("sleep 30 & echo $!; wait")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        cmd.process_group(0);
+        // tokio::process::Command 的 spawn 必须在 runtime 上下文中调用；
+        // 否则 Unix 后端会 panic（there is no reactor running）。
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        let mut child = cmd.spawn().expect("spawn sh");
-        let mut stdout = child.stdout.take().expect("stdout");
-        let mut reader = BufReader::new(&mut stdout);
-        let mut line = String::new();
-        let grandchild: i32 = block_on(async {
+        let (grandchild, status) = runtime.block_on(async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg("sleep 30 & echo $!; wait")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            cmd.process_group(0);
+
+            let mut child = cmd.spawn().expect("spawn sh");
+            let mut stdout = child.stdout.take().expect("stdout");
+            let mut reader = BufReader::new(&mut stdout);
+            let mut line = String::new();
             reader.read_line(&mut line).await.expect("read pid");
-            line.trim().parse().expect("pid")
+            let grandchild: i32 = line.trim().parse().expect("pid");
+
+            kill_child_tree(&mut child);
+            let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .expect("sh 必须退出")
+                .expect("wait");
+            (grandchild, status)
         });
 
-        kill_child_tree(&mut child);
-        let status = block_on(tokio::time::timeout(Duration::from_secs(3), child.wait()))
-            .expect("sh 必须退出")
-            .expect("wait");
         assert!(!status.success(), "被 SIGKILL 的进程不应成功退出");
 
         // 僵尸进程也算“已停止”；只要不是 R/S/D 等运行态即可。

@@ -61,8 +61,8 @@ struct LayerShellLib {
 }
 
 // 安全前提：所有 GTK 符号只在主线程调用；Library 本身在初始化后只读。
-unsafe impl Send for LayerShellLib {}
-unsafe impl Sync for LayerShellLib {}
+// LayerShellLib 只包含 Library 与函数指针，二者都已实现 Send + Sync，
+// 因此不需要也不应该再手写 unsafe impl（会与自动实现冲突）。
 
 /// 是否已经成功初始化并持有窗口指针。
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -212,6 +212,9 @@ pub fn init(window: &gtk::ApplicationWindow) -> Result<()> {
         (lib.set_keyboard_mode)(ptr, KEYBOARD_MODE_ON_DEMAND);
         (lib.set_monitor)(ptr, monitor.to_glib_none().0);
     }
+    // gtk-layer-shell 可能保留 namespace 指针；这个字符串只初始化一次，
+    // 直接泄漏到进程结束，避免 CString 析构后留下悬空指针。
+    std::mem::forget(namespace);
 
     MONITOR_W.store(monitor_w, Ordering::Release);
     MONITOR_H.store(monitor_h, Ordering::Release);
@@ -227,21 +230,33 @@ pub fn position(position: &str) -> bool {
     if !is_ready() {
         return false;
     }
-    let monitor_w = MONITOR_W.load(Ordering::Acquire);
-    let monitor_h = MONITOR_H.load(Ordering::Acquire);
-    let win_w = WIN_W.load(Ordering::Acquire);
-    let win_h = WIN_H.load(Ordering::Acquire);
+    let (x, y) = preset_position(
+        position,
+        MONITOR_W.load(Ordering::Acquire),
+        MONITOR_H.load(Ordering::Acquire),
+        WIN_W.load(Ordering::Acquire),
+        WIN_H.load(Ordering::Acquire),
+    );
+    set_position(x, y);
+    true
+}
 
-    let (x, y) = match position {
+/// 纯函数：根据显示器/窗口尺寸计算预设角落的 left/top 边距。
+fn preset_position(
+    position: &str,
+    monitor_w: i32,
+    monitor_h: i32,
+    win_w: i32,
+    win_h: i32,
+) -> (i32, i32) {
+    match position {
         "top-left" => (MARGIN, MARGIN),
         "top-center" => ((monitor_w - win_w) / 2, MARGIN),
         "top-right" => (monitor_w - win_w - MARGIN, MARGIN),
         "bottom-left" => (MARGIN, monitor_h - win_h - MARGIN),
         "bottom-center" => ((monitor_w - win_w) / 2, monitor_h - win_h - MARGIN),
         _ => (monitor_w - win_w - MARGIN, monitor_h - win_h - MARGIN), // bottom-right
-    };
-    set_position(x, y);
-    true
+    }
 }
 
 /// 按逻辑像素增量移动窗口。返回错误时前端应停止拖拽并提示。
@@ -256,6 +271,7 @@ pub fn move_by(dx: i32, dy: i32) -> Result<()> {
 }
 
 /// 当前边距（仅测试/诊断用）。
+#[allow(dead_code)]
 pub fn current_position() -> Option<(i32, i32)> {
     if !is_ready() {
         return None;
@@ -306,13 +322,7 @@ mod tests {
 
     #[test]
     fn corner_presets_stay_inside_monitor() {
-        // 纯计算逻辑通过临时设置静态状态验证；测试进程内不会真的调用 GTK。
-        MONITOR_W.store(1920, Ordering::Release);
-        MONITOR_H.store(1080, Ordering::Release);
-        WIN_W.store(220, Ordering::Release);
-        WIN_H.store(340, Ordering::Release);
-        INITIALIZED.store(true, Ordering::Release);
-
+        // 纯计算逻辑，不触碰 GTK/GLib，避免 CI 无主循环时挂起。
         for preset in [
             "top-left",
             "top-center",
@@ -321,12 +331,9 @@ mod tests {
             "bottom-center",
             "bottom-right",
         ] {
-            assert!(position(preset), "{preset}");
-            let (x, y) = current_position().expect("应有位置");
+            let (x, y) = preset_position(preset, 1920, 1080, 220, 340);
             assert!((0..=1700).contains(&x), "{preset}: x={x}");
             assert!((0..=740).contains(&y), "{preset}: y={y}");
         }
-
-        INITIALIZED.store(false, Ordering::Release);
     }
 }
