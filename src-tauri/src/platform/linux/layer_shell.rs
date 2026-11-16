@@ -89,31 +89,31 @@ unsafe fn load_library() -> Result<LayerShellLib> {
         match Library::new(name) {
             Ok(library) => {
                 let is_supported = *library
-                    .get::<GtkLayerIsSupported>(b"gtk_layer_is_supported\0")
+                    .get::<GtkLayerIsSupported>(c"gtk_layer_is_supported".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_is_supported")?;
                 let init_for_window = *library
-                    .get::<GtkLayerInitForWindow>(b"gtk_layer_init_for_window\0")
+                    .get::<GtkLayerInitForWindow>(c"gtk_layer_init_for_window".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_init_for_window")?;
                 let set_namespace = *library
-                    .get::<GtkLayerSetNamespace>(b"gtk_layer_set_namespace\0")
+                    .get::<GtkLayerSetNamespace>(c"gtk_layer_set_namespace".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_set_namespace")?;
                 let set_layer = *library
-                    .get::<GtkLayerSetLayer>(b"gtk_layer_set_layer\0")
+                    .get::<GtkLayerSetLayer>(c"gtk_layer_set_layer".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_set_layer")?;
                 let set_anchor = *library
-                    .get::<GtkLayerSetAnchor>(b"gtk_layer_set_anchor\0")
+                    .get::<GtkLayerSetAnchor>(c"gtk_layer_set_anchor".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_set_anchor")?;
                 let set_margin = *library
-                    .get::<GtkLayerSetMargin>(b"gtk_layer_set_margin\0")
+                    .get::<GtkLayerSetMargin>(c"gtk_layer_set_margin".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_set_margin")?;
                 let set_monitor = *library
-                    .get::<GtkLayerSetMonitor>(b"gtk_layer_set_monitor\0")
+                    .get::<GtkLayerSetMonitor>(c"gtk_layer_set_monitor".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_set_monitor")?;
                 let set_exclusive_zone = *library
-                    .get::<GtkLayerSetExclusiveZone>(b"gtk_layer_set_exclusive_zone\0")
+                    .get::<GtkLayerSetExclusiveZone>(c"gtk_layer_set_exclusive_zone".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_set_exclusive_zone")?;
                 let set_keyboard_mode = *library
-                    .get::<GtkLayerSetKeyboardMode>(b"gtk_layer_set_keyboard_mode\0")
+                    .get::<GtkLayerSetKeyboardMode>(c"gtk_layer_set_keyboard_mode".to_bytes_with_nul())
                     .context("库缺少 gtk_layer_set_keyboard_mode")?;
 
                 return Ok(LayerShellLib {

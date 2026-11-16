@@ -103,8 +103,13 @@ pub fn tool_usage_rules(runtime: &ToolRuntime, registry: &ToolRegistry) -> Strin
         .any(|name| name == "os_control")
     {
         let actions = tools::os_control::action_list();
+        let window_action = if crate::platform::capabilities().activate_window {
+            "、切换窗口"
+        } else {
+            ""
+        };
         text.push_str(&format!(
-            "- 需要操作桌面（点按钮、输入文字、切换窗口）时调用 os_control（动作：{actions}），不要用 run_command 拼自动化脚本；每次调用都要审批，被拒绝时说明情况而不是反复重试。\n"
+            "- 需要操作桌面（点按钮、输入文字{window_action}）时调用 os_control（动作：{actions}），不要用 run_command 拼自动化脚本；每次调用都要审批，被拒绝时说明情况而不是反复重试。\n"
         ));
         if crate::platform::current_capabilities().input_injection_backend
             == crate::platform::InputInjectionBackend::Eis

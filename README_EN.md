@@ -146,7 +146,7 @@
 - **Node.js**: 20.19+ or 22.12+ (required by Vite 7; 22 LTS recommended)
 - **pnpm**: Package manager
 - **Rust**: 1.87+
-- **System Dependencies** (Linux): [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) (WebKitGTK, `libxdo-dev`, etc.; `libxdo` powers enigo keyboard/mouse control). See [docs/linux.md](docs/linux.md) for the Wayland support matrix, the read-only screenshot opt-in, the experimental XDG portal global-shortcut opt-in, and the layer-shell positioning opt-in.
+- **System Dependencies** (Linux): [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) (WebKitGTK, `libxdo-dev`, `libxkbcommon-dev`, etc.; `libxdo` powers enigo keyboard/mouse control and `libxkbcommon` is needed to build the EIS backend). See [docs/linux.md](docs/linux.md) for the Wayland support matrix, the read-only screenshot opt-in, the experimental XDG portal global-shortcut opt-in, the layer-shell positioning opt-in, and the EIS input opt-in.
 
 ### Installation
 

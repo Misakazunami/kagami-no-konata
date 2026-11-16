@@ -146,7 +146,7 @@
 - **Node.js**：20.19+ 或 22.12+（Vite 7 的要求，推荐 22 LTS）
 - **pnpm**：包管理器
 - **Rust**：1.87+
-- **系统依赖**（Linux）：见 [docs/linux.md](docs/linux.md)。需要 WebKitGTK 4.1、`libxdo-dev`（enigo 键鼠）、`libxcb1-dev` / `libxrandr-dev`（截图）、`libayatana-appindicator3-dev`（托盘）等；**推荐使用 X11/Xorg 会话**，Wayland 下桌面能力会降级（只读截图、门户快捷键与 layer-shell 定位需分别显式 opt-in）。
+- **系统依赖**（Linux）：见 [docs/linux.md](docs/linux.md)。需要 WebKitGTK 4.1、`libxdo-dev`（enigo 键鼠）、`libxkbcommon-dev`（EIS 后端编译）、`libxcb1-dev` / `libxrandr-dev`（截图）、`libayatana-appindicator3-dev`（托盘）等；**推荐使用 X11/Xorg 会话**，Wayland 下桌面能力会降级（只读截图、门户快捷键、layer-shell 定位与 EIS 键鼠注入需分别显式 opt-in）。
 
 ### 安装步骤
 
