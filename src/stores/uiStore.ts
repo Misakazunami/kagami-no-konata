@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { GlobalShortcutStatusData } from "../types/events";
+import type { GlobalShortcutStatusData, InputInjectionStatusData } from "../types/events";
 import type { PlatformCapabilities } from "../types/platform";
 
 export type ToastKind = "success" | "error" | "info";
@@ -20,6 +20,9 @@ interface UiState {
   /** Wayland 门户快捷键最近一次状态（仅 portal 后端会收到） */
   globalShortcutStatus: GlobalShortcutStatusData | null;
   setGlobalShortcutStatus: (status: GlobalShortcutStatusData) => void;
+  /** Wayland EIS 输入服务最近一次状态（仅 eis 后端会收到） */
+  inputInjectionStatus: InputInjectionStatusData | null;
+  setInputInjectionStatus: (status: InputInjectionStatusData) => void;
   /** 推一条 toast；同一文本只保留最新一条（避免重复点击刷屏） */
   pushToast: (text: string, kind?: ToastKind, duration?: number) => void;
   dismissToast: (id: string) => void;
@@ -43,6 +46,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   toasts: [],
   platform: null,
   globalShortcutStatus: null,
+  inputInjectionStatus: null,
 
   setPlatformCapabilities: (platform) => set({ platform }),
 
@@ -55,6 +59,20 @@ export const useUiStore = create<UiState>((set, get) => ({
         ? {
             ...state.platform,
             globalShortcut: status.available,
+            notes: state.platform.notes.includes(status.message)
+              ? state.platform.notes
+              : [...state.platform.notes, status.message],
+          }
+        : null,
+    })),
+
+  setInputInjectionStatus: (status) =>
+    set((state) => ({
+      inputInjectionStatus: status,
+      platform: state.platform
+        ? {
+            ...state.platform,
+            inputInjection: status.available,
             notes: state.platform.notes.includes(status.message)
               ? state.platform.notes
               : [...state.platform.notes, status.message],

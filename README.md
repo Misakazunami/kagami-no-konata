@@ -123,6 +123,7 @@
 - 系统托盘菜单（打开主窗口 / 打开悬浮窗 / 设置 / 退出）
 - 全局快捷键 `Ctrl+Shift+K` 切换主窗口（Wayland 下需设置 `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` 走 XDG 门户，实验）；关闭按钮行为可配置（隐藏 / 隐藏并显示桌宠 / 退出）
 - Wayland 下可设置 `KONATA_WAYLAND_LAYER_SHELL=1` 启用 layer-shell 悬浮窗定位与自由拖拽（实验，仅支持的合成器）
+- Wayland 下可设置 `KONATA_WAYLAND_INPUT=1` 启用 EIS 键鼠注入（实验，仅输入、需系统授权；没有截图时禁止鼠标点击，且永不绕过逐次审批）
 - 主窗口从最小尺寸拉到全屏都保持可用：侧栏可折叠、正文有版心、弹窗有高度上限与内部滚动
 
 ---
@@ -226,7 +227,7 @@ src-tauri/target/release/bundle/appimage/
 src-tauri/target/release/bundle/rpm/
 ```
 
-> 推荐在 **X11/Xorg** 会话下运行以获得完整的悬浮窗定位、托盘、全局快捷键、截图和桌面控制能力。Wayland 下应用会降级并显示提示；可设置 `KONATA_WAYLAND_SCREENSHOT=1` 启用只读实验截图，设置 `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` 尝试通过 XDG 门户绑定全局快捷键，或设置 `KONATA_WAYLAND_LAYER_SHELL=1` 启用 layer-shell 定位/拖拽（均需系统授权或合成器支持，详见 [docs/linux.md](docs/linux.md)）。
+> 推荐在 **X11/Xorg** 会话下运行以获得完整的悬浮窗定位、托盘、全局快捷键、截图和桌面控制能力。Wayland 下应用会降级并显示提示；可设置 `KONATA_WAYLAND_SCREENSHOT=1` 启用只读实验截图，设置 `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` 尝试通过 XDG 门户绑定全局快捷键，设置 `KONATA_WAYLAND_LAYER_SHELL=1` 启用 layer-shell 定位/拖拽，或设置 `KONATA_WAYLAND_INPUT=1` 启用 EIS 键鼠注入（均需系统授权或合成器支持，详见 [docs/linux.md](docs/linux.md)）。
 
 ### 首次启动
 
@@ -412,7 +413,7 @@ poke_lines:
 | 工作区写入 | `copy_path` | 复制（需审批） |
 | 工作区写入 | `open_with_system` | 用系统默认程序打开文件或白名单链接（需审批） |
 | 命令执行 | `run_command` | 不经 shell 执行命令，支持多步串行（需审批，仅「完全」模式可见） |
-| 系统控制 | `os_control` | 鼠标点击 / 双击、键盘输入、组合键、切换前台窗口（需审批，仅「完全」模式可见；窗口激活目前仅 Windows） |
+| 系统控制 | `os_control` | 鼠标点击 / 双击、键盘输入、组合键、切换前台窗口（需审批，仅「完全」模式可见；窗口激活目前仅 Windows；Wayland EIS 下仅输入、不可激活窗口、不绕过 AUTO，无截图时禁止鼠标点击） |
 | 系统控制 | `look_at_screen` | Wayland 只读模式下按需截图（仅查看，不能控制键鼠；需显式 opt-in） |
 | 网络 | `web_fetch` | 抓取网页为纯文本（需审批 + 域名白名单） |
 | 网络 | `web_search` | 联网检索候选链接（需审批 + 配置检索后端） |
@@ -434,7 +435,7 @@ poke_lines:
 | 任务 · Work | 完全 | ≥20 | 命令与桌面控制可见，但每次写入 / 执行 / 桌面操作仍需审批 |
 | 悬浮窗 | 不使用工具 | — | 纯对话，避免桌宠窗口触发任何操作 |
 
-> 只有任务 Work 会进入 OS 接管模式并**自动**采集屏幕；Wayland 只读模式（`KONATA_WAYLAND_SCREENSHOT=1`）下，模型可在允许只读工具的模式按需调用 `look_at_screen`。普通聊天、任务 Plan 与悬浮窗都不自动截屏。`os_control` 不受路径监狱与写前快照覆盖，它唯一的闸门是「仅完全模式可见 + 逐次审批」；会话 AUTO 开启后会跳过该审批。`look_at_screen` 是只读工具，不需要审批，但只在显式 opt-in 的 Wayland 会话可见。
+> 只有任务 Work 会进入 OS 接管模式并**自动**采集屏幕；Wayland 只读模式（`KONATA_WAYLAND_SCREENSHOT=1`）下，模型可在允许只读工具的模式按需调用 `look_at_screen`。普通聊天、任务 Plan 与悬浮窗都不自动截屏。`os_control` 不受路径监狱与写前快照覆盖，它唯一的闸门是「仅完全模式可见 + 逐次审批」；会话 AUTO 开启后会跳过该审批，但 **Wayland EIS 输入是例外：永不跳过审批**。`look_at_screen` 是只读工具，不需要审批，但只在显式 opt-in 的 Wayland 会话可见。
 
 在此之上还有五层彼此独立的防线：
 

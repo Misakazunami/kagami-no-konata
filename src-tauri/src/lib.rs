@@ -222,6 +222,10 @@ pub fn run() {
                 platform::init_float_window_layer_shell(&float_win);
             }
 
+            // ─── Wayland EIS 键鼠注入（实验，默认关闭） ───
+            // 只有显式 KONATA_WAYLAND_INPUT=1 才会启动；后台线程会请求系统授权。
+            platform::start_input_service(app.handle().clone());
+
             // ─── Wayland 全局快捷键门户（实验，默认关闭） ───
             // Windows/X11 走前端 tauri-plugin-global-shortcut；只有显式
             // KONATA_WAYLAND_GLOBAL_SHORTCUTS=1 的 Wayland 会话才会真正启动

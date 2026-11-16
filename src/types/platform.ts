@@ -26,6 +26,15 @@ export type GlobalShortcutBackend = "native" | "portal" | "none";
  */
 export type WindowPositioningBackend = "native" | "layer_shell" | "none";
 
+/**
+ * 键鼠注入后端（后端 `InputInjectionBackend`，serde 为 snake_case）
+ *
+ * - `native`：Windows / X11，使用现有 enigo；
+ * - `eis`：Wayland XDG RemoteDesktop + libei/EIS，连接成功前不可用；
+ * - `none`：当前会话没有可用的注入后端。
+ */
+export type InputInjectionBackend = "native" | "eis" | "none";
+
 export interface PlatformCapabilities {
   /** `windows` / `linux` / `macos` / ... */
   os: string;
@@ -47,6 +56,8 @@ export interface PlatformCapabilities {
   /** 截图可用但只读（Wayland 实验模式：不能注入键鼠） */
   screenCaptureOnly: boolean;
   inputInjection: boolean;
+  /** 键鼠注入后端；`eis` 时由异步门户连接结果决定是否可用 */
+  inputInjectionBackend: InputInjectionBackend;
   activateWindow: boolean;
   /** 截图 + 键鼠 + 窗口激活整体是否可用 */
   osControl: boolean;

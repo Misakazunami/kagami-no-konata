@@ -1962,6 +1962,16 @@ export function SettingsPage() {
                 桌面控制：{platform.osControl ? "可用" : "不可用"}
               </span>
               <span className="platform-diagnostic-item">
+                键鼠注入：
+                {platform.inputInjection
+                  ? platform.inputInjectionBackend === "eis"
+                    ? "EIS（实验）"
+                    : "可用"
+                  : platform.inputInjectionBackend === "eis"
+                    ? "EIS 未就绪"
+                    : "不可用"}
+              </span>
+              <span className="platform-diagnostic-item">
                 托盘：{platform.trayMenu ? (platform.trayReliable ? "可用" : "可用但不保证可见") : "不可用"}
               </span>
             </div>

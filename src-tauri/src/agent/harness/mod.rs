@@ -102,9 +102,17 @@ pub fn tool_usage_rules(runtime: &ToolRuntime, registry: &ToolRegistry) -> Strin
         .iter()
         .any(|name| name == "os_control")
     {
-        text.push_str(
-            "- 需要操作桌面（点按钮、输入文字、切换窗口）时调用 os_control（动作：mouse_click / keyboard_type / key_press / activate_window），不要用 run_command 拼自动化脚本；每次调用都要审批，被拒绝时说明情况而不是反复重试。\n",
-        );
+        let actions = tools::os_control::action_list();
+        text.push_str(&format!(
+            "- 需要操作桌面（点按钮、输入文字、切换窗口）时调用 os_control（动作：{actions}），不要用 run_command 拼自动化脚本；每次调用都要审批，被拒绝时说明情况而不是反复重试。\n"
+        ));
+        if crate::platform::current_capabilities().input_injection_backend
+            == crate::platform::InputInjectionBackend::Eis
+        {
+            text.push_str(
+                "- 当前是 Wayland EIS 输入模式：只能点击、输入和按键，不能切换窗口；没有可用截图时不要点击鼠标。每次调用仍会单独审批，不要声称已经操作成功后再调用。\n",
+            );
+        }
     }
     // Wayland 只读截图：点名工具，并明确"只能看、不能操作"，
     // 否则模型容易把"看得到"当成"点得到"。

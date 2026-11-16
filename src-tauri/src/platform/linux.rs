@@ -12,11 +12,12 @@ use x11rb::protocol::xproto::{
 };
 
 mod global_shortcuts;
+mod input;
 mod layer_shell;
 
 use super::{
-    capabilities, set_layer_shell_status, GlobalShortcutBackend, PlatformCapabilities, SessionType,
-    WindowPositioningBackend,
+    capabilities, set_layer_shell_status, GlobalShortcutBackend, InputInjectionBackend, KeyToken,
+    MouseButton, PlatformCapabilities, SessionType, WindowPositioningBackend,
 };
 
 const CURRENT_TIME: u32 = 0;
@@ -29,6 +30,9 @@ const WAYLAND_GLOBAL_SHORTCUTS_ENV: &str = "KONATA_WAYLAND_GLOBAL_SHORTCUTS";
 
 /// Wayland 悬浮窗 layer-shell 定位的显式 opt-in 开关
 const WAYLAND_LAYER_SHELL_ENV: &str = "KONATA_WAYLAND_LAYER_SHELL";
+
+/// Wayland 键鼠注入（libei/EIS）的显式 opt-in 开关
+const WAYLAND_INPUT_ENV: &str = "KONATA_WAYLAND_INPUT";
 
 /// 解析环境变量开关：空值与 "0" 视为关闭，其余非空值视为开启
 fn env_flag(value: Option<&std::ffi::OsStr>) -> bool {
@@ -51,6 +55,10 @@ fn wayland_global_shortcuts_opt_in() -> bool {
 
 fn wayland_layer_shell_opt_in() -> bool {
     env_flag(std::env::var_os(WAYLAND_LAYER_SHELL_ENV).as_deref())
+}
+
+fn wayland_input_opt_in() -> bool {
+    env_flag(std::env::var_os(WAYLAND_INPUT_ENV).as_deref())
 }
 
 /// 纯逻辑：根据会话类型与运行时条件选择全局快捷键后端。
@@ -119,6 +127,15 @@ pub fn detect() -> PlatformCapabilities {
         WindowPositioningBackend::None
     };
 
+    // EIS 需要门户会话；真正的连接结果由后台输入线程写回动态状态。
+    let input_injection_backend = if x11 {
+        InputInjectionBackend::Native
+    } else if session == SessionType::Wayland && wayland_input_opt_in() && has_dbus_session {
+        InputInjectionBackend::Eis
+    } else {
+        InputInjectionBackend::None
+    };
+
     match session {
         SessionType::X11 if !forced_x11 => {
             notes.push("X11 会话：窗口定位、置顶、截图和桌面控制可用。".to_string());
@@ -154,6 +171,30 @@ pub fn detect() -> PlatformCapabilities {
             notes.push(
                 "Wayland 全局快捷键默认关闭；设置 KONATA_WAYLAND_GLOBAL_SHORTCUTS=1 并重启\
                  可尝试通过 XDG 门户启用（实验，需要桌面环境支持并经过用户确认）。"
+                    .to_string(),
+            );
+        }
+    }
+
+    if session == SessionType::Wayland {
+        if input_injection_backend == InputInjectionBackend::Eis {
+            notes.push(
+                "Wayland EIS 键鼠注入已请求（实验）：启动时会请求系统授权；\
+                 连接成功前桌面控制不可用。没有只读截图时鼠标点击会被拒绝，\
+                 窗口激活始终不可用。"
+                    .to_string(),
+            );
+        } else if wayland_input_opt_in() {
+            notes.push(
+                "已设置 KONATA_WAYLAND_INPUT=1，但缺少 DBUS_SESSION_BUS_ADDRESS：\
+                 Wayland 键鼠注入依赖 XDG RemoteDesktop 门户，当前不可用。"
+                    .to_string(),
+            );
+        } else {
+            notes.push(
+                "Wayland 键鼠注入默认关闭；设置 KONATA_WAYLAND_INPUT=1 并重启\
+                 可尝试通过 XDG RemoteDesktop + libei/EIS 启用（实验，需要桌面环境支持\
+                 并经过用户授权；鼠标点击还要求先启用只读截图）。"
                     .to_string(),
             );
         }
@@ -221,6 +262,7 @@ pub fn detect() -> PlatformCapabilities {
         screen_capture: x11 || wayland_screenshot,
         screen_capture_only: wayland_screenshot,
         input_injection: x11,
+        input_injection_backend,
         activate_window: x11,
         os_control: x11,
         close_action_default: "hide_and_float",
@@ -268,6 +310,12 @@ pub fn apply_startup_env() {
     if session == SessionType::Wayland && wayland_layer_shell_opt_in() {
         eprintln!(
             "[platform] KONATA_WAYLAND_LAYER_SHELL=1：请求启用 Wayland layer-shell 悬浮窗定位（实验）"
+        );
+    }
+
+    if session == SessionType::Wayland && wayland_input_opt_in() {
+        eprintln!(
+            "[platform] KONATA_WAYLAND_INPUT=1：请求启用 Wayland EIS 键鼠注入（实验，需要系统授权）"
         );
     }
 
@@ -338,6 +386,46 @@ pub fn position_float_window_layer_shell(position: &str) -> bool {
 /// 按逻辑像素增量移动 layer-shell 悬浮窗（自由拖拽）。
 pub fn move_float_window_by(dx: i32, dy: i32) -> Result<()> {
     layer_shell::move_by(dx, dy)
+}
+
+/// 启动 Wayland EIS 输入服务（仅显式 opt-in 时）。
+pub fn start_input_service(app: tauri::AppHandle) {
+    if capabilities().input_injection_backend != InputInjectionBackend::Eis {
+        return;
+    }
+    input::start(app);
+}
+
+pub fn input_move_abs(x: i32, y: i32) -> Result<()> {
+    if capabilities().input_injection_backend == InputInjectionBackend::Eis {
+        input::move_abs(x, y)
+    } else {
+        move_cursor(x, y)
+    }
+}
+
+pub fn input_click(button: MouseButton, double: bool) -> Result<()> {
+    if capabilities().input_injection_backend == InputInjectionBackend::Eis {
+        input::click(button, double)
+    } else {
+        super::native_input::click(button, double)
+    }
+}
+
+pub fn input_type_text(text: &str) -> Result<()> {
+    if capabilities().input_injection_backend == InputInjectionBackend::Eis {
+        input::type_text(text)
+    } else {
+        super::native_input::type_text(text)
+    }
+}
+
+pub fn input_key_combo(keys: &[KeyToken]) -> Result<()> {
+    if capabilities().input_injection_backend == InputInjectionBackend::Eis {
+        input::key_combo(keys)
+    } else {
+        super::native_input::key_combo(keys)
+    }
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

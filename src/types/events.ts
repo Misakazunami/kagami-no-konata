@@ -341,6 +341,18 @@ export interface GlobalShortcutStatusData {
   message: string;
 }
 
+/**
+ * `input-injection-status` 事件载荷：Wayland EIS 输入服务的异步连接结果。
+ *
+ * `available` 只有在 RemoteDesktop 门户授权并成功连接 EIS 后才为 true；
+ * 拒绝、取消、会话关闭都会推 `available: false`。
+ */
+export interface InputInjectionStatusData {
+  available: boolean;
+  backend: "native" | "eis" | "none";
+  message: string;
+}
+
 export const STREAM_EVENT = {
   chunk: "stream-chunk",
   thinking: "stream-thinking-chunk",
@@ -352,6 +364,7 @@ export const STREAM_EVENT = {
 /** 平台/桌面集成事件名（与后端 `app.emit` 的字面量一一对应） */
 export const PLATFORM_EVENT = {
   globalShortcutStatus: "global-shortcut-status",
+  inputInjectionStatus: "input-injection-status",
 } as const;
 
 /** 工具调用事件名（与后端 `app.emit` 的字面量一一对应） */

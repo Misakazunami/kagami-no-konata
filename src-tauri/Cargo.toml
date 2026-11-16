@@ -59,6 +59,9 @@ ashpd = { version = "0.14", features = ["global_shortcuts"] }
 # Wayland layer-shell：运行时 dlopen，不硬链接 libgtk-layer-shell。
 gtk = "0.18"
 libloading = "0.8"
+# Wayland 键鼠注入：enigo 0.6 的 libei 后端（内部使用 ashpd + reis）。
+# 与上面的 enigo 0.2 并存：X11/Windows 继续走旧后端，Wayland 显式 opt-in 才用 EIS。
+enigo_libei = { package = "enigo", version = "0.6", default-features = false, features = ["libei_tokio"] }
 
 [target.'cfg(unix)'.dependencies]
 # 进程组回收（run_command 超时/取消时杀掉整个子进程树）。

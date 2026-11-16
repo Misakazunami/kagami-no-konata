@@ -31,7 +31,7 @@ jobs:
             build-essential curl wget file \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
             librsvg2-dev libxdo-dev libxcb1-dev libxrandr-dev \
-            libdbus-1-dev libssl-dev patchelf rpm xvfb dbus-x11
+            libdbus-1-dev libssl-dev libxkbcommon-dev patchelf rpm xvfb dbus-x11
 
       - uses: dtolnay/rust-toolchain@stable
         with:

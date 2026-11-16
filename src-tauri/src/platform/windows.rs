@@ -11,7 +11,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, SetCursorPos, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
-use super::{GlobalShortcutBackend, PlatformCapabilities, SessionType, WindowPositioningBackend};
+use super::{
+    GlobalShortcutBackend, InputInjectionBackend, KeyToken, MouseButton, PlatformCapabilities,
+    SessionType, WindowPositioningBackend,
+};
 
 pub fn detect() -> PlatformCapabilities {
     PlatformCapabilities {
@@ -28,6 +31,7 @@ pub fn detect() -> PlatformCapabilities {
         screen_capture: true,
         screen_capture_only: false,
         input_injection: true,
+        input_injection_backend: InputInjectionBackend::Native,
         activate_window: true,
         os_control: true,
         close_action_default: "hide",
@@ -51,6 +55,26 @@ pub fn position_float_window_layer_shell(_position: &str) -> bool {
 
 pub fn move_float_window_by(_dx: i32, _dy: i32) -> Result<()> {
     Err(anyhow!("layer-shell 仅支持 Linux Wayland 会话"))
+}
+
+pub fn start_input_service(_app: tauri::AppHandle) {
+    // Windows 直接使用 enigo（SendInput），无需后台服务。
+}
+
+pub fn input_move_abs(x: i32, y: i32) -> Result<()> {
+    move_cursor(x, y)
+}
+
+pub fn input_click(button: MouseButton, double: bool) -> Result<()> {
+    super::native_input::click(button, double)
+}
+
+pub fn input_type_text(text: &str) -> Result<()> {
+    super::native_input::type_text(text)
+}
+
+pub fn input_key_combo(keys: &[KeyToken]) -> Result<()> {
+    super::native_input::key_combo(keys)
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

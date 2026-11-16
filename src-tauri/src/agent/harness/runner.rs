@@ -286,7 +286,12 @@ impl HarnessRun<'_> {
             //
             // 工具可见性按模式判定（`find` 而不是 `contains_tool`）：标准/只读模式下
             // os_control 本来就不可用，这时再截屏只会白白泄露屏幕内容。
+            //
+            // Wayland EIS 只允许按需截图：门户截图可能弹授权框，不能每轮自动截；
+            // 因此这里要求 `os_control`（完整原生桌面控制）为 true。
+            let native_os_takeover = crate::platform::capabilities().os_control;
             if self.tools_enabled
+                && native_os_takeover
                 && self
                     .registry
                     .find("os_control", self.services.mode)
@@ -311,7 +316,7 @@ impl HarnessRun<'_> {
                      6. `os_control` 就在你的工具表里。**不要**向用户罗列、复述或评价你的工具清单，\
                         也不要说\"没有注册/没有下发/工具栏里没有\"这类话——工具是否可用以**调用结果**为准。\
                         用户要求操作时，直接调用；只有真的收到\"工具不存在\"的报错，才向用户说明。",
-                    crate::agent::harness::tools::os_control::ACTION_LIST
+                    crate::agent::harness::tools::os_control::action_list()
                 );
 
                 let already_has_instruction = messages.iter().any(|m| {
@@ -331,7 +336,7 @@ impl HarnessRun<'_> {
                         // 记不牢，而截图是它每轮必然读到的一条消息
                         let extra = format!(
                             "本轮可用的桌面工具：`os_control`（动作：{}，每次调用需审批）",
-                            crate::agent::harness::tools::os_control::ACTION_LIST
+                            crate::agent::harness::tools::os_control::action_list()
                         );
                         self.push_screen_frame(&mut messages, frame, Some(&extra));
                     }
@@ -631,9 +636,16 @@ impl HarnessRun<'_> {
 
         // ─── 审批 ───
         if permission.requires_approval() {
-            let pre_granted = self.auto_approve_all
-                || grants.map(|g| g.contains(&call.name)).unwrap_or(false)
-                || self.auto_approve.iter().any(|name| name == &call.name);
+            // P3.4 安全策略：Wayland EIS 键鼠注入永不走 AUTO / 免审批名单。
+            // 这是有意覆盖会话级 AUTO：用户可以在系统门户里授权输入，但每一次
+            // 具体动作仍要看到模型要做什么。
+            let force_approval = call.name == "os_control"
+                && crate::platform::current_capabilities().input_injection_backend
+                    == crate::platform::InputInjectionBackend::Eis;
+            let pre_granted = !force_approval
+                && (self.auto_approve_all
+                    || grants.map(|g| g.contains(&call.name)).unwrap_or(false)
+                    || self.auto_approve.iter().any(|name| name == &call.name));
 
             if pre_granted {
                 record.approval = Some("auto".to_string());
@@ -1216,19 +1228,19 @@ mod tests {
 
         // 模型看到的是两步的输出，且顺序正确
         let seen = backend.seen_messages.lock().unwrap();
-        let tool_msg = seen
+        let tool_content = seen
             .last()
             .expect("第二轮请求")
             .iter()
             .find(|m| m.role == "tool")
             .expect("必须回灌 tool 角色消息")
             .content
-            .clone();
-        assert!(tool_msg.contains("step 1/2"), "{tool_msg}");
-        assert!(tool_msg.contains("step 2/2"), "{tool_msg}");
-        let alpha = tool_msg.find("alpha").expect("第一步输出");
-        let beta = tool_msg.find("beta").expect("第二步输出");
-        assert!(alpha < beta, "{tool_msg}");
+            .content_as_str();
+        assert!(tool_content.contains("step 1/2"), "{tool_content}");
+        assert!(tool_content.contains("step 2/2"), "{tool_content}");
+        let alpha = tool_content.find("alpha").expect("第一步输出");
+        let beta = tool_content.find("beta").expect("第二步输出");
+        assert!(alpha < beta, "{tool_content}");
     }
 
     #[test]

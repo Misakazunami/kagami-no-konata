@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
-use super::{GlobalShortcutBackend, PlatformCapabilities, SessionType, WindowPositioningBackend};
+use super::{
+    GlobalShortcutBackend, InputInjectionBackend, KeyToken, MouseButton, PlatformCapabilities,
+    SessionType, WindowPositioningBackend,
+};
 
 pub fn detect() -> PlatformCapabilities {
     PlatformCapabilities {
@@ -21,6 +24,7 @@ pub fn detect() -> PlatformCapabilities {
         screen_capture: false,
         screen_capture_only: false,
         input_injection: false,
+        input_injection_backend: InputInjectionBackend::None,
         activate_window: false,
         os_control: false,
         close_action_default: "hide",
@@ -42,12 +46,26 @@ pub fn move_float_window_by(_dx: i32, _dy: i32) -> Result<()> {
     Err(anyhow!("layer-shell 仅支持 Linux Wayland 会话"))
 }
 
-pub fn cursor_position() -> Option<(i32, i32)> {
-    None
+pub fn start_input_service(_app: tauri::AppHandle) {}
+
+pub fn input_move_abs(_x: i32, _y: i32) -> Result<()> {
+    Err(anyhow!("当前平台不支持鼠标绝对定位"))
 }
 
-pub fn move_cursor(_x: i32, _y: i32) -> Result<()> {
-    Err(anyhow!("当前平台不支持鼠标绝对定位"))
+pub fn input_click(_button: MouseButton, _double: bool) -> Result<()> {
+    Err(anyhow!("当前平台不支持鼠标注入"))
+}
+
+pub fn input_type_text(_text: &str) -> Result<()> {
+    Err(anyhow!("当前平台不支持键盘注入"))
+}
+
+pub fn input_key_combo(_keys: &[KeyToken]) -> Result<()> {
+    Err(anyhow!("当前平台不支持组合键注入"))
+}
+
+pub fn cursor_position() -> Option<(i32, i32)> {
+    None
 }
 
 pub fn activate_window(_title: &str, _settle: Duration) -> Result<String> {

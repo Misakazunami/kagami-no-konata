@@ -9,6 +9,7 @@ import {
   PLATFORM_EVENT,
   type GlobalShortcutStatusData,
   type HarnessNoticeData,
+  type InputInjectionStatusData,
   type SessionUpdatedData,
 } from "./types/events";
 import type { PlatformCapabilities } from "./types/platform";
@@ -270,6 +271,19 @@ function App() {
           const payload = event.payload;
           if (!payload?.message) return;
           useUiStore.getState().setGlobalShortcutStatus(payload);
+          useUiStore
+            .getState()
+            .pushToast(
+              payload.message,
+              payload.available ? "success" : "info",
+              payload.available ? 6000 : 9000
+            );
+        }),
+        // Wayland EIS 键鼠注入：授权/断开同样是异步的，按后端回报更新能力。
+        listen<InputInjectionStatusData>(PLATFORM_EVENT.inputInjectionStatus, (event) => {
+          const payload = event.payload;
+          if (!payload?.message) return;
+          useUiStore.getState().setInputInjectionStatus(payload);
           useUiStore
             .getState()
             .pushToast(

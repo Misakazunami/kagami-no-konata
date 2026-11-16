@@ -18,6 +18,9 @@ mod unsupported;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 use unsupported as imp;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod native_input;
+
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
@@ -74,6 +77,56 @@ pub enum WindowPositioningBackend {
     None,
 }
 
+/// 键鼠注入使用的后端。
+///
+/// - `Native`：Windows / X11，使用现有 enigo（X11 走 libxdo）；
+/// - `Eis`：Wayland 下通过 XDG RemoteDesktop 门户 + libei/EIS（enigo 的
+///   libei 后端），连接成功前 `input_injection` 保持 false；
+/// - `None`：当前会话没有可用的注入后端。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputInjectionBackend {
+    Native,
+    Eis,
+    None,
+}
+
+/// 平台中立的鼠标按键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// 平台中立的按键 token。
+///
+/// `os_control` 只负责解析字符串；具体映射到 enigo 0.2（X11/Windows）或
+/// enigo 0.6 libei（Wayland）由平台层完成，避免工具层出现两套按键枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyToken {
+    Control,
+    Alt,
+    Shift,
+    Meta,
+    Return,
+    Tab,
+    Escape,
+    Space,
+    Backspace,
+    Delete,
+    UpArrow,
+    DownArrow,
+    LeftArrow,
+    RightArrow,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Unicode(char),
+}
+
 /// 当前平台的能力集合。
 ///
 /// 前端通过 `get_platform_capabilities` 读取同一份数据，避免设置页写死
@@ -101,6 +154,8 @@ pub struct PlatformCapabilities {
     /// 截图可用，但只用于“看”，不能注入键鼠（Wayland 实验模式）
     pub screen_capture_only: bool,
     pub input_injection: bool,
+    /// 键鼠注入后端；`eis` 时由异步门户连接结果动态决定是否可用
+    pub input_injection_backend: InputInjectionBackend,
     pub activate_window: bool,
     /// 完整桌面控制（截图 + 键鼠 + 窗口激活）是否可用
     pub os_control: bool,
@@ -138,6 +193,23 @@ static LAYER_SHELL_READY: AtomicBool = AtomicBool::new(false);
 /// layer-shell 最近一次成功/失败的说明。
 #[cfg(target_os = "linux")]
 static LAYER_SHELL_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Wayland EIS 输入服务是否已经连接成功。
+#[cfg(target_os = "linux")]
+static EIS_INPUT_READY: AtomicBool = AtomicBool::new(false);
+
+/// EIS 输入服务最近一次成功/失败的说明。
+#[cfg(target_os = "linux")]
+static EIS_INPUT_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+/// 更新 EIS 输入服务的运行时状态（仅 Linux 输入线程调用）。
+#[cfg(target_os = "linux")]
+pub(crate) fn set_eis_input_status(ready: bool, note: Option<String>) {
+    EIS_INPUT_READY.store(ready, Ordering::Release);
+    if let Ok(mut slot) = EIS_INPUT_NOTE.lock() {
+        *slot = note;
+    }
+}
 
 /// 更新 layer-shell 的运行时状态（仅 Linux 窗口初始化代码调用）。
 #[cfg(target_os = "linux")]
@@ -186,6 +258,14 @@ pub fn current_capabilities() -> PlatformCapabilities {
                 }
             }
         }
+        if caps.input_injection_backend == InputInjectionBackend::Eis {
+            caps.input_injection = EIS_INPUT_READY.load(Ordering::Acquire);
+            if let Ok(note) = EIS_INPUT_NOTE.lock() {
+                if let Some(note) = note.as_ref() {
+                    caps.notes.push(note.clone());
+                }
+            }
+        }
         caps
     };
 
@@ -213,6 +293,34 @@ pub fn move_float_window_by(dx: i32, dy: i32) -> Result<()> {
     imp::move_float_window_by(dx, dy)
 }
 
+/// 启动 Wayland EIS 输入服务（显式 opt-in 时由 setup 调用）。
+///
+/// Windows / X11 为空实现；Wayland 下会在独立线程中请求门户授权并保持
+/// EIS 会话，失败结果通过 `input-injection-status` 事件回报。
+pub fn start_input_service(app: tauri::AppHandle) {
+    imp::start_input_service(app);
+}
+
+/// 把鼠标移动到屏幕绝对坐标。
+pub fn input_move_abs(x: i32, y: i32) -> Result<()> {
+    imp::input_move_abs(x, y)
+}
+
+/// 鼠标点击（可选双击）。
+pub fn input_click(button: MouseButton, double: bool) -> Result<()> {
+    imp::input_click(button, double)
+}
+
+/// 输入一段文本。
+pub fn input_type_text(text: &str) -> Result<()> {
+    imp::input_type_text(text)
+}
+
+/// 按顺序按下修饰键、点一下主键、再逆序松开。
+pub fn input_key_combo(keys: &[KeyToken]) -> Result<()> {
+    imp::input_key_combo(keys)
+}
+
 /// 启动需要平台后端的全局快捷键服务。
 ///
 /// Windows / X11 由前端插件注册，这里不做事；Wayland 门户由 Linux 实现
@@ -229,11 +337,6 @@ pub fn apply_startup_env() {
 /// 当前鼠标在虚拟桌面中的绝对坐标（物理像素）。
 pub fn cursor_position() -> Option<(i32, i32)> {
     imp::cursor_position()
-}
-
-/// 把鼠标移动到虚拟桌面绝对坐标（支持负坐标副屏）。
-pub fn move_cursor(x: i32, y: i32) -> Result<()> {
-    imp::move_cursor(x, y)
 }
 
 /// 按标题包含匹配激活窗口，并等待 `settle` 让系统完成切换。

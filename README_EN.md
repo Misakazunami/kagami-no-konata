@@ -123,6 +123,7 @@
 - System tray menu (open main window / open floating window / settings / quit)
 - Global shortcut `Ctrl+Shift+K` toggles the main window (on Wayland, set `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` to use the XDG portal; experimental); the close button behaviour is configurable (hide / hide and show pet / quit)
 - On Wayland, set `KONATA_WAYLAND_LAYER_SHELL=1` to enable layer-shell floating-window positioning and free dragging (experimental; supported compositors only)
+- On Wayland, set `KONATA_WAYLAND_INPUT=1` to enable EIS keyboard/mouse injection (experimental; input only, requires system consent, refuses mouse clicks without a screenshot, and never bypasses per-call approval)
 - The main window stays usable from its minimum size up to full screen: the sidebar collapses, the conversation keeps a reading measure, and dialogs are height-capped with internal scrolling
 
 ---
@@ -383,14 +384,14 @@ All dialogs (confirm / task creation / approval / rewind) share the same viewpor
 | Workspace write | `copy_path` | Copy (approval) |
 | Workspace write | `open_with_system` | Open a file or allowlisted link with the default program (approval) |
 | Execute | `run_command` | Run a command without a shell, several steps in sequence (approval; visible only in "full" mode) |
-| System control | `os_control` | Mouse click / double-click, keyboard typing, key combos, and foreground window activation (approval; visible only in "full" mode; window activation is currently Windows-only) |
+| System control | `os_control` | Mouse click / double-click, keyboard typing, key combos, and foreground window activation (approval; visible only in "full" mode; window activation is currently Windows-only; under Wayland EIS it is input-only, cannot activate windows, never bypasses AUTO, and refuses mouse clicks without a screenshot) |
 | System control | `look_at_screen` | On-demand screenshot in Wayland read-only mode (view only; no keyboard/mouse control; explicit opt-in required) |
 | Network | `web_fetch` | Fetch a web page as plain text (approval + domain allowlist) |
 | Network | `web_search` | Search the web for candidate links (approval + configured search backend) |
 
 > `run_command` has no shell: no pipes, redirection, or `&&`. To run several commands, submit them as a `steps` array in one call — they execute sequentially behind a single approval.
 
-> In task Work mode, the current display's screenshot is automatically injected before each round (only while `os_control` is visible); the model neither needs nor can call a screenshot tool. The exception is Wayland read-only mode (`KONATA_WAYLAND_SCREENSHOT=1`): `os_control` is unavailable, and the model may call `look_at_screen` on demand; the image is injected before the next round.
+> In task Work mode, native (Windows/X11) OS takeover automatically injects the current display's screenshot before each round (only while `os_control` is visible). On Wayland, screenshots are never automatic: with `KONATA_WAYLAND_SCREENSHOT=1` the model may call `look_at_screen` on demand. `os_control` may also be available on Wayland through EIS (`KONATA_WAYLAND_INPUT=1`), but it is input-only and refuses mouse clicks until a screenshot exists. Plain chat, task Plan, and the floating window never capture automatically.
 
 ---
 
@@ -405,7 +406,7 @@ What the tools can actually do is decided by the **session type**, not by the gl
 | Task · Work | Full | ≥20 | Commands and desktop control become visible, but every write / execution / desktop action still needs approval |
 | Floating window | No tools at all | — | Pure conversation, so the pet window can never trigger an action |
 
-> Only task Work enters OS takeover and captures the screen **automatically**; in Wayland read-only mode (`KONATA_WAYLAND_SCREENSHOT=1`), the model may call `look_at_screen` on demand in any mode where read-only tools are visible. Plain chat, task Plan, and the floating window never capture automatically. `os_control` is not covered by the path jail or pre-write snapshots; its only gates are "visible in full mode only" and per-call approval. Session AUTO skips that approval. `look_at_screen` is a read-only tool and needs no approval, but it is visible only in an explicitly opted-in Wayland session.
+> Only task Work enters native OS takeover and captures the screen **automatically**; in Wayland read-only mode (`KONATA_WAYLAND_SCREENSHOT=1`), the model may call `look_at_screen` on demand in any mode where read-only tools are visible. Plain chat, task Plan, and the floating window never capture automatically. `os_control` is not covered by the path jail or pre-write snapshots; on native platforms its only gates are "visible in full mode only" and per-call approval, and Session AUTO skips that approval. **Wayland EIS input is the exception: it is never auto-approved.** `look_at_screen` is a read-only tool and needs no approval, but it is visible only in an explicitly opted-in Wayland session.
 
 On top of that sit five independent layers:
 
