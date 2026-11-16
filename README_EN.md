@@ -84,7 +84,7 @@
 - Plan panel: the model submits a plan and updates each item, and the user can edit or check items directly
 - Working notes: the model records cross-turn conclusions and deletes stale ones
 - Changes panel: browse snapshots per generation batch, roll back in one click, with a task report
-- Session-level AUTO (task sessions only): skips approval prompts (including desktop actions) while every hard safety boundary still applies; only enable it for sessions you trust
+- Session-level AUTO (task sessions only): skips approval prompts (including native desktop actions) while every hard safety boundary still applies; Wayland EIS input is the exception and is never auto-approved; only enable it for sessions you trust
 
 ### 🤖 Multi-Agent and Model Routing
 - Four-level intent pipeline: slash commands, regex, weighted keywords, then fallback
@@ -532,7 +532,7 @@ Issues and Pull Requests are welcome!
 - **Privacy Protection**: data is never uploaded to a third party. The only outbound requests come from your own LLM / Embedding endpoints plus the web search backend and MCP servers you explicitly enabled (web search is off by default)
 - **Screen Captures**: in task Work mode, a screenshot of the current display (JPEG, configurable resolution and quality) is sent to the configured LLM endpoint with each request; it may contain other windows on screen. Plain chat, task Plan, and the floating window never capture the screen, and capture stops as soon as tools are disabled or Work mode ends. On Wayland, capture stays off unless `KONATA_WAYLAND_SCREENSHOT=1` is set; when enabled it is read-only and happens only when the model calls `look_at_screen`
 - **API Key Security**: stored in plaintext in the local `config.json`; never commit it to version control. That file is also on the built-in deny list, so tools cannot read it
-- **Tool Security**: command tools run without a shell and their arguments must stay inside the workspace; file changes are snapshotted first and can be rolled back at any time; deletions go to the system trash by default; desktop actions require approval per call and are visible only in task Work
+- **Tool Security**: command tools run without a shell and their arguments must stay inside the workspace; file changes are snapshotted first and can be rolled back at any time; deletions go to the system trash by default; desktop actions require approval per call and are visible only in task Work. Wayland EIS additionally requires explicit opt-in and system consent, refuses mouse clicks without a screenshot, and never skips per-call approval
 - **Data Migration**: the application identifier changed once, so on startup the app copies — never deletes — chat history, configuration, personas, and workspace from the legacy directory
 
 ---
