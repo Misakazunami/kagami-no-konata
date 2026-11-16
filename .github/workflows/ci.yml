@@ -44,18 +44,68 @@ jobs:
       - run: pnpm build
 
       # 在 Xvfb 下跑测试，让平台能力探测走 X11 分支，而不是 CI 的“无 DISPLAY”分支。
-      - run: xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml
-      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      # 日志同时落盘：失败时由下一步写入 check-run 注解，便于在没有日志下载权限时定位问题。
+      - name: cargo test（Xvfb）
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/konata-logs"
+          xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml 2>&1 \
+            | tee "$RUNNER_TEMP/konata-logs/test.log"
+      - name: cargo clippy
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/konata-logs"
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings 2>&1 \
+            | tee "$RUNNER_TEMP/konata-logs/clippy.log"
 
       - name: 打包 deb / AppImage / rpm
-        run: pnpm tauri build --bundles deb,appimage,rpm
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/konata-logs"
+          pnpm tauri build --bundles deb,appimage,rpm 2>&1 \
+            | tee "$RUNNER_TEMP/konata-logs/bundle.log"
 
       - name: 冒烟测试（X11）
         run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/konata-logs"
           dbus-run-session -- xvfb-run -a env \
             KONATA_SMOKE_TEST=1 \
             WEBKIT_DISABLE_DMABUF_RENDERER=1 \
-            ./src-tauri/target/release/kagami-no-konata
+            ./src-tauri/target/release/kagami-no-konata 2>&1 \
+            | tee "$RUNNER_TEMP/konata-logs/smoke.log"
+
+      # 失败原因只出现在作业日志里，而日志下载需要仓库权限；把末尾输出和
+      # rustc error 行写成注解，任何能看到 check-run 的人都能直接定位。
+      - name: 失败诊断（写入注解）
+        if: failure()
+        run: |
+          set -u
+          shopt -s nullglob
+          logs=("$RUNNER_TEMP"/konata-logs/*.log)
+          if [ ${#logs[@]} -eq 0 ]; then
+            echo "::error::构建失败，但失败发生在记录日志的步骤之前"
+            exit 0
+          fi
+          for log in "${logs[@]}"; do
+            name=$(basename "$log")
+            echo "::group::${name}（末尾 200 行）"
+            tail -n 200 "$log" || true
+            echo "::endgroup::"
+
+            # 1) 最后 60 行合并成一条注解，保留 rustc 的完整错误上下文
+            tail_text=$(tail -n 60 "$log" | sed ':a;N;$!ba;s/\n/ | /g' | cut -c1-6000)
+            tail_text=${tail_text//'%'/'%25'}
+            echo "::error::${name} 末尾输出：${tail_text}"
+
+            # 2) 所有 error / panic 行合并成一条，方便快速 grep
+            errors=$(grep -aE '^(error(\[[A-Za-z0-9]+\])?:|failures:$|thread .+ panicked)' "$log" \
+              | tail -n 20 | sed ':a;N;$!ba;s/\n/; /g' | cut -c1-4000)
+            errors=${errors//'%'/'%25'}
+            if [ -n "$errors" ]; then
+              echo "::error::${name} 关键错误：${errors}"
+            fi
+          done
 
       - uses: actions/upload-artifact@v7
         with:
