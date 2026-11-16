@@ -56,10 +56,19 @@ x11rb = "0.13"
 # Wayland 全局快捷键：org.freedesktop.portal.GlobalShortcuts。
 # 只在显式 opt-in 的 Wayland 会话中启动，X11 仍走前端原生插件。
 ashpd = { version = "0.14", features = ["global_shortcuts"] }
+# Wayland layer-shell：运行时 dlopen，不硬链接 libgtk-layer-shell。
+gtk = "0.18"
+libloading = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 # 进程组回收（run_command 超时/取消时杀掉整个子进程树）。
 libc = "0.2"
+
+[patch.crates-io]
+# screenshots 0.8.10 的 Wayland 后端在 Linux + 新版 Rust 下有两处
+# never-type 推断失败（E0277）。vendor 进来只补显式返回类型，不改行为；
+# 上游恢复发版后可删除本节与 vendor 目录。
+screenshots = { path = "vendor/screenshots" }
 
 [profile.release]
 opt-level = "z"
