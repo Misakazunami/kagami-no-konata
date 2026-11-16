@@ -455,6 +455,7 @@ kagami-no-konata/
 │   │   ├── platform/          # Platform capability abstraction (Windows / Linux X11 / experimental Wayland)
 │   │   └── appdata.rs         # App data directory and legacy directory migration
 │   ├── personas/              # Built-in persona files
+│   ├── vendor/screenshots/    # Local patch for screenshots 0.8.10 (Linux + new Rust build fix)
 │   └── capabilities/          # Frontend permission declarations (window / tray / global shortcut / opener)
 │
 └── public/                    # Static assets (Live2D models, pet assets, Cubism runtime)

@@ -483,6 +483,7 @@ kagami-no-konata/
 │   │   ├── platform/          # 平台能力抽象（Windows / Linux X11 / Wayland 实验）
 │   │   └── appdata.rs         # 应用数据目录与旧目录迁移
 │   ├── personas/              # 预置人格文件
+│   ├── vendor/screenshots/    # screenshots 0.8.10 的本地补丁（Linux 新版 Rust 编译修复）
 │   └── capabilities/          # 前端权限声明（窗口 / 托盘 / 全局快捷键 / opener）
 │
 └── public/                    # 静态资源（Live2D 模型、桌宠素材、Cubism 运行时）
