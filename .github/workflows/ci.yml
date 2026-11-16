@@ -14,12 +14,12 @@ jobs:
     name: Linux · 测试 + clippy + 打包
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -57,7 +57,7 @@ jobs:
             WEBKIT_DISABLE_DMABUF_RENDERER=1 \
             ./src-tauri/target/release/kagami-no-konata
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-bundles
           path: src-tauri/target/release/bundle/**
@@ -67,7 +67,7 @@ jobs:
     name: Windows · 编译检查 + clippy
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -87,12 +87,12 @@ jobs:
     name: Windows · NSIS 打包
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -105,7 +105,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm tauri build --bundles nsis
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-nsis
           path: src-tauri/target/release/bundle/nsis/**
