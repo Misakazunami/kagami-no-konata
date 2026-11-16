@@ -1,2 +1,6 @@
+packages:
+  - '.'
+
+# pnpm 11+ 默认禁止依赖执行安装脚本；esbuild 的 postinstall 需要显式放行。
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: true
