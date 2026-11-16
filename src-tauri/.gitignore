@@ -9,5 +9,5 @@
 # WebView2 loader (auto-copied by build.rs)
 WebView2Loader.dll
 
-# 本地 Cargo 镜像配置（因网络环境而异，不随仓库发布）
-/.cargo/config.toml
+# 本地 Cargo 配置目录（镜像 / 凭据因环境而异，不随仓库发布）
+/.cargo/

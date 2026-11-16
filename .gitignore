@@ -5,13 +5,31 @@ node_modules/
 # 前端构建产物与缓存
 dist/
 dist-ssr/
+.vite/
+.turbo/
+coverage/
 *.local
 *.tsbuildinfo
 
 # Rust / Tauri 构建产物
 src-tauri/target/
 src-tauri/gen/schemas/
+src-tauri/vendor/**/target/
 **/*.rs.bk
+*.profraw
+*.profdata
+lcov.info
+
+# 安装包（通常位于 target/；防止手动复制到仓库根目录后误提交）
+*.AppImage
+*.appimage
+*.deb
+*.rpm
+*.snap
+*.flatpak
+*.exe
+*.msi
+*.dmg
 
 # 第三方参考项目（不参与本项目构建）
 tauri-live2d-main/

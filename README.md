@@ -73,18 +73,18 @@
 - 工具输出以「不可信数据」标记回灌模型，削弱提示注入的影响
 
 ### 🖥 屏幕感知与桌面操作
-- 任务 Work（完全模式）下进入「OS 接管」：每轮自动把当前显示器截图放进上下文，模型不需要自己截图
-- `os_control` 支持鼠标点击 / 双击、键盘输入、组合键、把窗口切到前台（窗口激活目前仅 Windows）
+- 原生（Windows / X11）任务 Work（完全模式）下进入「OS 接管」：每轮自动把当前显示器截图放进上下文，模型不需要自己截图
+- `os_control` 支持鼠标点击 / 双击、键盘输入、组合键、把窗口切到前台（窗口激活目前仅 Windows；Wayland EIS 下仅输入、不可激活窗口）
 - 截图优先跟随鼠标所在显示器（取不到时退回主屏），缩放比与屏幕原点统一换算，多显示器与 DPI 缩放下落点仍然准确
 - 截图缩放后以 JPEG 下发，长边上限与质量可配置；每轮只保留最新一张，旧截图从上下文清理
-- 只有 `os_control` 可见时才自动截屏（Wayland 只读模式例外：显式 opt-in 后由 `look_at_screen` 按需截取）：普通聊天、任务 Plan 与悬浮窗都不会采集屏幕
+- 只有原生 `os_control` 可见时才自动截屏；Wayland 下截图始终按需：只读截图由 `look_at_screen` 触发，EIS 输入也不会自动采集屏幕。普通聊天、任务 Plan 与悬浮窗都不会采集屏幕
 
 ### 🗂 任务模式
 - 会话分「聊天」与「任务」两类；任务会话再分 Plan（规划）与 Work（执行）
 - 计划面板：模型提交计划并逐项更新状态，用户可直接编辑与勾选
 - 工作笔记：模型把跨轮结论记下来，过时结论可删除
 - 文件改动面板：按生成批次查看快照、一键回滚，并附带任务报告
-- 会话级 AUTO（仅任务会话可开）：跳过审批弹窗（包括桌面操作），硬性安全边界仍然生效；请只在信任当前会话时开启
+- 会话级 AUTO（仅任务会话可开）：跳过审批弹窗（包括原生桌面操作；Wayland EIS 输入永不跳过），硬性安全边界仍然生效；请只在信任当前会话时开启
 
 ### 🤖 多智能体与模型路由
 - 斜杠指令 / 正则 / 关键词三级加兜底的四级意图流水线
@@ -420,7 +420,7 @@ poke_lines:
 
 > `run_command` 没有 shell：不支持管道、重定向与 `&&`；需要连续执行时用 `steps` 数组一次提交，按顺序串行执行且只需一次审批。
 
-> 任务 Work 模式下，系统会在每轮生成前自动注入当前显示器截图（仅当 `os_control` 可见）；模型不需要也不能调用截图工具。Wayland 只读模式（`KONATA_WAYLAND_SCREENSHOT=1`）例外：`os_control` 不可用，模型可调用 `look_at_screen` 按需截图，图片在下一轮对话前注入。
+> 原生任务 Work 模式下，系统会在每轮生成前自动注入当前显示器截图（仅当原生 `os_control` 可见）；模型不需要也不能调用截图工具。Wayland 下不自动截图：只读截图需设置 `KONATA_WAYLAND_SCREENSHOT=1`，并由模型调用 `look_at_screen` 按需截取；EIS 输入需设置 `KONATA_WAYLAND_INPUT=1`，且没有可用截图时禁止鼠标点击。图片在下一轮对话前注入。
 
 ---
 
@@ -453,7 +453,7 @@ poke_lines:
 
 ```
 kagami-no-konata/
-├── src/                       # React 前端（51 个源文件，约 1.5 万行）
+├── src/                       # React 前端（43 个源文件，约 1.1 万行）
 │   ├── components/
 │   │   ├── chat/              # 聊天窗口、消息气泡、流式渲染、工具卡片、审批、计划、变更、笔记、时间轴
 │   │   ├── float/             # 悬浮窗、Live2D 画布、时钟、戳一戳
@@ -467,7 +467,7 @@ kagami-no-konata/
 │   ├── utils/                 # 剪贴板、会话导出、消息文本
 │   └── styles/                # tokens / base / chat / tools / panels / conversation / float / settings / a11y
 │
-├── src-tauri/                 # Rust 后端（67 个源文件，约 2.9 万行）
+├── src-tauri/                 # Rust 后端（76 个源文件，约 3.1 万行）
 │   ├── src/
 │   │   ├── agent/             # 智能体：chat_agent / dispatcher / router / system_agent
 │   │   │   └── harness/       # 工具运行时：registry / runner / approve / jail / screen
@@ -480,6 +480,7 @@ kagami-no-konata/
 │   │   ├── store/             # SQLite 持久化（db / chat_store / memory_store）
 │   │   ├── config/            # 配置读写与自愈迁移
 │   │   ├── mcp/               # MCP 服务器桥接（stdio JSON-RPC）
+│   │   ├── platform/          # 平台能力抽象（Windows / Linux X11 / Wayland 实验）
 │   │   └── appdata.rs         # 应用数据目录与旧目录迁移
 │   ├── personas/              # 预置人格文件
 │   └── capabilities/          # 前端权限声明（窗口 / 托盘 / 全局快捷键 / opener）

@@ -73,11 +73,11 @@
 - Tool output is fed back to the model as untrusted data, weakening prompt injection
 
 ### 🖥 Screen Awareness and Desktop Control
-- Task Work (full mode) enters "OS takeover": a screenshot of the current display is injected into context every round, so the model never needs a screenshot tool
-- `os_control` supports mouse click / double-click, keyboard typing, key combos, and bringing a window to the foreground (window activation is currently Windows-only)
+- Native (Windows / X11) task Work (full mode) enters "OS takeover": a screenshot of the current display is injected into context every round, so the model never needs a screenshot tool
+- `os_control` supports mouse click / double-click, keyboard typing, key combos, and bringing a window to the foreground (window activation is currently Windows-only; under Wayland EIS it is input-only and cannot activate windows)
 - Screenshots prefer the display under the mouse (falling back to the primary display); scale and screen origin are converted in one place, so clicks stay accurate across multiple monitors and DPI scaling
 - Screenshots are downscaled and sent as JPEG; the long-edge limit and quality are configurable, and only the newest screenshot is kept (older ones are removed from context)
-- The screen is captured automatically only when `os_control` is visible (Wayland read-only mode is the exception: after explicit opt-in, `look_at_screen` captures on demand): plain chat, task Plan, and the floating window never capture the screen
+- The screen is captured automatically only when native `os_control` is visible; on Wayland capture is always on demand: read-only screenshots require `look_at_screen`, and EIS input never captures automatically. Plain chat, task Plan, and the floating window never capture the screen
 
 ### 🗂 Task Mode
 - Sessions are either "chat" or "task"; task sessions are further split into Plan and Work
@@ -424,7 +424,7 @@ In addition, tool results are labelled `untrusted` for the model (data, not inst
 
 ```
 kagami-no-konata/
-├── src/                       # React frontend (51 source files, ~15k lines)
+├── src/                       # React frontend (43 source files, ~11k lines)
 │   ├── components/
 │   │   ├── chat/              # Chat window, message bubbles, streaming, tool cards, approvals,
 │   │   │                      #   plan, changes, notes, timeline
@@ -439,12 +439,12 @@ kagami-no-konata/
 │   ├── utils/                 # Clipboard, conversation export, message text
 │   └── styles/                # tokens / base / chat / tools / panels / conversation / float / settings / a11y
 │
-├── src-tauri/                 # Rust backend (67 source files, ~29k lines)
+├── src-tauri/                 # Rust backend (76 source files, ~31k lines)
 │   ├── src/
 │   │   ├── agent/             # Agents: chat_agent / dispatcher / router / system_agent
 │   │   │   └── harness/       # Tool runtime: registry / runner / approve / jail / screen
 │   │   │                      #   command_guard / snapshot / subagent / trash / tools/
-│   │   │                      #   (tools/ holds os_control and the other 25 built-ins)
+│   │   │                      #   (tools/ holds os_control and the other 26 built-ins)
 │   │   ├── commands/          # 70 Tauri IPC commands (chat/settings/tools/persona/memory/backup/stats/window)
 │   │   ├── llm/               # OpenAI-compatible client, SSE parsing, model routing, capability probing
 │   │   ├── memory/            # Memory extractor
@@ -452,6 +452,7 @@ kagami-no-konata/
 │   │   ├── store/             # SQLite persistence (db / chat_store / memory_store)
 │   │   ├── config/            # Configuration read/write with self-healing migrations
 │   │   ├── mcp/               # MCP server bridge (stdio JSON-RPC)
+│   │   ├── platform/          # Platform capability abstraction (Windows / Linux X11 / experimental Wayland)
 │   │   └── appdata.rs         # App data directory and legacy directory migration
 │   ├── personas/              # Built-in persona files
 │   └── capabilities/          # Frontend permission declarations (window / tray / global shortcut / opener)
