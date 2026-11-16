@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
-use super::{GlobalShortcutBackend, PlatformCapabilities, SessionType};
+use super::{GlobalShortcutBackend, PlatformCapabilities, SessionType, WindowPositioningBackend};
 
 pub fn detect() -> PlatformCapabilities {
     PlatformCapabilities {
@@ -14,6 +14,7 @@ pub fn detect() -> PlatformCapabilities {
         tray_menu: false,
         tray_reliable: false,
         window_positioning: false,
+        window_positioning_backend: WindowPositioningBackend::None,
         always_on_top: false,
         global_shortcut: false,
         global_shortcut_backend: GlobalShortcutBackend::None,
@@ -30,6 +31,16 @@ pub fn detect() -> PlatformCapabilities {
 pub fn apply_startup_env() {}
 
 pub fn start_global_shortcut_service(_app: tauri::AppHandle) {}
+
+pub fn init_float_window_layer_shell(_window: &tauri::WebviewWindow) {}
+
+pub fn position_float_window_layer_shell(_position: &str) -> bool {
+    false
+}
+
+pub fn move_float_window_by(_dx: i32, _dy: i32) -> Result<()> {
+    Err(anyhow!("layer-shell 仅支持 Linux Wayland 会话"))
+}
 
 pub fn cursor_position() -> Option<(i32, i32)> {
     None

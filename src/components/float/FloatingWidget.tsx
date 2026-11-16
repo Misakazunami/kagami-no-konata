@@ -7,6 +7,7 @@ import { FloatingClock } from "./FloatingClock";
 import { usePoke, type PokePersona } from "./usePoke";
 import type { PersonaSummary } from "../../types/persona";
 import { STREAM_EVENT, isSameStream, type StreamEventData } from "../../types/events";
+import { useUiStore } from "../../stores/uiStore";
 import { IconExpand, IconSend, IconX } from "../icons";
 
 interface FloatConfig {
@@ -19,6 +20,10 @@ interface FloatConfig {
 
 export function FloatingWidget() {
   const [useLive2D, setUseLive2D] = useState(true);
+  const platform = useUiStore((s) => s.platform);
+  /** layer-shell 下原生 startDragging 无效，改为把指针增量发给后端改边距 */
+  const layerShellDrag =
+    platform?.windowPositioningBackend === "layer_shell" && platform.windowPositioning;
   const [, setLive2dError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
@@ -272,31 +277,70 @@ export function FloatingWidget() {
       {/* 角色立绘 */}
       <div
         className="pet-image-wrap"
-        onMouseDown={(e) => {
+        onPointerDown={(e) => {
+          e.preventDefault();
+          const target = e.currentTarget;
+          const pointerId = e.pointerId;
           const startX = e.clientX;
           const startY = e.clientY;
+          let lastX = startX;
+          let lastY = startY;
           let isDrag = false;
+          let nativeStarted = false;
 
-          const handleMove = (ev: MouseEvent) => {
-            const dx = Math.abs(ev.clientX - startX);
-            const dy = Math.abs(ev.clientY - startY);
-            // 移动超过 5px 判定为拖拽，启动窗口拖拽
-            if (!isDrag && (dx >= 5 || dy >= 5)) {
+          try {
+            target.setPointerCapture(pointerId);
+          } catch {
+            // 某些 WebKitGTK 版本不支持 pointer capture；退化为窗口内拖拽
+          }
+
+          const handleMove = (ev: PointerEvent) => {
+            if (ev.pointerId !== pointerId) return;
+            if (!isDrag) {
+              const dx = Math.abs(ev.clientX - startX);
+              const dy = Math.abs(ev.clientY - startY);
+              // 移动超过 5px 判定为拖拽，避免点击戳一戳被误判
+              if (dx < 5 && dy < 5) return;
               isDrag = true;
-              document.removeEventListener("mousemove", handleMove);
-              document.removeEventListener("mouseup", handleUp);
+            }
+
+            if (layerShellDrag) {
+              // layer-shell 表面由锚点 + 边距定位，后端更新 left/top 边距。
+              // movementX 是设备级增量；window 跟随指针时 clientX 可能不变，
+              // 所以优先用它，取不到再退回 client 坐标差。
+              const dx = ev.movementX || ev.clientX - lastX;
+              const dy = ev.movementY || ev.clientY - lastY;
+              lastX = ev.clientX;
+              lastY = ev.clientY;
+              if (dx || dy) {
+                void invoke("move_float_window_by", { dx, dy }).catch((err) => {
+                  console.error("[float] layer-shell 拖拽失败:", err);
+                });
+              }
+            } else if (!nativeStarted) {
+              nativeStarted = true;
               getCurrentWindow().startDragging().catch(() => {});
             }
           };
 
-          const handleUp = () => {
-            document.removeEventListener("mousemove", handleMove);
-            document.removeEventListener("mouseup", handleUp);
+          const handleUp = (ev: PointerEvent) => {
+            if (ev.pointerId !== pointerId) return;
+            target.removeEventListener("pointermove", handleMove);
+            target.removeEventListener("pointerup", handleUp);
+            target.removeEventListener("pointercancel", handleUp);
+            try {
+              if (target.hasPointerCapture(pointerId)) {
+                target.releasePointerCapture(pointerId);
+              }
+            } catch {
+              // 忽略：capture 可能已随窗口拖拽释放
+            }
             if (!isDrag) handlePoke();
           };
 
-          document.addEventListener("mousemove", handleMove);
-          document.addEventListener("mouseup", handleUp);
+          target.addEventListener("pointermove", handleMove);
+          target.addEventListener("pointerup", handleUp);
+          target.addEventListener("pointercancel", handleUp);
         }}
       >
         {showClock && <FloatingClock />}

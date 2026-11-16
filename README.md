@@ -122,6 +122,7 @@
 - **悬浮窗**（220×340）：透明无边框、置顶、跳过任务栏
 - 系统托盘菜单（打开主窗口 / 打开悬浮窗 / 设置 / 退出）
 - 全局快捷键 `Ctrl+Shift+K` 切换主窗口（Wayland 下需设置 `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` 走 XDG 门户，实验）；关闭按钮行为可配置（隐藏 / 隐藏并显示桌宠 / 退出）
+- Wayland 下可设置 `KONATA_WAYLAND_LAYER_SHELL=1` 启用 layer-shell 悬浮窗定位与自由拖拽（实验，仅支持的合成器）
 - 主窗口从最小尺寸拉到全屏都保持可用：侧栏可折叠、正文有版心、弹窗有高度上限与内部滚动
 
 ---
@@ -144,7 +145,7 @@
 - **Node.js**：20.19+ 或 22.12+（Vite 7 的要求，推荐 22 LTS）
 - **pnpm**：包管理器
 - **Rust**：1.87+
-- **系统依赖**（Linux）：见 [docs/linux.md](docs/linux.md)。需要 WebKitGTK 4.1、`libxdo-dev`（enigo 键鼠）、`libxcb1-dev` / `libxrandr-dev`（截图）、`libayatana-appindicator3-dev`（托盘）等；**推荐使用 X11/Xorg 会话**，Wayland 下桌面能力会降级（只读截图与门户快捷键需分别显式 opt-in）。
+- **系统依赖**（Linux）：见 [docs/linux.md](docs/linux.md)。需要 WebKitGTK 4.1、`libxdo-dev`（enigo 键鼠）、`libxcb1-dev` / `libxrandr-dev`（截图）、`libayatana-appindicator3-dev`（托盘）等；**推荐使用 X11/Xorg 会话**，Wayland 下桌面能力会降级（只读截图、门户快捷键与 layer-shell 定位需分别显式 opt-in）。
 
 ### 安装步骤
 
@@ -225,7 +226,7 @@ src-tauri/target/release/bundle/appimage/
 src-tauri/target/release/bundle/rpm/
 ```
 
-> 推荐在 **X11/Xorg** 会话下运行以获得完整的悬浮窗定位、托盘、全局快捷键、截图和桌面控制能力。Wayland 下应用会降级并显示提示；可设置 `KONATA_WAYLAND_SCREENSHOT=1` 启用只读实验截图，或设置 `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` 尝试通过 XDG 门户绑定全局快捷键（均需系统授权，详见 [docs/linux.md](docs/linux.md)）。
+> 推荐在 **X11/Xorg** 会话下运行以获得完整的悬浮窗定位、托盘、全局快捷键、截图和桌面控制能力。Wayland 下应用会降级并显示提示；可设置 `KONATA_WAYLAND_SCREENSHOT=1` 启用只读实验截图，设置 `KONATA_WAYLAND_GLOBAL_SHORTCUTS=1` 尝试通过 XDG 门户绑定全局快捷键，或设置 `KONATA_WAYLAND_LAYER_SHELL=1` 启用 layer-shell 定位/拖拽（均需系统授权或合成器支持，详见 [docs/linux.md](docs/linux.md)）。
 
 ### 首次启动
 

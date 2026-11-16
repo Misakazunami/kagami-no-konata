@@ -1920,7 +1920,14 @@ export function SettingsPage() {
                 会话：{SESSION_TYPE_LABEL[platform.sessionType]}
               </span>
               <span className="platform-diagnostic-item">
-                悬浮窗定位：{platform.windowPositioning ? "可用" : "不可用"}
+                悬浮窗定位：
+                {platform.windowPositioning
+                  ? platform.windowPositioningBackend === "layer_shell"
+                    ? "layer-shell（实验，可拖拽）"
+                    : "可用"
+                  : platform.windowPositioningBackend === "layer_shell"
+                    ? "layer-shell 未就绪"
+                    : "不可用"}
               </span>
               <span className="platform-diagnostic-item">
                 置顶：{platform.alwaysOnTop ? "可用" : "不保证"}

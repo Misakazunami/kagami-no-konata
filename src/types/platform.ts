@@ -17,6 +17,15 @@ export type SessionType = "x11" | "wayland" | "native" | "unknown";
  */
 export type GlobalShortcutBackend = "native" | "portal" | "none";
 
+/**
+ * 悬浮窗定位后端（后端 `WindowPositioningBackend`，serde 为 snake_case）
+ *
+ * - `native`：Windows / X11，使用 set_position + 置顶标志；
+ * - `layer_shell`：Wayland wlr-layer-shell，初始化成功后支持自由拖拽；
+ * - `none`：当前会话没有可用的绝对定位后端。
+ */
+export type WindowPositioningBackend = "native" | "layer_shell" | "none";
+
 export interface PlatformCapabilities {
   /** `windows` / `linux` / `macos` / ... */
   os: string;
@@ -28,6 +37,8 @@ export interface PlatformCapabilities {
   /** 托盘是否可靠可见（GNOME 默认没有 AppIndicator 扩展） */
   trayReliable: boolean;
   windowPositioning: boolean;
+  /** 悬浮窗定位后端；`layer_shell` 时由运行时初始化结果决定是否可用 */
+  windowPositioningBackend: WindowPositioningBackend;
   alwaysOnTop: boolean;
   globalShortcut: boolean;
   /** 全局快捷键后端；`portal` 时由后端门户直接处理按键 */

@@ -59,6 +59,21 @@ pub enum GlobalShortcutBackend {
     None,
 }
 
+/// 悬浮窗定位使用的后端。
+///
+/// - `Native`：Windows / X11，使用 `set_position` + 置顶标志；
+/// - `LayerShell`：Wayland 下通过 `wlr-layer-shell`（运行时 dlopen）定位，
+///   初始化成功前 `window_positioning` 保持 false；
+/// - `None`：当前会话没有可用的绝对定位后端。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowPositioningBackend {
+    Native,
+    LayerShell,
+    None,
+}
+
 /// 当前平台的能力集合。
 ///
 /// 前端通过 `get_platform_capabilities` 读取同一份数据，避免设置页写死
@@ -75,6 +90,8 @@ pub struct PlatformCapabilities {
     /// 托盘是否“可靠可见”。GNOME 默认没有 AppIndicator 扩展，保守设为 false。
     pub tray_reliable: bool,
     pub window_positioning: bool,
+    /// 悬浮窗定位后端；`layer_shell` 时由运行时初始化结果动态决定是否可用
+    pub window_positioning_backend: WindowPositioningBackend,
     pub always_on_top: bool,
     /// 当前是否已经有一个“可用”的全局快捷键后端（门户绑定成功后才为 true）
     pub global_shortcut: bool,
@@ -110,6 +127,27 @@ static PORTAL_SHORTCUT_READY: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 static PORTAL_SHORTCUT_NOTE: Mutex<Option<String>> = Mutex::new(None);
 
+/// Wayland layer-shell 是否已经成功初始化。
+///
+/// `detect()` 运行时只能知道“用户请求了 layer-shell”，真正的
+/// `gtk_layer_is_supported()` + `gtk_layer_init_for_window()` 必须等 GTK
+/// 初始化之后才能执行，因此单独用运行时状态叠加。
+#[cfg(target_os = "linux")]
+static LAYER_SHELL_READY: AtomicBool = AtomicBool::new(false);
+
+/// layer-shell 最近一次成功/失败的说明。
+#[cfg(target_os = "linux")]
+static LAYER_SHELL_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+/// 更新 layer-shell 的运行时状态（仅 Linux 窗口初始化代码调用）。
+#[cfg(target_os = "linux")]
+pub(crate) fn set_layer_shell_status(ready: bool, note: Option<String>) {
+    LAYER_SHELL_READY.store(ready, Ordering::Release);
+    if let Ok(mut slot) = LAYER_SHELL_NOTE.lock() {
+        *slot = note;
+    }
+}
+
 /// 更新门户快捷键的运行时状态（仅 Linux 门户服务调用）。
 #[cfg(target_os = "linux")]
 pub(crate) fn set_portal_shortcut_status(ready: bool, note: Option<String>) {
@@ -138,10 +176,41 @@ pub fn current_capabilities() -> PlatformCapabilities {
                 }
             }
         }
+        if caps.window_positioning_backend == WindowPositioningBackend::LayerShell {
+            caps.window_positioning = LAYER_SHELL_READY.load(Ordering::Acquire);
+            // layer-shell 的 Top 层本身就是“置顶”的实现；初始化失败时一起回退。
+            caps.always_on_top = caps.window_positioning;
+            if let Ok(note) = LAYER_SHELL_NOTE.lock() {
+                if let Some(note) = note.as_ref() {
+                    caps.notes.push(note.clone());
+                }
+            }
+        }
         caps
     };
 
     caps
+}
+
+/// GTK 初始化后，尝试为悬浮窗启用 layer-shell。
+///
+/// 必须在窗口首次显示之前调用；非 Linux 平台为空实现。
+pub fn init_float_window_layer_shell(window: &tauri::WebviewWindow) {
+    imp::init_float_window_layer_shell(window);
+}
+
+/// 用 layer-shell 的锚点/边距把悬浮窗定位到指定角落。
+///
+/// 返回 false 表示当前平台或初始化状态不支持。
+pub fn position_float_window_layer_shell(position: &str) -> bool {
+    imp::position_float_window_layer_shell(position)
+}
+
+/// 按逻辑像素增量移动 layer-shell 悬浮窗。
+///
+/// 只应由前端拖拽路径在 `window_positioning_backend == layer_shell` 时调用。
+pub fn move_float_window_by(dx: i32, dy: i32) -> Result<()> {
+    imp::move_float_window_by(dx, dy)
 }
 
 /// 启动需要平台后端的全局快捷键服务。

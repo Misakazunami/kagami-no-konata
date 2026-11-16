@@ -140,23 +140,34 @@ function App() {
         useUiStore.getState().setPlatformCapabilities(caps);
         if (isFloatWindow || caps.sessionType !== "wayland") return;
 
+        // layer-shell 是本次会话的定位后端时，提示必须与真实状态一致：
+        // 成功就说可用（拖拽/置顶），失败就明确说位置由合成器决定。
+        const positioning =
+          caps.windowPositioningBackend === "layer_shell"
+            ? caps.windowPositioning
+              ? "layer-shell 悬浮窗定位已启用（实验，支持自由拖拽和置顶）；"
+              : "layer-shell 悬浮窗定位未启用，位置由合成器决定；"
+            : "窗口绝对定位、置顶不可用；";
+
         const notice =
           caps.globalShortcutBackend === "portal"
             ? caps.globalShortcut
-              ? "Wayland 会话：全局快捷键已通过系统门户启用（实验）；窗口绝对定位、置顶和桌面控制仍不可用。"
-              : "Wayland 会话：已请求通过系统门户绑定 Ctrl+Shift+K（实验），首次可能需要在系统弹窗中确认；" +
-                "绑定成功前快捷键不可用。窗口绝对定位、置顶和桌面控制仍不可用。"
+              ? `Wayland 会话：${positioning}全局快捷键已通过系统门户启用（实验）；桌面控制仍不可用。`
+              : `Wayland 会话：${positioning}已请求通过系统门户绑定 Ctrl+Shift+K（实验），` +
+                "首次可能需要在系统弹窗中确认；绑定成功前快捷键不可用。桌面控制仍不可用。"
             : caps.screenCaptureOnly
-              ? "Wayland 会话：已启用只读截图（实验），可以查看屏幕，但仍不能点击、输入或切换窗口；" +
-                "窗口绝对定位、置顶和全局快捷键也不可用。需要完整桌面能力请注销并选择 X11/Xorg 会话。"
-              : "Wayland 会话：窗口绝对定位、置顶、全局快捷键、屏幕截图和桌面控制不可用。" +
+              ? `Wayland 会话：${positioning}已启用只读截图（实验），可以查看屏幕，` +
+                "但仍不能点击、输入或切换窗口。需要完整桌面能力请注销并选择 X11/Xorg 会话。"
+              : `Wayland 会话：${positioning}全局快捷键、屏幕截图和桌面控制不可用。` +
                 "需要完整桌面能力请注销并选择 X11/Xorg 会话。";
         const key =
           caps.globalShortcutBackend === "portal"
             ? "konata-wayland-portal-shortcut-notice-shown"
             : caps.screenCaptureOnly
               ? "konata-wayland-readonly-notice-shown"
-              : "konata-wayland-notice-shown";
+              : caps.windowPositioningBackend === "layer_shell"
+                ? "konata-wayland-layer-shell-notice-shown"
+                : "konata-wayland-notice-shown";
         try {
           if (sessionStorage.getItem(key)) return;
           sessionStorage.setItem(key, "1");

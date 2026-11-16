@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, SetCursorPos, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
 };
 
-use super::{GlobalShortcutBackend, PlatformCapabilities, SessionType};
+use super::{GlobalShortcutBackend, PlatformCapabilities, SessionType, WindowPositioningBackend};
 
 pub fn detect() -> PlatformCapabilities {
     PlatformCapabilities {
@@ -21,6 +21,7 @@ pub fn detect() -> PlatformCapabilities {
         tray_menu: true,
         tray_reliable: true,
         window_positioning: true,
+        window_positioning_backend: WindowPositioningBackend::Native,
         always_on_top: true,
         global_shortcut: true,
         global_shortcut_backend: GlobalShortcutBackend::Native,
@@ -40,6 +41,16 @@ pub fn apply_startup_env() {
 
 pub fn start_global_shortcut_service(_app: tauri::AppHandle) {
     // Windows 使用前端 `tauri-plugin-global-shortcut`，无需后端服务。
+}
+
+pub fn init_float_window_layer_shell(_window: &tauri::WebviewWindow) {}
+
+pub fn position_float_window_layer_shell(_position: &str) -> bool {
+    false
+}
+
+pub fn move_float_window_by(_dx: i32, _dy: i32) -> Result<()> {
+    Err(anyhow!("layer-shell 仅支持 Linux Wayland 会话"))
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

@@ -12,8 +12,12 @@ use x11rb::protocol::xproto::{
 };
 
 mod global_shortcuts;
+mod layer_shell;
 
-use super::{capabilities, GlobalShortcutBackend, PlatformCapabilities, SessionType};
+use super::{
+    capabilities, set_layer_shell_status, GlobalShortcutBackend, PlatformCapabilities, SessionType,
+    WindowPositioningBackend,
+};
 
 const CURRENT_TIME: u32 = 0;
 
@@ -22,6 +26,9 @@ const WAYLAND_SCREENSHOT_ENV: &str = "KONATA_WAYLAND_SCREENSHOT";
 
 /// Wayland 全局快捷键（XDG 门户）的显式 opt-in 开关
 const WAYLAND_GLOBAL_SHORTCUTS_ENV: &str = "KONATA_WAYLAND_GLOBAL_SHORTCUTS";
+
+/// Wayland 悬浮窗 layer-shell 定位的显式 opt-in 开关
+const WAYLAND_LAYER_SHELL_ENV: &str = "KONATA_WAYLAND_LAYER_SHELL";
 
 /// 解析环境变量开关：空值与 "0" 视为关闭，其余非空值视为开启
 fn env_flag(value: Option<&std::ffi::OsStr>) -> bool {
@@ -40,6 +47,10 @@ fn wayland_screenshot_opt_in() -> bool {
 
 fn wayland_global_shortcuts_opt_in() -> bool {
     env_flag(std::env::var_os(WAYLAND_GLOBAL_SHORTCUTS_ENV).as_deref())
+}
+
+fn wayland_layer_shell_opt_in() -> bool {
+    env_flag(std::env::var_os(WAYLAND_LAYER_SHELL_ENV).as_deref())
 }
 
 /// 纯逻辑：根据会话类型与运行时条件选择全局快捷键后端。
@@ -98,6 +109,16 @@ pub fn detect() -> PlatformCapabilities {
         shortcut_backend(session, wayland_global_shortcuts_opt_in(), has_dbus_session);
     let wayland_shortcuts = global_shortcut_backend == GlobalShortcutBackend::Portal;
 
+    // layer-shell 需要 GTK 初始化后才能探测；这里只记录“用户请求了”，
+    // 真正的可用性由 init_float_window_layer_shell() 写回动态状态。
+    let window_positioning_backend = if x11 {
+        WindowPositioningBackend::Native
+    } else if session == SessionType::Wayland && wayland_layer_shell_opt_in() {
+        WindowPositioningBackend::LayerShell
+    } else {
+        WindowPositioningBackend::None
+    };
+
     match session {
         SessionType::X11 if !forced_x11 => {
             notes.push("X11 会话：窗口定位、置顶、截图和桌面控制可用。".to_string());
@@ -139,6 +160,28 @@ pub fn detect() -> PlatformCapabilities {
     }
 
     if session == SessionType::Wayland {
+        if window_positioning_backend == WindowPositioningBackend::LayerShell {
+            notes.push(
+                "Wayland 悬浮窗定位已请求（实验）：GTK 初始化后将探测 wlr-layer-shell；\
+                 仅 Sway/Hyprland 等支持的合成器可用，失败时回退为合成器默认摆放。"
+                    .to_string(),
+            );
+        } else if wayland_layer_shell_opt_in() {
+            notes.push(
+                "已设置 KONATA_WAYLAND_LAYER_SHELL=1，但当前不是可尝试 layer-shell 的 \
+                 Wayland 会话，悬浮窗定位保持不可用。"
+                    .to_string(),
+            );
+        } else {
+            notes.push(
+                "Wayland 悬浮窗定位默认关闭；设置 KONATA_WAYLAND_LAYER_SHELL=1 并重启\
+                 可尝试 layer-shell（实验，GNOME/Mutter 通常不支持）。"
+                    .to_string(),
+            );
+        }
+    }
+
+    if session == SessionType::Wayland {
         if wayland_screenshot {
             notes.push(
                 "Wayland 只读截图已启用（实验）：只能查看屏幕，不能点击/输入/切换窗口；\
@@ -170,6 +213,7 @@ pub fn detect() -> PlatformCapabilities {
         // GNOME 默认不显示 AppIndicator；其它桌面通常有 StatusNotifier 宿主。
         tray_reliable: tray_reliable(),
         window_positioning: x11,
+        window_positioning_backend,
         always_on_top: x11,
         // 门户路径要等异步绑定成功后才由 current_capabilities() 置为 true。
         global_shortcut: x11,
@@ -221,6 +265,12 @@ pub fn apply_startup_env() {
         );
     }
 
+    if session == SessionType::Wayland && wayland_layer_shell_opt_in() {
+        eprintln!(
+            "[platform] KONATA_WAYLAND_LAYER_SHELL=1：请求启用 Wayland layer-shell 悬浮窗定位（实验）"
+        );
+    }
+
     let safe_mode = std::env::var_os("KONATA_WEBKIT_SAFE").is_some();
     let nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists();
 
@@ -248,6 +298,46 @@ pub fn start_global_shortcut_service(app: tauri::AppHandle) {
         return;
     }
     global_shortcuts::start(app);
+}
+
+/// GTK 初始化后尝试为悬浮窗启用 layer-shell（主线程调用）。
+pub fn init_float_window_layer_shell(window: &tauri::WebviewWindow) {
+    if capabilities().window_positioning_backend != WindowPositioningBackend::LayerShell {
+        return;
+    }
+
+    let result = window
+        .gtk_window()
+        .map_err(|err| anyhow!("无法取得悬浮窗的 GTK 句柄：{err}"))
+        .and_then(|gtk_window| layer_shell::init(&gtk_window));
+
+    match result {
+        Ok(()) => {
+            let note = "Wayland layer-shell 悬浮窗定位已启用（实验）：支持自由拖拽与置顶，\
+                        位置由合成器的 layer-shell 协议管理；GNOME/Mutter 不支持该协议。"
+                .to_string();
+            set_layer_shell_status(true, Some(note.clone()));
+            eprintln!("[platform] {note}");
+        }
+        Err(err) => {
+            let note = format!(
+                "Wayland layer-shell 不可用：{err}。悬浮窗位置由合成器决定，\
+                 应用不会假装定位成功。"
+            );
+            set_layer_shell_status(false, Some(note.clone()));
+            eprintln!("[platform] {note}");
+        }
+    }
+}
+
+/// 用 layer-shell 边距把悬浮窗放到指定角落；未初始化时返回 false。
+pub fn position_float_window_layer_shell(position: &str) -> bool {
+    layer_shell::position(position)
+}
+
+/// 按逻辑像素增量移动 layer-shell 悬浮窗（自由拖拽）。
+pub fn move_float_window_by(dx: i32, dy: i32) -> Result<()> {
+    layer_shell::move_by(dx, dy)
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

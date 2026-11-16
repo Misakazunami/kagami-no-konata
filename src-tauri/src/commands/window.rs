@@ -7,7 +7,16 @@ use tauri::{Emitter, Manager, State};
 /// 返回 `false` 表示当前平台/会话不支持绝对定位（例如 Wayland），
 /// 调用方应提示用户，而不是假装成功。
 pub fn apply_float_position(window: &tauri::WebviewWindow, position: &str) -> bool {
-    if !platform::capabilities().window_positioning {
+    let capabilities = platform::capabilities();
+
+    // Wayland layer-shell：位置由锚点 + 边距表达，不能走 set_position。
+    if capabilities.window_positioning_backend
+        == crate::platform::WindowPositioningBackend::LayerShell
+    {
+        return platform::position_float_window_layer_shell(position);
+    }
+
+    if !capabilities.window_positioning {
         return false;
     }
 
@@ -163,4 +172,14 @@ pub async fn is_float_visible(app: tauri::AppHandle) -> Result<bool, String> {
     } else {
         Ok(false)
     }
+}
+
+/// layer-shell 自由拖拽：按逻辑像素增量移动悬浮窗。
+///
+/// 只在 `windowPositioningBackend === "layer_shell"` 且定位已初始化时可用；
+/// 其它平台返回明确错误，前端据此回退到原生拖拽。
+#[tauri::command]
+pub async fn move_float_window_by(dx: f64, dy: f64) -> Result<(), String> {
+    platform::move_float_window_by(dx.round() as i32, dy.round() as i32)
+        .map_err(|err| err.to_string())
 }

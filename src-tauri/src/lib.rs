@@ -216,6 +216,12 @@ pub fn run() {
                 eprintln!("[tray] 初始化失败，应用继续运行：{e}");
             }
 
+            // ─── Wayland layer-shell 悬浮窗定位（实验，默认关闭） ───
+            // 必须在悬浮窗首次 show() 之前初始化；失败只降级为合成器摆放。
+            if let Some(float_win) = app.get_webview_window("float") {
+                platform::init_float_window_layer_shell(&float_win);
+            }
+
             // ─── Wayland 全局快捷键门户（实验，默认关闭） ───
             // Windows/X11 走前端 tauri-plugin-global-shortcut；只有显式
             // KONATA_WAYLAND_GLOBAL_SHORTCUTS=1 的 Wayland 会话才会真正启动
@@ -357,6 +363,7 @@ pub fn run() {
             commands::window::hide_float_window,
             commands::window::toggle_float_window,
             commands::window::is_float_visible,
+            commands::window::move_float_window_by,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
